@@ -39,9 +39,11 @@ from jarvis.knowledge_artifact import (
     synthesize_offline,
 )
 from jarvis.recovery import ProgressAwareRecovery
+from jarvis.calibration import AutoCalibration
 
 logger = logging.getLogger("jarvis.orchestrator")
 
+# Defaults — runtime values come from AutoCalibration (persisted, measurable).
 MAX_REPAIR_ATTEMPTS = 5
 MAX_LEARNING_ATTEMPTS = 5
 # Learning: at most one networked research gather; later attempts are local gap-fill.
@@ -98,7 +100,19 @@ class Orchestrator:
         self.memory = Memory(db)
         self.ledger = Ledger(db)
         self.registry = CapabilityRegistry(db)
-        self.research = ResearchSystem(brain=self.brain, on_log=self._log)
+        # Self-improvement from VERIFY outcomes (survives restart via SQLite facts)
+        self.calibration = AutoCalibration(self.memory, on_log=self._log)
+        # Apply calibrated timeouts to brain / research (defaults if untouched)
+        try:
+            self.brain.timeout = float(self.calibration.params.chat_timeout_sec)
+        except Exception:
+            pass
+        self.research = ResearchSystem(
+            brain=self.brain,
+            on_log=self._log,
+            timeout=float(self.calibration.research_timeout()),
+        )
+        self.research.max_open_sources = int(self.calibration.max_open_sources())
         self.deps = DependencyManager(on_log=self._log)
         self.builder = SkillBuilder(self.skills_dir, brain=self.brain, on_log=self._log)
         self.tester = SkillTester(self.workspace, on_log=self._log)
@@ -108,6 +122,11 @@ class Orchestrator:
         self.contexts = ContextBuilder(brain=self.brain, on_log=self._log)
         # Ephemeral: last repair VERIFY PASS proof (skip duplicate execute+verify)
         self._activation_proof: Optional[dict[str, Any]] = None
+        self._log(
+            f"CALIBRATE: loaded params success_rate="
+            f"{self.calibration.window_success_rate():.2f} "
+            f"approaches={len(self.calibration.approaches)}"
+        )
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -474,6 +493,13 @@ class Orchestrator:
                     task_goal, research, verified_prior[-1]
                 )
                 if verification.get("verified"):
+                    self.calibration.observe_verify(
+                        verified=True,
+                        domain="learning",
+                        approach="reuse_verified_artifact",
+                        skill_or_topic=topic,
+                        extra={"request_id": request_id, "memory_used": True},
+                    )
                     return self._finish_learning_success(
                         task_id=task_id,
                         topic=topic,
@@ -507,6 +533,17 @@ class Orchestrator:
                     task_goal.user_request, missing_from_mem
                 )[:6]
             current_approach = "knowledge_artifact_synthesis"
+            # Prefer historically successful learning approaches when known
+            calib_learning = [
+                a.approach
+                for a in self.calibration.approaches.values()
+                if a.domain == "learning" and a.successes > 0 and a.approach
+            ]
+            if calib_learning:
+                current_approach = self.calibration.pick_best_approach(
+                    [current_approach] + [str(x) for x in calib_learning[:5]],
+                    domain="learning",
+                )
             verification: dict[str, Any] = {}
             saved: dict[str, Any] = {}
             diagnosis: Optional[dict] = None
@@ -514,6 +551,13 @@ class Orchestrator:
             network_research_used = 0
             prior_gap_sig = ""
             stagnant_gap_rounds = 0
+            learn_max = int(self.calibration.learning_attempts() or MAX_LEARNING_ATTEMPTS)
+            net_budget = int(
+                self.calibration.learning_network_budget()
+                if self.calibration.learning_network_budget() is not None
+                else MAX_LEARNING_NETWORK_RESEARCH
+            )
+            gap_stag_limit = int(self.calibration.gap_stagnation_rounds())
             if gap_fill_seed:
                 diagnosis = {
                     "missing_knowledge": list(missing_from_mem),
@@ -522,13 +566,19 @@ class Orchestrator:
                     "approach": "memory_gap_fill",
                 }
 
-            for attempt in range(1, MAX_LEARNING_ATTEMPTS + 1):
+            for attempt in range(1, learn_max + 1):
                 ap_fp = Observer.fingerprint_approach(current_approach)
                 failed_fps = {
                     str(a.get("approach_fingerprint") or "")
                     for a in failed_approaches
                 }
-                if ap_fp in failed_fps:
+                # Also avoid approaches calibration marked as repeatedly failing
+                if (
+                    ap_fp in failed_fps
+                    or self.calibration.should_avoid_approach(
+                        self.calibration.fingerprint(current_approach, "learning")
+                    )
+                ):
                     current_approach = (
                         f"{current_approach}::alt::{attempt}::{len(failed_fps)}"
                     )
@@ -538,13 +588,13 @@ class Orchestrator:
                     (diagnosis or {}).get("missing_knowledge") or []
                 )
 
-                # RESEARCH — at most one networked SEARCH→OPEN→EXTRACT;
+                # RESEARCH — at most calibrated networked SEARCH→OPEN→EXTRACT;
                 # further attempts are local gap-fill only
-                use_network = network_research_used < MAX_LEARNING_NETWORK_RESEARCH
+                use_network = network_research_used < net_budget
                 self._status("RESEARCH")
                 self._log(
                     f"[{task_id}] LEARNING RESEARCH attempt={attempt}/"
-                    f"{MAX_LEARNING_ATTEMPTS} topic={topic!r} "
+                    f"{learn_max} topic={topic!r} "
                     f"approach={current_approach!r} "
                     f"gap_fill={gap_fill_only} network={use_network} "
                     f"gaps={missing_gaps!r} queries={len(queries)}"
@@ -657,6 +707,15 @@ class Orchestrator:
                     f"[{task_id}] LEARNING VERIFY: "
                     f"{'PASS' if verification.get('verified') else 'FAIL'} "
                     f"attempt={attempt} — {verification.get('reason')}"
+                )
+                # Auto-calibration feedback (measurable VERIFY outcome)
+                self.calibration.observe_verify(
+                    verified=bool(verification.get("verified")),
+                    domain="learning",
+                    approach=current_approach,
+                    approach_fingerprint=ap_fp,
+                    skill_or_topic=topic,
+                    extra={"attempt": attempt, "request_id": request_id},
                 )
 
                 if verification.get("verified"):
@@ -789,7 +848,13 @@ class Orchestrator:
                     list(diagnosis.get("missing_knowledge") or ["explanations"]),
                 )
                 queries = queries[:6]
-                current_approach = str(diagnosis.get("approach") or current_approach)
+                next_ap = str(diagnosis.get("approach") or current_approach)
+                # Prefer calibrated gap-fill strategies over repeatedly failing ones
+                current_approach = self.calibration.pick_best_approach(
+                    [next_ap, f"gap_fill_v{attempt + 1}", current_approach],
+                    domain="learning",
+                    failed_fingerprints=failed_fps,
+                )
                 gap_fill_only = True
                 gap_sig = "|".join(
                     sorted(str(g) for g in (diagnosis.get("missing_knowledge") or []))
@@ -799,16 +864,22 @@ class Orchestrator:
                 else:
                     stagnant_gap_rounds = 0
                 prior_gap_sig = gap_sig
-                if stagnant_gap_rounds >= 2:
+                if stagnant_gap_rounds >= gap_stag_limit:
                     self._log(
                         f"[{task_id}] LEARNING stagnation — same gaps "
-                        f"{gap_sig!r} twice; stopping early"
+                        f"{gap_sig!r} x{stagnant_gap_rounds}; stopping early"
+                    )
+                    self.calibration.observe_recovery(
+                        stagnated=True,
+                        stopped=True,
+                        allow_research=False,
+                        failure_signature=gap_sig[:64],
                     )
                     break
                 prior_history = self.memory.get_topic_knowledge(topic, limit=8)
 
             outcome = (
-                f"LEARNING VERIFY FAIL after {MAX_LEARNING_ATTEMPTS} attempts: "
+                f"LEARNING VERIFY FAIL after {learn_max} attempts: "
                 f"{(verification or {}).get('reason')}. DONE nav atļauts. "
                 f"Knowledge draft under topic:{topic}."
             )
@@ -820,15 +891,16 @@ class Orchestrator:
                     "task_id": task_id,
                     "request_id": request_id,
                     "intent": "learning",
-                    "attempts": MAX_LEARNING_ATTEMPTS,
+                    "attempts": learn_max,
                     "failed_approaches": [
                         a.get("approach") for a in failed_approaches[:10]
                     ],
+                    "calibration": self.calibration.status(),
                 },
             )
             self.ledger.finish(
                 task_id, False,
-                {"outcome": outcome, "topic": topic, "attempts": MAX_LEARNING_ATTEMPTS},
+                {"outcome": outcome, "topic": topic, "attempts": learn_max},
             )
             return {
                 "type": "learning",
@@ -839,7 +911,7 @@ class Orchestrator:
                 "outcome": outcome,
                 "topic": topic,
                 "verification": verification,
-                "attempts": MAX_LEARNING_ATTEMPTS,
+                "attempts": learn_max,
             }
         except Exception as exc:
             tb = traceback.format_exc()
@@ -1585,6 +1657,13 @@ class Orchestrator:
                 f"{'PASS' if verification.get('verified') else 'FAIL'} — "
                 f"{verification.get('reason')}"
             )
+            self.calibration.observe_verify(
+                verified=bool(verification.get("verified")),
+                domain="repair",
+                approach=str((skill_record or {}).get("name") or "execute"),
+                skill_or_topic=str((skill_record or {}).get("name") or ""),
+                extra={"phase": "outer_verify", "task_id": task_id},
+            )
 
             # VERIFY FAIL → OBSERVE → DIAGNOSE → REPAIR → RETEST (then re-execute)
             if not verification.get("verified"):
@@ -1656,6 +1735,13 @@ class Orchestrator:
                         f"[{task_id}] VERIFIER RESULT (after repair): "
                         f"{'PASS' if verification.get('verified') else 'FAIL'} — "
                         f"{verification.get('reason')}"
+                    )
+                    self.calibration.observe_verify(
+                        verified=bool(verification.get("verified")),
+                        domain="repair",
+                        approach=str((skill_record or {}).get("name") or "repair"),
+                        skill_or_topic=str((skill_record or {}).get("name") or ""),
+                        extra={"phase": "after_repair_verify", "task_id": task_id},
                     )
 
             if not verification.get("verified"):
@@ -1807,8 +1893,8 @@ class Orchestrator:
                 skill_name, path=repair_of.get("file_path")
             )
 
-        # Progress-aware recovery — prevents identical VERIFY→RESEARCH loops
-        recovery = ProgressAwareRecovery()
+        # Progress-aware recovery — params from AutoCalibration (measurable history)
+        recovery = ProgressAwareRecovery(**self.calibration.recovery_kwargs())
 
         # Load prior knowledge. Research is NOT a universal entry fallback —
         # only gather when we lack knowledge for a new skill (not mid-repair).
@@ -1936,7 +2022,8 @@ class Orchestrator:
                 )
                 return self.registry.get_skill(skill_name), args, task_goal
 
-        for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
+        repair_max = int(self.calibration.repair_attempts() or MAX_REPAIR_ATTEMPTS)
+        for attempt in range(1, repair_max + 1):
             if recovery.stopped:
                 break
             attempt_version = version + (attempt - 1)
@@ -2154,6 +2241,14 @@ class Orchestrator:
                         "task_goal": task_goal.to_dict(),
                     },
                 )
+                self.calibration.observe_verify(
+                    verified=bool(verification.get("verified")),
+                    domain="repair",
+                    approach=current_approach,
+                    approach_fingerprint=Observer.fingerprint_approach(current_approach),
+                    skill_or_topic=skill_name,
+                    extra={"attempt": attempt, "phase": "inner_verify"},
+                )
                 if verification.get("verified"):
                     # ── ACTIVE + remember solution ──────────────────────
                     skill = self._activate_and_remember(
@@ -2330,7 +2425,7 @@ class Orchestrator:
         if task_goal is None:
             task_goal = TaskGoal.from_request(goal, goal=goal)
         if recovery is None:
-            recovery = ProgressAwareRecovery()
+            recovery = ProgressAwareRecovery(**self.calibration.recovery_kwargs())
         # Ensure observation carries the args + immutable USER REQUEST
         if isinstance(observation.get("context"), dict) and task_args is not None:
             observation["context"] = dict(observation["context"])
@@ -2531,13 +2626,26 @@ class Orchestrator:
         diagnosis["stagnated"] = decision.stagnated
         diagnosis["prefer_coding"] = decision.prefer_coding
         diagnosis["recovery_reason"] = decision.reason
+        if decision.stagnated or decision.stop:
+            self.calibration.observe_recovery(
+                stagnated=bool(decision.stagnated),
+                stopped=bool(decision.stop),
+                allow_research=bool(decision.allow_research),
+                failure_signature=fail_sig,
+            )
 
         if decision.force_new_approach and layer_now == "skill_code":
             # Must not repeat the same approach/research — force CODING divergence
+            # Prefer historically better repair approaches when available
             old_ap = str(diagnosis.get("approach") or "repair")
-            diagnosis["approach"] = (
-                f"{old_ap}::coding_diverge::v{observation.get('version')}::"
-                f"{fail_sig[:6]}"
+            candidates = [
+                f"{old_ap}::coding_diverge::v{observation.get('version')}::{fail_sig[:6]}",
+                f"honor_user_request::div::{fail_sig[:6]}",
+                f"offline_alt_v{int(observation.get('version') or 0) + 1}",
+            ]
+            diagnosis["approach"] = self.calibration.pick_best_approach(
+                candidates,
+                domain="repair",
             )
             diagnosis["approach_fingerprint"] = Observer.fingerprint_approach(
                 diagnosis["approach"]
@@ -3167,6 +3275,7 @@ class Orchestrator:
         catalog = ""
         if hasattr(self.brain, "model_catalog_summary"):
             catalog = f"\nModels — {self.brain.model_catalog_summary()}"
+        cal = self.calibration.status()
         return (
             f"Brain (Ollama multi-model): {brain}{catalog}\n"
             f"Memory — conv:{mem['conversations']} exp:{mem['experiences']} "
@@ -3179,7 +3288,12 @@ class Orchestrator:
             f"BROKEN:{reg.get('BROKEN', 0)} REPAIRING:{reg.get('REPAIRING', 0)} "
             f"ARCHIVED:{reg.get('ARCHIVED', 0)} archive_files:{reg.get('archived_versions', 0)}\n"
             f"Ledger — tasks:{led['tasks']} done:{led['done']} fail:{led['failed']} "
-            f"actions:{led['actions']}"
+            f"actions:{led['actions']}\n"
+            f"Calibration — rate:{cal.get('success_rate', 0):.2f} "
+            f"outcomes:{cal.get('outcomes', 0)} "
+            f"approaches:{cal.get('approaches', 0)} "
+            f"avoided:{len(cal.get('avoided') or [])} "
+            f"adaptations:{(cal.get('meta') or {}).get('adaptations', 0)}"
         )
 
     def _format_skills(self) -> str:
@@ -3215,6 +3329,7 @@ class Orchestrator:
             "model_catalog": catalog,
             "model_tiers": detail.get("tiers") or {},
             "skill_list": self.registry.list_skills(),
+            "calibration": self.calibration.status(),
         }
 
     def _log(self, msg: str) -> None:
