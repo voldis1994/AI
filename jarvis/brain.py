@@ -686,6 +686,7 @@ class Brain:
             '  "approach": "short label of the NEW strategy to try",\n'
             '  "approach_changed": true|false,\n'
             '  "needs_research": true|false,\n'
+            '  "missing_knowledge": ["only if a real knowledge gap blocks repair"],\n'
             '  "research_queries": ["..."],\n'
             '  "needs_new_deps": ["pip-or-import-name"],\n'
             '  "missing_args": ["arg_names"],\n'
@@ -715,10 +716,10 @@ class Brain:
             "dependency→environment are accepted but prefer canonical names.\n"
             "- If the same approach already failed, set approach_changed=true "
             "and propose a meaningfully different approach.\n"
-            "- If the same/similar error repeats (prior_approaches or repeated VERIFY/"
-            "TEST failure), set needs_research=true and fill research_queries from the "
-            "observation, diagnosis, traceback, failed approaches, and verifier failure. "
-            "Research is required mid-repair — not only on first learning.\n"
+            "- needs_research=true ONLY when missing_knowledge is non-empty "
+            "(a real knowledge gap). Do NOT set needs_research for ordinary "
+            "skill_code bugs, VERIFY mismatches, or repeated identical failures — "
+            "those go to CODING rewrite. Research is never a universal fallback.\n"
             "- Do not claim the task is done; only diagnose.\n"
             "- Prefer concrete, testable next steps."
         )
@@ -844,13 +845,10 @@ class Brain:
                 )
             ),
             "approach_changed": True,
-            # Mid-repair research is allowed for skill faults including VERIFY mismatches
-            "needs_research": fb_layer == "skill_code",
-            "research_queries": [
-                f"python {observation.get('goal', '')}",
-                str(observation.get("exception") or "")[:160],
-                str((observation.get("verifier_result") or {}).get("reason") or "")[:160],
-            ],
+            # Research only for genuine knowledge gaps — not every skill_code fail
+            "needs_research": False,
+            "missing_knowledge": [],
+            "research_queries": [],
             "needs_new_deps": [],
             "missing_args": [],
             "required_args": [],
@@ -878,6 +876,11 @@ class Brain:
             result["suggested_args"] = {}
         if not isinstance(result.get("missing_args"), list):
             result["missing_args"] = list(result.get("required_args") or [])
+        if not isinstance(result.get("missing_knowledge"), list):
+            result["missing_knowledge"] = []
+        # Research requires an explicit knowledge gap — never universal
+        if result.get("needs_research") and not result.get("missing_knowledge"):
+            result["needs_research"] = False
 
         # Enrich missing/suggested args from error + original request
         result = ContextBuilder.enrich_diagnosis_args(

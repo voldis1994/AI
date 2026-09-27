@@ -226,3 +226,23 @@ class Observer:
             if prior_fp == fp:
                 n += 1
         return n
+
+    @staticmethod
+    def failure_signature(
+        observation: dict[str, Any],
+        *,
+        fault_layer: str = "",
+    ) -> str:
+        """Progress-aware failure class signature (delegates to recovery helper)."""
+        from jarvis.recovery import ProgressAwareRecovery
+
+        err_fp = observation.get("error_fingerprint") or Observer.fingerprint_error(
+            observation
+        )
+        return ProgressAwareRecovery.failure_signature(
+            phase=str(observation.get("phase") or ""),
+            error_fingerprint=str(err_fp or ""),
+            fault_layer=fault_layer
+            or str(observation.get("fault_layer") or ""),
+            verifier_failure=observation.get("verifier_result"),
+        )

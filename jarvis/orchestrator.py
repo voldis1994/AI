@@ -33,6 +33,7 @@ from jarvis.context_builder import ContextBuilder
 from jarvis.task_goal import TaskGoal
 from jarvis.intent import IntentClassifier
 from jarvis import learning_verify as learn_v
+from jarvis.recovery import ProgressAwareRecovery, MAX_RECOVERY_ATTEMPTS
 
 logger = logging.getLogger("jarvis.orchestrator")
 
@@ -1563,13 +1564,47 @@ class Orchestrator:
                 skill_name, path=repair_of.get("file_path")
             )
 
-        # Load previously saved research knowledge, then gather new research
+        # Progress-aware recovery — prevents identical VERIFY→RESEARCH loops
+        recovery = ProgressAwareRecovery()
+
+        # Load prior knowledge. Research is NOT a universal entry fallback —
+        # only gather when we lack knowledge for a new skill (not mid-repair).
         prior_knowledge = self.memory.get_research_knowledge(skill_name, limit=8)
         prior_research = self.memory.get_latest_research(skill_name)
-        research = self._do_research(
-            task_id, skill_name, goal, plan.get("research_queries") or [goal]
+        research: dict[str, Any] = {
+            "approach": "coding_first",
+            "libraries": [],
+            "key_apis": [],
+            "pitfalls": [],
+            "test_idea": "",
+            "raw": "",
+            "sources": [],
+            "results": [],
+        }
+        need_entry_research = (
+            not repair_of
+            and not verify_failure
+            and not prior_knowledge
+            and not prior_research
+            and bool(plan.get("needs_research", True))
         )
-        if prior_research:
+        if need_entry_research:
+            research = self._do_research(
+                task_id, skill_name, goal, plan.get("research_queries") or [goal]
+            )
+            recovery.research_count += 1
+        elif prior_research:
+            research = dict(prior_research)
+            self._log(
+                f"[{task_id}] RECOVERY: reuse prior research "
+                f"(skip universal entry RESEARCH)"
+            )
+        else:
+            self._log(
+                f"[{task_id}] RECOVERY: CODING-first — no entry RESEARCH "
+                f"(research only on diagnosed knowledge gap)"
+            )
+        if prior_research and need_entry_research:
             research = self._merge_research(prior_research, research)
         if prior_knowledge:
             research["knowledge_history"] = prior_knowledge
@@ -1636,6 +1671,7 @@ class Orchestrator:
                     code=previous_code,
                     task_args=args,
                     task_goal=task_goal,
+                    recovery=recovery,
                 )
             )
             task_goal = task_goal.with_args(args)
@@ -1650,8 +1686,16 @@ class Orchestrator:
             if existing and existing.get("status") == "ACTIVE":
                 protect_active_path = existing.get("file_path")
                 self.registry.set_status(skill_name, "REPAIRING")
+            if diagnosis.get("stop_recovery"):
+                self._log(
+                    f"[{task_id}] RECOVERY STOP (seed): "
+                    f"{(diagnosis.get('recovery_report') or {}).get('focus_signature')}"
+                )
+                return self.registry.get_skill(skill_name), args, task_goal
 
         for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
+            if recovery.stopped:
+                break
             attempt_version = version + (attempt - 1)
             is_retest = attempt > 1
             phase_build = "REPAIR" if is_retest else "BUILD_SKILL"
@@ -1721,11 +1765,14 @@ class Orchestrator:
                             code=built.get("code"),
                             task_args=args,
                             task_goal=task_goal,
+                            recovery=recovery,
                         )
                     )
                     task_goal = task_goal.with_args(args)
                     failed_approaches = self.memory.get_failed_approaches(skill_name)
                     skip_rebuild = not diagnosis.get("rewrite_skill", False)
+                    if diagnosis.get("stop_recovery"):
+                        break
                     continue
 
                 meta = built["meta"]
@@ -1787,6 +1834,7 @@ class Orchestrator:
                         code=(built or {}).get("code"),
                         task_args=args,
                         task_goal=task_goal,
+                        recovery=recovery,
                     )
                 )
                 task_goal = task_goal.with_args(args)
@@ -1794,6 +1842,8 @@ class Orchestrator:
                 skip_rebuild = not TaskGoal.rewrite_skill_for_layer(
                     diagnosis.get("fault_layer")
                 )
+                if diagnosis.get("stop_recovery"):
+                    break
                 continue
 
             # ── TEST / RETEST (subprocess) with prepared args ───────────
@@ -1915,6 +1965,7 @@ class Orchestrator:
                     code=(built or {}).get("code"),
                     task_args=args,
                     task_goal=task_goal,
+                    recovery=recovery,
                 )
             )
             task_goal = task_goal.with_args(args)
@@ -1924,18 +1975,33 @@ class Orchestrator:
             )
             diagnosis["fault_layer"] = layer
             diagnosis["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(layer)
-            # Only rewrite skill when the fault is skill_code
+            # Only rewrite skill when the fault is skill_code → CODING next
             skip_rebuild = not diagnosis.get("rewrite_skill", False)
+            if diagnosis.get("prefer_coding") and layer == "skill_code":
+                self._log(
+                    f"[{task_id}] RECOVERY ROUTE: skill_code → CODING repair "
+                    f"(no identical research cycle)"
+                )
             if layer == "environment" and diagnosis.get("needs_new_deps"):
                 self.deps.ensure(list(diagnosis["needs_new_deps"]))
             # legacy alias
             if layer in ("dependency",) and diagnosis.get("needs_new_deps"):
                 self.deps.ensure(list(diagnosis["needs_new_deps"]))
+            if diagnosis.get("stop_recovery"):
+                break
             # loop → REPAIR correct layer on next iteration
 
+        report = recovery.stop_report or recovery.build_report()
         self._log(
-            f"[{task_id}] Failed to produce ACTIVE skill after "
-            f"{MAX_REPAIR_ATTEMPTS} repair attempts"
+            f"[{task_id}] RECOVERY STOP: unresolved after "
+            f"{len(recovery.attempts)} attempts — "
+            f"signatures={report.get('signatures')}"
+        )
+        self.ledger.log(
+            task_id,
+            "RECOVERY_STOP",
+            "unresolved failure — recovery budget / stagnation",
+            report,
         )
         return self.registry.get_skill(skill_name), args, task_goal
 
@@ -1992,11 +2058,20 @@ class Orchestrator:
         code: Optional[str],
         task_args: Optional[dict] = None,
         task_goal: Optional[TaskGoal] = None,
+        recovery: Optional[ProgressAwareRecovery] = None,
     ) -> tuple[dict, dict, str, str, Optional[str], dict]:
-        """OBSERVE → DIAGNOSE → optional RESEARCH → return repair state + updated args."""
+        """
+        OBSERVE → REASONING diagnose → optional RESEARCH (knowledge gap only)
+        → CODING-oriented repair state.
+
+        Progress-aware: identical failure_signature without progress must not
+        repeat the same research/approach cycle.
+        """
         self._status("OBSERVE")
         if task_goal is None:
             task_goal = TaskGoal.from_request(goal, goal=goal)
+        if recovery is None:
+            recovery = ProgressAwareRecovery()
         # Ensure observation carries the args + immutable USER REQUEST
         if isinstance(observation.get("context"), dict) and task_args is not None:
             observation["context"] = dict(observation["context"])
@@ -2004,13 +2079,16 @@ class Orchestrator:
             observation["context"]["user_request"] = task_goal.user_request
         observation["user_request"] = task_goal.user_request
 
-        # Fingerprint this failure for adaptive mid-repair research
+        # Fingerprints for stagnation / similarity (not task-specific)
         observation["error_fingerprint"] = Observer.fingerprint_error(observation)
+        # Provisional signature (fault_layer filled after diagnose)
+        observation["failure_signature"] = Observer.failure_signature(observation)
 
         failure_id = self.memory.save_failure(
             skill_name, goal, observation,
             version=observation.get("version"),
             phase=observation.get("phase"),
+            failure_signature=observation.get("failure_signature"),
         )
         self.ledger.log(task_id, "OBSERVE", f"failure_id={failure_id}", {
             "phase": observation.get("phase"),
@@ -2018,6 +2096,7 @@ class Orchestrator:
             "exception": (observation.get("exception") or "")[:500],
             "code_fingerprint": observation.get("code_fingerprint"),
             "error_fingerprint": observation.get("error_fingerprint"),
+            "failure_signature": observation.get("failure_signature"),
             "artifact_count": len(observation.get("artifacts") or []),
             "args_keys": list((task_args or {}).keys()),
         })
@@ -2120,15 +2199,10 @@ class Orchestrator:
                 "what_to_change": change,
                 "approach": approach,
                 "approach_changed": True,
-                "needs_research": layer == "skill_code",
-                "research_queries": Brain._offline_research_queries(
-                    observation,
-                    {
-                        "root_cause": str(observation.get("exception") or "")[:500],
-                        "fault_layer": layer,
-                    },
-                    self.memory.get_failed_approaches(skill_name),
-                ),
+                # Research only for genuine knowledge gaps — not every skill_code fail
+                "needs_research": False,
+                "missing_knowledge": [],
+                "research_queries": [],
                 "needs_new_deps": [],
                 "missing_args": list(parsed_missing),
                 "required_args": list(parsed_missing),
@@ -2197,8 +2271,102 @@ class Orchestrator:
             if isinstance(f.get("observation"), dict)
         ]
         similar_count = Observer.count_similar_errors(observation, prior_obs)
+        layer_now = TaskGoal.normalize_fault_layer(
+            diagnosis.get("fault_layer") or "skill_code"
+        )
+        diagnosis["fault_layer"] = layer_now
         diagnosis["error_fingerprint"] = observation.get("error_fingerprint")
         diagnosis["similar_failure_count"] = similar_count
+
+        # Finalize failure_signature with diagnosed fault_layer
+        fail_sig = ProgressAwareRecovery.failure_signature(
+            phase=str(observation.get("phase") or ""),
+            error_fingerprint=str(observation.get("error_fingerprint") or ""),
+            fault_layer=layer_now,
+            verifier_failure=observation.get("verifier_result"),
+        )
+        observation["failure_signature"] = fail_sig
+        observation["fault_layer"] = layer_now
+        diagnosis["failure_signature"] = fail_sig
+
+        # Model used for this diagnose step (REASONING)
+        model_used = ""
+        if hasattr(self.brain, "router") and self.brain.router.last_route:
+            model_used = str(self.brain.router.last_route.model or "")
+        model_used = model_used or getattr(self.brain, "model", "") or "offline"
+
+        # Persist recovery attempt fields on the observation (memory + policy)
+        did_research = False
+        missing_knowledge = list(diagnosis.get("missing_knowledge") or [])
+        knowledge_gap = bool(missing_knowledge) or bool(
+            diagnosis.get("knowledge_gap")
+        )
+        # Strip spurious needs_research when no knowledge gap is stated
+        if diagnosis.get("needs_research") and not knowledge_gap:
+            # Keep flag only if diagnosis explicitly listed research_queries
+            # as a knowledge-gap fill — otherwise clear (no universal fallback)
+            if not diagnosis.get("research_queries"):
+                diagnosis["needs_research"] = False
+
+        attempt_rec = recovery.record(
+            fault_layer=layer_now,
+            failure_signature=fail_sig,
+            attempted_solution=str(
+                diagnosis.get("approach") or approach_label or ""
+            ),
+            model_used=model_used,
+            result=str(observation.get("exception") or "fail")[:500],
+            artifacts=list(observation.get("artifacts") or []),
+            verifier_failure=observation.get("verifier_result"),
+            error_fingerprint=str(observation.get("error_fingerprint") or ""),
+            code_fingerprint=str(observation.get("code_fingerprint") or ""),
+            approach_fingerprint=str(
+                diagnosis.get("approach_fingerprint")
+                or Observer.fingerprint_approach(
+                    str(diagnosis.get("approach") or approach_label)
+                )
+            ),
+            researched=False,
+        )
+        observation["attempted_solution"] = attempt_rec.attempted_solution
+        observation["model_used"] = model_used
+        observation["recovery_progress"] = attempt_rec.progress
+
+        decision = recovery.evaluate(
+            failure_signature=fail_sig,
+            fault_layer=layer_now,
+            diagnosis_needs_research=bool(diagnosis.get("needs_research")),
+            missing_knowledge=missing_knowledge,
+            knowledge_gap=knowledge_gap,
+        )
+        diagnosis["stagnated"] = decision.stagnated
+        diagnosis["prefer_coding"] = decision.prefer_coding
+        diagnosis["recovery_reason"] = decision.reason
+
+        if decision.force_new_approach and layer_now == "skill_code":
+            # Must not repeat the same approach/research — force CODING divergence
+            old_ap = str(diagnosis.get("approach") or "repair")
+            diagnosis["approach"] = (
+                f"{old_ap}::coding_diverge::v{observation.get('version')}::"
+                f"{fail_sig[:6]}"
+            )
+            diagnosis["approach_fingerprint"] = Observer.fingerprint_approach(
+                diagnosis["approach"]
+            )
+            diagnosis["approach_changed"] = True
+            diagnosis["rewrite_skill"] = True
+            self._log(
+                f"[{task_id}] STAGNATION: signature={fail_sig} — "
+                f"force new CODING approach (no identical cycle)"
+            )
+
+        if decision.stop:
+            report = recovery.mark_stopped(decision.report or recovery.build_report(fail_sig))
+            diagnosis["stop_recovery"] = True
+            diagnosis["recovery_report"] = report
+            self._log(
+                f"[{task_id}] RECOVERY BUDGET STOP: {decision.reason}"
+            )
 
         diag_id = self.memory.save_diagnosis(
             skill_name, goal, diagnosis, failure_id=failure_id
@@ -2214,13 +2382,18 @@ class Orchestrator:
                 "approach": diagnosis.get("approach"),
                 "approach_changed": diagnosis.get("approach_changed"),
                 "needs_research": diagnosis.get("needs_research"),
+                "missing_knowledge": missing_knowledge,
                 "needs_new_deps": diagnosis.get("needs_new_deps"),
                 "missing_args": diagnosis.get("missing_args"),
                 "suggested_args": diagnosis.get("suggested_args"),
                 "args_keys": list(new_args.keys()),
                 "test_plan": diagnosis.get("test_plan"),
                 "error_fingerprint": diagnosis.get("error_fingerprint"),
+                "failure_signature": fail_sig,
                 "similar_failure_count": similar_count,
+                "stagnated": decision.stagnated,
+                "stop_recovery": diagnosis.get("stop_recovery"),
+                "model_used": model_used,
             },
         )
         self._log(
@@ -2229,29 +2402,12 @@ class Orchestrator:
             f"rewrite_skill={diagnosis.get('rewrite_skill')} "
             f"| approach={diagnosis.get('approach')!r} "
             f"changed={diagnosis.get('approach_changed')} "
-            f"| similar_errors={similar_count}"
+            f"| sig={fail_sig} similar={similar_count} "
+            f"stagnated={decision.stagnated}"
         )
 
-        # ── Adaptive RESEARCH inside the repair cycle ───────────────────
-        # When the same/similar error repeats, generate fresh queries from
-        # observation + diagnosis + traceback + failed approaches + verifier.
-        repeated_error = similar_count >= 2  # current save + at least one prior
-        many_failed_approaches = len(failed) >= 2
-        layer_now = str(diagnosis.get("fault_layer") or "")
-
-        force_research = repeated_error or (
-            diagnosis.get("needs_research")
-            and layer_now not in ("context_mapping", "context_args", "goal_parsing")
-        ) or (
-            many_failed_approaches and layer_now == "skill_code"
-        )
-        # Pure first-time context mapping does not need web research
-        if layer_now in ("context_mapping", "context_args", "goal_parsing") and not repeated_error:
-            force_research = False
-
-        if force_research:
-            diagnosis["needs_research"] = True
-            diagnosis["adaptive_research"] = bool(repeated_error or many_failed_approaches)
+        # ── RESEARCH only on diagnosed knowledge gap (never universal) ──
+        if decision.allow_research and not diagnosis.get("stop_recovery"):
             queries = list(diagnosis.get("research_queries") or [])
             if self.brain.is_available():
                 try:
@@ -2269,27 +2425,38 @@ class Orchestrator:
             for q in generated:
                 if q and q not in queries:
                     queries.append(q)
+            # Ground queries in stated missing knowledge
+            for mk in missing_knowledge[:4]:
+                q = f"{goal} — knowledge gap: {mk}"
+                if q not in queries:
+                    queries.append(q)
             if not queries:
-                queries = [goal, str(observation.get("exception") or "")[:160]]
+                queries = [
+                    f"{goal} — fill knowledge: {m}"
+                    for m in (missing_knowledge or ["fundamentals"])[:3]
+                ]
             diagnosis["research_queries"] = queries[:6]
+            diagnosis["adaptive_research"] = True
             self._log(
-                f"[{task_id}] ADAPTIVE RESEARCH: similar={similar_count} "
-                f"failed_approaches={len(failed)} queries={len(queries)}"
+                f"[{task_id}] KNOWLEDGE-GAP RESEARCH: sig={fail_sig} "
+                f"missing={missing_knowledge!r} queries={len(queries)}"
             )
             new_research = self._do_research(task_id, skill_name, goal, list(queries))
             research = self._merge_research(research, new_research)
             research["knowledge_history"] = self.memory.get_research_knowledge(
                 skill_name, limit=8
             )
-            # Research must drive a NEW approach for the next repair
+            did_research = True
+            recovery.mark_researched(fail_sig)
             researched_approach = str(research.get("approach") or "").strip()
             if researched_approach:
                 candidate = researched_approach.split("\n")[0][:100]
                 cand_fp = Observer.fingerprint_approach(candidate)
                 failed_fps = {a.get("approach_fingerprint") for a in failed}
-                if cand_fp in failed_fps:
+                if cand_fp in failed_fps or not diagnosis.get("approach_changed"):
                     candidate = (
                         f"{candidate} | researched-v{observation.get('version')}"
+                        f"|{fail_sig[:6]}"
                     )
                     cand_fp = Observer.fingerprint_approach(candidate)
                 diagnosis["approach"] = candidate
@@ -2303,14 +2470,22 @@ class Orchestrator:
             self.ledger.log(
                 task_id,
                 "RESEARCH",
-                f"adaptive repair research similar={similar_count}",
+                f"knowledge-gap research sig={fail_sig}",
                 {
                     "queries": queries[:6],
-                    "similar_failure_count": similar_count,
+                    "failure_signature": fail_sig,
+                    "missing_knowledge": missing_knowledge,
                     "approach": diagnosis.get("approach"),
                     "libraries": research.get("libraries"),
                 },
             )
+        elif diagnosis.get("needs_research") and not decision.allow_research:
+            self._log(
+                f"[{task_id}] RESEARCH SKIPPED: {decision.reason} "
+                f"— route to "
+                f"{'CODING' if decision.prefer_coding else layer_now} repair"
+            )
+            diagnosis["adaptive_research"] = False
 
         if diagnosis.get("needs_new_deps"):
             dep_r = self.deps.ensure(list(diagnosis["needs_new_deps"]))
@@ -2327,12 +2502,16 @@ class Orchestrator:
         research["approach"] = diagnosis.get("approach")
         research["diagnosis"] = diagnosis
         research["adaptive_research"] = diagnosis.get("adaptive_research")
+        research["failure_signature"] = fail_sig
 
         last_error = (
             f"ROOT CAUSE: {diagnosis.get('root_cause')}\n"
             f"FAULT_LAYER: {diagnosis.get('fault_layer')}\n"
+            f"FAILURE_SIGNATURE: {fail_sig}\n"
             f"CHANGE: {diagnosis.get('what_to_change')}\n"
             f"APPROACH: {diagnosis.get('approach')}\n"
+            f"MODEL_USED: {model_used}\n"
+            f"RESEARCHED: {did_research}\n"
             f"RESEARCH_INSIGHT: {research.get('repair_insight') or ''}\n"
             f"ARGS: {json.dumps(new_args, default=str)[:500]}\n"
             f"EXCEPTION: {observation.get('exception')}\n"
@@ -2348,7 +2527,8 @@ class Orchestrator:
             f"prepare repair layer={diagnosis.get('fault_layer')} "
             f"rewrite_skill={diagnosis.get('rewrite_skill')} "
             f"approach={diagnosis.get('approach')} "
-            f"adaptive_research={diagnosis.get('adaptive_research')}",
+            f"sig={fail_sig} research={did_research} "
+            f"stagnated={decision.stagnated}",
         )
         return (
             diagnosis,

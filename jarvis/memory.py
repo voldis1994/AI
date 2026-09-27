@@ -73,6 +73,7 @@ class Memory:
                     phase TEXT,
                     observation TEXT NOT NULL,
                     code_fingerprint TEXT,
+                    failure_signature TEXT,
                     created_at REAL NOT NULL
                 );
 
@@ -118,6 +119,19 @@ class Memory:
                 CREATE INDEX IF NOT EXISTS idx_learn_diag_skill ON learning_diagnoses(skill_name);
                 CREATE INDEX IF NOT EXISTS idx_learn_sol_skill ON learning_solutions(skill_name);
                 """
+            )
+            # Migrate older DBs that predate failure_signature
+            cols = {
+                r[1]
+                for r in self._conn.execute("PRAGMA table_info(learning_failures)").fetchall()
+            }
+            if "failure_signature" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE learning_failures ADD COLUMN failure_signature TEXT"
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_learn_fail_sig "
+                "ON learning_failures(failure_signature)"
             )
             self._conn.commit()
 
@@ -310,12 +324,15 @@ class Memory:
         observation: dict[str, Any],
         version: Optional[int] = None,
         phase: Optional[str] = None,
+        failure_signature: Optional[str] = None,
     ) -> int:
+        sig = failure_signature or observation.get("failure_signature")
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO learning_failures "
-                "(skill_name, goal, version, phase, observation, code_fingerprint, created_at) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "(skill_name, goal, version, phase, observation, code_fingerprint, "
+                "failure_signature, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
                 (
                     skill_name,
                     goal,
@@ -323,6 +340,7 @@ class Memory:
                     phase or observation.get("phase"),
                     json.dumps(observation, default=str),
                     observation.get("code_fingerprint"),
+                    sig,
                     time.time(),
                 ),
             )
