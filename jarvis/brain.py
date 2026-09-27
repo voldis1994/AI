@@ -20,6 +20,39 @@ logger = logging.getLogger("jarvis.brain")
 # Re-export for callers that import from jarvis.brain
 __all__ = ["Brain", "DEFAULT_MODEL", "DEFAULT_HOST"]
 
+# Shorter than historical 180s — hung Ollama must not dominate repair loops.
+DEFAULT_CHAT_TIMEOUT = 90.0
+
+_CONN_FAIL_MARKERS = (
+    "connection refused",
+    "failed to connect",
+    "connect call failed",
+    "connection reset",
+    "name or service not known",
+    "nodename nor servname",
+    "network is unreachable",
+    "timed out",
+    "timeout",
+    "ollama unreachable",
+)
+
+
+def _is_connection_failure(exc: Any) -> bool:
+    if isinstance(
+        exc,
+        (
+            ConnectionRefusedError,
+            ConnectionResetError,
+            BrokenPipeError,
+            TimeoutError,
+            ConnectionError,
+        ),
+    ):
+        return True
+    msg = str(exc).lower()
+    # urllib wraps OSError / URLError — match message markers
+    return any(m in msg for m in _CONN_FAIL_MARKERS)
+
 
 class Brain:
     """Ollama API wrapper with universal Multi-Model routing."""
@@ -28,7 +61,7 @@ class Brain:
         self,
         model: str = DEFAULT_MODEL,
         host: str = DEFAULT_HOST,
-        timeout: float = 180.0,
+        timeout: float = DEFAULT_CHAT_TIMEOUT,
         on_log: Optional[Callable[[str], None]] = None,
         router: Optional[ModelRouter] = None,
     ) -> None:
@@ -142,6 +175,7 @@ class Brain:
         allow_escalate: bool = False,
         expect_json: bool = False,
         expect_code: bool = False,
+        escalate_error_only: bool = False,
         model: Optional[str] = None,
     ) -> str:
         """
@@ -149,6 +183,9 @@ class Brain:
 
         work/tier select FAST|REASONING|CODING. On insufficient FAST output,
         optionally escalate once to REASONING.
+
+        escalate_error_only: when True with allow_escalate, only escalate on
+        empty / [BRAIN ERROR] (not weak JSON) — prefer offline Python fallbacks.
         """
         full: list[dict[str, str]] = []
         if system:
@@ -166,15 +203,28 @@ class Brain:
         text = self._chat_on_model(full, temperature, decision.model)
 
         if allow_escalate and ModelRouter.result_insufficient(
-            text, expect_json=expect_json, expect_code=expect_code
+            text,
+            expect_json=expect_json,
+            expect_code=expect_code,
+            error_only=escalate_error_only,
         ):
+            # Connection failures: do not burn another 30B / HTTP timeout
+            if text.startswith("[BRAIN ERROR]") and _is_connection_failure(text):
+                try:
+                    self.router.invalidate_cache()
+                except Exception:
+                    pass
+                return text
             esc = self.router.escalate(decision.tier, work=work or decision.work)
             if esc is not None and (
                 esc.model != decision.model or esc.tier != decision.tier
             ):
                 text2 = self._chat_on_model(full, temperature, esc.model)
                 if not ModelRouter.result_insufficient(
-                    text2, expect_json=expect_json, expect_code=expect_code
+                    text2,
+                    expect_json=expect_json,
+                    expect_code=expect_code,
+                    error_only=escalate_error_only,
                 ):
                     return text2
                 # Prefer non-empty escalated text over empty first try
@@ -208,6 +258,13 @@ class Brain:
                 return (content or "").strip()
             except Exception as exc:
                 logger.error("ollama chat failed (%s): %s", model, exc)
+                # Connection / timeout: fail fast — do NOT wait another full HTTP timeout
+                if _is_connection_failure(exc):
+                    try:
+                        self.router.invalidate_cache()
+                    except Exception:
+                        pass
+                    return f"[BRAIN ERROR] Ollama unreachable: {exc}"
                 return self._http_chat(messages, temperature, model=model)
 
         return self._http_chat(messages, temperature, model=model)
@@ -241,6 +298,11 @@ class Brain:
                 return (data.get("message", {}) or {}).get("content", "").strip()
         except Exception as exc:
             logger.error("HTTP chat failed (%s): %s", use_model, exc)
+            if _is_connection_failure(exc):
+                try:
+                    self.router.invalidate_cache()
+                except Exception:
+                    pass
             return f"[BRAIN ERROR] Ollama unreachable: {exc}"
 
     def generate(
@@ -254,6 +316,7 @@ class Brain:
         allow_escalate: bool = False,
         expect_json: bool = False,
         expect_code: bool = False,
+        escalate_error_only: bool = False,
         model: Optional[str] = None,
     ) -> str:
         messages = [{"role": "user", "content": prompt}]
@@ -266,6 +329,7 @@ class Brain:
             allow_escalate=allow_escalate,
             expect_json=expect_json,
             expect_code=expect_code,
+            escalate_error_only=escalate_error_only,
             model=model,
         )
 
@@ -289,7 +353,9 @@ class Brain:
             system=system,
             temperature=0.5,
             work="converse",
+            # Soft chat: stay on FAST; escalate only hard errors (not weak prose)
             allow_escalate=True,
+            escalate_error_only=True,
         )
 
     def classify_intent(self, user_text: str) -> dict[str, Any]:
@@ -325,7 +391,8 @@ class Brain:
             system=system,
             temperature=0.1,
             work="intent",
-            allow_escalate=True,
+            # Offline IntentClassifier covers weak JSON — do not burn 30B
+            allow_escalate=False,
             expect_json=True,
         )
         parsed = self._parse_json(raw, IntentClassifier.classify_offline(user_text))
@@ -414,7 +481,8 @@ class Brain:
             system=system,
             temperature=0.1,
             work="extract_args",
-            allow_escalate=True,
+            # ContextBuilder has deterministic arg grounding — avoid 30B escalate
+            allow_escalate=False,
             expect_json=True,
         )
         parsed = self._parse_json(raw, {})
@@ -506,6 +574,7 @@ class Brain:
             temperature=0.3,
             work="query_generation",
             allow_escalate=True,
+            escalate_error_only=True,
             expect_json=True,
         )
         parsed = self._parse_json(raw, {})
