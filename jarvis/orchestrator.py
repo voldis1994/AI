@@ -248,7 +248,7 @@ class Orchestrator:
                         task_id, skill_record, goal, args=task_args
                     )
 
-            # VERIFY final execution — SKILL RESULT ≠ VERIFIER RESULT
+            # VERIFY final execution against USER REQUEST — not skill self-proof
             self._status("VERIFY")
             if not exec_result:
                 outcome = "Neizdevās izpildīt uzdevumu: nav skill / nav izpildes rezultāta."
@@ -272,7 +272,13 @@ class Orchestrator:
                 f"[{task_id}] SKILL RESULT: ok={exec_result.get('ok')} "
                 f"rc={exec_result.get('returncode')} error={exec_result.get('error')}"
             )
-            verification = self.verifier.verify(goal, exec_result, require_brain_confirm=False)
+            verification = self.verifier.verify(
+                goal,
+                exec_result,
+                require_brain_confirm=False,
+                args=task_args,
+                user_request=original_request or goal,
+            )
             self.ledger.log(
                 task_id,
                 "VERIFY",
@@ -280,6 +286,7 @@ class Orchestrator:
                 {
                     "skill_result": verification.get("skill_result"),
                     "verifier_result": verification.get("verifier_result"),
+                    "args": task_args,
                 },
             )
             self._log(
@@ -288,12 +295,64 @@ class Orchestrator:
                 f"{verification.get('reason')}"
             )
 
+            # VERIFY FAIL → OBSERVE → DIAGNOSE → REPAIR → RETEST (then re-execute)
             if not verification.get("verified"):
                 if skill_record:
                     self.registry.mark_failure(
                         skill_record["name"],
                         verification.get("reason") or "verify failed",
                     )
+                    self.memory.log_skill_event(
+                        skill_record["name"],
+                        "verifier_failed",
+                        "BROKEN",
+                        {
+                            "reason": verification.get("reason"),
+                            "args_keys": list(task_args.keys()),
+                        },
+                    )
+                self._log(
+                    f"[{task_id}] VERIFY FAIL vs USER REQUEST — "
+                    f"entering OBSERVE→DIAGNOSE→REPAIR→RETEST"
+                )
+                skill_record, task_args = self._learn_or_repair(
+                    task_id,
+                    goal,
+                    plan,
+                    repair_of=skill_record,
+                    task_args=task_args,
+                    verify_failure=verification,
+                )
+                if skill_record and skill_record.get("status") == "ACTIVE":
+                    exec_result = self._execute_trusted(
+                        task_id, skill_record, goal, args=task_args
+                    )
+                    self._status("VERIFY")
+                    verification = self.verifier.verify(
+                        goal,
+                        exec_result,
+                        require_brain_confirm=False,
+                        args=task_args,
+                        user_request=original_request or goal,
+                    )
+                    self.ledger.log(
+                        task_id,
+                        "VERIFY",
+                        verification.get("reason"),
+                        {
+                            "skill_result": verification.get("skill_result"),
+                            "verifier_result": verification.get("verifier_result"),
+                            "args": task_args,
+                            "after_repair": True,
+                        },
+                    )
+                    self._log(
+                        f"[{task_id}] VERIFIER RESULT (after repair): "
+                        f"{'PASS' if verification.get('verified') else 'FAIL'} — "
+                        f"{verification.get('reason')}"
+                    )
+
+            if not verification.get("verified"):
                 outcome = (
                     f"SKILL RESULT ok={exec_result.get('ok')}, bet VERIFIER FAIL: "
                     f"{verification.get('reason')}. DONE nav atļauts."
@@ -305,6 +364,7 @@ class Orchestrator:
                         "skill_result": verification.get("skill_result"),
                         "verifier_result": verification.get("verifier_result"),
                         "task_id": task_id,
+                        "args": task_args,
                     },
                 )
                 self.ledger.log(task_id, "SAVE_EXPERIENCE", outcome)
@@ -385,6 +445,7 @@ class Orchestrator:
         plan: dict,
         repair_of: Optional[dict] = None,
         task_args: Optional[dict] = None,
+        verify_failure: Optional[dict] = None,
     ) -> tuple[Optional[dict], dict]:
         """
         Universal learning loop (no task-specific hardcoding):
@@ -450,6 +511,49 @@ class Orchestrator:
         meta: dict = {}
         caps: list = [description]
         deps_list: list = []
+
+        # Seed from a final-EXECUTE verifier failure so the first loop iteration
+        # OBSERVE→DIAGNOSE that mismatch (defaults / wrong artifact vs USER REQUEST).
+        if verify_failure and repair_of:
+            seed_obs = self.observer.observe_failure(
+                goal=goal,
+                skill_name=skill_name,
+                version=int(repair_of.get("version") or version),
+                phase="VERIFY",
+                skill_code=previous_code,
+                context={
+                    "goal": goal,
+                    "args": args,
+                    "workspace": str(self.workspace),
+                },
+                dependencies=list(repair_of.get("dependencies") or []),
+                test_result={
+                    "ok": True,
+                    "error": verify_failure.get("reason"),
+                    "result": (verify_failure.get("skill_result") or {}).get("result"),
+                    "evidence": (verify_failure.get("skill_result") or {}).get("evidence"),
+                    "returncode": 0,
+                },
+                verification=verify_failure,
+                prior_approaches=failed_approaches,
+            )
+            diagnosis, research, current_approach, last_error, last_code, args = (
+                self._observe_diagnose_enrich(
+                    task_id, skill_name, goal, seed_obs, research,
+                    approach_label=current_approach,
+                    code=previous_code,
+                    task_args=args,
+                )
+            )
+            failed_approaches = self.memory.get_failed_approaches(skill_name)
+            layer = str(diagnosis.get("fault_layer") or "skill_code")
+            # Defaults / wrong artifact vs user request → rewrite skill
+            skip_rebuild = layer in (
+                "context_args", "test_harness", "dependency", "verifier"
+            ) and (not diagnosis.get("rewrite_skill", False))
+            if existing and existing.get("status") == "ACTIVE":
+                protect_active_path = existing.get("file_path")
+                self.registry.set_status(skill_name, "REPAIRING")
 
         for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
             attempt_version = version + (attempt - 1)
@@ -628,9 +732,14 @@ class Orchestrator:
             )
             verification = None
             if not test_failed:
-                # ── VERIFY ──────────────────────────────────────────────
+                # ── VERIFY against USER REQUEST / args (not skill claims) ─
                 self._status("VERIFY")
-                verification = self.verifier.verify(goal, test_result)
+                verification = self.verifier.verify(
+                    goal,
+                    test_result,
+                    args=args,
+                    user_request=goal,
+                )
                 self.ledger.log(
                     task_id,
                     "VERIFY",
@@ -638,6 +747,7 @@ class Orchestrator:
                     {
                         "skill_result": verification.get("skill_result"),
                         "verifier_result": verification.get("verifier_result"),
+                        "args": args,
                     },
                 )
                 if verification.get("verified"):
@@ -800,27 +910,47 @@ class Orchestrator:
             ctx_args = (observation.get("context") or {}).get("args") or {}
             empty_args = not ctx_args
             err = str(observation.get("exception") or "")
+            err_l = err.lower()
+            phase = str(observation.get("phase") or "").upper()
             parsed_missing = ContextBuilder.parse_missing_arg_names(err)
             args_fault = (empty_args or bool(parsed_missing)) and any(
-                t in err.lower()
+                t in err_l
                 for t in ("argument", "args", "missing", "required", "keyerror")
             )
+            goal_mismatch = phase == "VERIFY" and any(
+                t in err_l
+                for t in (
+                    "default", "placeholder", "untrusted", "claim_aligns",
+                    "not in user", "user constraints", "user request",
+                    "reject_defaults", "missing from expected",
+                )
+            )
+            if goal_mismatch:
+                layer = "skill_code"
+                rewrite = True
+                approach = "honor_user_request"
+                change = (
+                    "Rewrite skill to satisfy USER REQUEST "
+                    "(no default/placeholder artifacts)"
+                )
+            elif args_fault:
+                layer = "context_args"
+                rewrite = False
+                approach = "context_args_prep"
+                change = "Prepare structured context args from the user goal"
+            else:
+                layer = "skill_code"
+                rewrite = True
+                approach = f"offline_alt_v{int(observation.get('version') or 0) + 1}"
+                change = "Rebuild with a different strategy using observation data"
             diagnosis = {
                 "root_cause": str(observation.get("exception") or "unknown")[:500],
-                "fault_layer": "context_args" if args_fault else "skill_code",
-                "rewrite_skill": not args_fault,
-                "what_to_change": (
-                    "Prepare structured context args from the user goal"
-                    if args_fault
-                    else "Rebuild with a different strategy using observation data"
-                ),
-                "approach": (
-                    "context_args_prep"
-                    if args_fault
-                    else f"offline_alt_v{int(observation.get('version') or 0) + 1}"
-                ),
+                "fault_layer": layer,
+                "rewrite_skill": rewrite,
+                "what_to_change": change,
+                "approach": approach,
                 "approach_changed": True,
-                "needs_research": not args_fault,
+                "needs_research": layer == "skill_code" and not goal_mismatch,
                 "research_queries": [
                     goal,
                     str(observation.get("exception") or "")[:160],
@@ -829,7 +959,10 @@ class Orchestrator:
                 "missing_args": list(parsed_missing),
                 "required_args": list(parsed_missing),
                 "suggested_args": {},
-                "test_plan": "subprocess retest with prepared args + verify",
+                "test_plan": (
+                    "subprocess retest with prepared args; "
+                    "VERIFY against USER REQUEST (reject defaults)"
+                ),
                 "expected_artifacts": [],
                 "is_unfixable": False,
                 "diagnosis": str(observation.get("exception") or "failure")[:500],
@@ -840,6 +973,13 @@ class Orchestrator:
 
         # Universal enrichment: parse missing arg names + suggest values from goal
         diagnosis = ContextBuilder.enrich_diagnosis_args(diagnosis, observation, goal)
+        # Keep VERIFY goal-mismatch as skill_code even if args enrichment runs
+        if (
+            str(observation.get("phase") or "").upper() == "VERIFY"
+            and "default" in str(observation.get("exception") or "").lower()
+        ):
+            diagnosis["fault_layer"] = "skill_code"
+            diagnosis["rewrite_skill"] = True
 
         # If diagnosis repeats a failed approach fingerprint — force divergence
         # (but do not force-rewrite context_args_prep — args repair is the fix)
