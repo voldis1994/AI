@@ -894,10 +894,37 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
-    # 4b) E2E: empty args → DIAGNOSE context_args → RETEST with args (no skill rewrite)
-    print("  — e2e context/args fault_layer repair (no skill rewrite) —")
+    # 4b) E2E: empty args → DIAGNOSE context_mapping → RETEST with args (no skill rewrite)
+    print("  — e2e context_mapping fault_layer repair (no skill rewrite) —")
     try:
         from jarvis.context_builder import ContextBuilder
+        from jarvis.task_goal import TaskGoal
+        from jarvis.verifier import Verifier
+
+        # Unit: immutable TaskGoal + grounding (no invented defaults / no token→file noise)
+        tg = TaskGoal.from_request("Izveido failu test.txt ar tekstu DARBOJAS")
+        assert tg.user_request == "Izveido failu test.txt ar tekstu DARBOJAS"
+        paths = [f.get("path") for f in tg.constraints.get("files") or []]
+        assert paths == ["test.txt"], paths
+        assert (tg.constraints.get("files") or [{}])[0].get("contains") == "DARBOJAS"
+        grounded = TaskGoal.ground_args(
+            {"path": "user_provided_path", "content": "DARBOJAS"},
+            tg.user_request,
+        )
+        assert "path" not in grounded and grounded.get("content") == "DARBOJAS", grounded
+        noisy_v = Verifier(root / "data" / "_tg_verify_ws")
+        (root / "data" / "_tg_verify_ws").mkdir(parents=True, exist_ok=True)
+        built = noisy_v.extract_constraints(
+            tg.user_request,
+            {"path": "user_provided_path", "content": "user_provided_content"},
+        )
+        assert [f.get("path") for f in built.get("files") or []] == ["test.txt"], built
+        assert "DARBOJAS" not in str(built.get("files"))
+        # user_provided_* must not become file constraints
+        assert not any(
+            "user_provided" in str(f.get("path") or "").lower()
+            for f in built.get("files") or []
+        ), built
 
         # Unit: universal missing-arg parse + offline fill (no hardcoded key names)
         parsed = ContextBuilder.parse_missing_arg_names(
@@ -910,6 +937,29 @@ def run(context: dict) -> dict:
         )
         assert filled.get("alpha") == "alpha_file.dat", filled
         assert filled.get("beta") == "PAYLOAD_Z", filled
+        # Context mapper rejects invented defaults even if diagnosis suggests them
+        cb = ContextBuilder()
+        mapped = cb.build(
+            tg.user_request,
+            str(root / "data" / "_tg_verify_ws"),
+            prior_args={"path": "user_provided_path", "content": "user_provided_content"},
+            diagnosis={
+                "missing_args": ["path", "content"],
+                "required_args": ["path", "content"],
+                "suggested_args": {
+                    "path": "user_provided_path",
+                    "content": "user_provided_content",
+                },
+                "fault_layer": "context_mapping",
+            },
+            user_request=tg.user_request,
+            task_goal=tg,
+        )
+        assert mapped["args"].get("path") == "test.txt", mapped["args"]
+        assert mapped["args"].get("content") == "DARBOJAS", mapped["args"]
+        assert TaskGoal.normalize_fault_layer("context_args") == "context_mapping"
+        assert TaskGoal.rewrite_skill_for_layer("context_mapping") is False
+        assert TaskGoal.rewrite_skill_for_layer("skill_code") is True
 
         args_root = root / "data" / "_e2e_args"
         if args_root.exists():
@@ -1040,10 +1090,10 @@ def run(context: dict) -> dict:
                 if parsed:
                     d = {
                         "root_cause": "context.args missing required keys",
-                        "fault_layer": "context_args",
+                        "fault_layer": "context_mapping",
                         "rewrite_skill": False,
-                        "what_to_change": "Prepare args from user goal and retest",
-                        "approach": "context_args_prep",
+                        "what_to_change": "Map TaskGoal → skill args from USER REQUEST",
+                        "approach": "context_mapping",
                         "approach_changed": True,
                         "needs_research": False,
                         "research_queries": [],
@@ -1051,7 +1101,7 @@ def run(context: dict) -> dict:
                         "missing_args": parsed,
                         "required_args": parsed,
                         "suggested_args": {},
-                        "test_plan": "retest with prepared context.args",
+                        "test_plan": "retest with grounded context.args",
                         "expected_artifacts": [],
                         "is_unfixable": False,
                         "diagnosis": err[:300],
@@ -1129,13 +1179,17 @@ def run(context: dict) -> dict:
         assert result_a.get("success"), result_a
         out = args_root / "workspace_runtime" / "args_e2e_out.txt"
         assert out.exists() and "ARGS_OK" in out.read_text(encoding="utf-8"), out
-        # Skill written once — context_args repair must not rewrite skill
+        # Skill written once — context_mapping repair must not rewrite skill
         assert brain_a.build_count == 1, brain_a.build_count
         assert "OBSERVE" in phases_a and "DIAGNOSE" in phases_a and "RETEST" in phases_a
-        assert any("context_args" in m or "CONTEXT repair" in m for m in logs_a), logs_a[-20:]
+        assert any(
+            "context_mapping" in m or "context_args" in m or "CONTEXT repair" in m
+            for m in logs_a
+        ), logs_a[-20:]
         assert any("Skip skill rewrite" in m for m in logs_a), logs_a[-20:]
+        assert any("TaskGoal" in m or "REQUEST:" in m for m in logs_a), logs_a[:10]
         orch_a.close()
-        print("  OK args     empty args → context_args diagnose → retest (no rewrite)")
+        print("  OK args     empty args → context_mapping diagnose → retest (no rewrite)")
     except Exception as exc:
         msg = f"E2E_ARGS: {exc}"
         print(f"  FAIL {msg}")
