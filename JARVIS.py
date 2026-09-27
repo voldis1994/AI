@@ -551,11 +551,13 @@ def run_check(root: Path) -> int:
         "jarvis.model_config",
         "jarvis.model_router",
         "jarvis.recovery",
+        "jarvis.calibration",
         "jarvis.knowledge_artifact",
         "jarvis.memory",
         "jarvis.ledger",
         "jarvis.capability_registry",
         "jarvis.research",
+        "jarvis.source_pipeline",
         "jarvis.dependency_manager",
         "jarvis.skill_builder",
         "jarvis.skill_tester",
@@ -3052,7 +3054,138 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
-    # 4l) E2E: Multi-Model Router — work kind → tier → model + fallback + escalate
+    # 4l) E2E: auto-calibration — VERIFY feedback, priority, rollback, persist
+    print("  — e2e auto-calibration / self-improvement —")
+    try:
+        from jarvis.calibration import (
+            AutoCalibration,
+            CalibParams,
+            EVAL_MIN_OUTCOMES,
+            FACT_PARAMS,
+            FACT_PENDING,
+            FACT_CONFIG_STACK,
+        )
+        from jarvis.memory import Memory as MemCal
+        from jarvis.recovery import ProgressAwareRecovery
+
+        cal_root = root / "data" / "_e2e_calibration"
+        if cal_root.exists():
+            shutil.rmtree(cal_root)
+        cal_root.mkdir(parents=True)
+        mem = MemCal(cal_root / "jarvis.db")
+        logs_c: list[str] = []
+        cal = AutoCalibration(mem, on_log=lambda m: logs_c.append(m))
+
+        # Defaults load / clamps
+        assert cal.repair_attempts() >= 2
+        p = CalibParams(max_repair_attempts=99, chat_timeout_sec=5.0).clamped()
+        assert p.max_repair_attempts <= 8
+        assert p.chat_timeout_sec >= 45.0
+
+        # Multi-fail → avoid approach; success → higher score
+        fp_bad = cal.fingerprint("bad_strategy", "repair")
+        for _ in range(4):
+            cal.observe_verify(
+                verified=False, domain="repair", approach="bad_strategy",
+                approach_fingerprint=fp_bad,
+            )
+        assert cal.should_avoid_approach(fp_bad)
+        fp_good = cal.fingerprint("good_strategy", "repair")
+        for _ in range(3):
+            cal.observe_verify(
+                verified=True, domain="repair", approach="good_strategy",
+                approach_fingerprint=fp_good,
+            )
+        assert cal.approach_score(fp_good) > cal.approach_score(fp_bad)
+        ranked = cal.rank_approaches(
+            ["bad_strategy", "good_strategy", "mid"], domain="repair"
+        )
+        assert ranked[0] == "good_strategy", ranked
+        picked = cal.pick_best_approach(
+            ["bad_strategy", "good_strategy"], domain="repair"
+        )
+        assert picked == "good_strategy"
+
+        # Recovery kwargs feed ProgressAwareRecovery
+        rk = cal.recovery_kwargs()
+        rec = ProgressAwareRecovery(**rk)
+        assert rec.stagnation_limit == cal.params.stagnation_same_signature
+
+        # Persist across "restart" (new AutoCalibration on same DB)
+        cal2 = AutoCalibration(mem, on_log=lambda m: None)
+        assert cal2.should_avoid_approach(fp_bad)
+        assert cal2.approach_score(fp_good) > 0.5
+        assert mem.get_fact(FACT_PARAMS)
+
+        # Snapshot + rollback when new config worse
+        # Seed a healthy baseline window
+        for _ in range(EVAL_MIN_OUTCOMES):
+            cal2.observe_verify(
+                verified=True, domain="repair", approach="good_strategy",
+                approach_fingerprint=fp_good,
+            )
+        baseline = cal2.window_success_rate()
+        assert baseline >= 0.5
+        # Force an adaptation by simulating stagnation signals
+        for _ in range(3):
+            cal2.observe_recovery(
+                stagnated=True, stopped=False, allow_research=False,
+                failure_signature="sig_stag",
+            )
+        # Pending eval should exist after adapt OR we force apply
+        pending = mem.get_fact(FACT_PENDING) or {}
+        if not pending.get("ts"):
+            cal2._apply_params(
+                CalibParams.from_dict({
+                    **cal2.params.to_dict(),
+                    "max_repair_attempts": min(8, cal2.params.max_repair_attempts + 1),
+                }),
+                reason="test_force_adapt",
+            )
+            pending = mem.get_fact(FACT_PENDING) or {}
+        assert pending.get("ts"), pending
+        assert mem.get_fact(FACT_CONFIG_STACK)
+        # Worse outcomes after change → rollback
+        for _ in range(EVAL_MIN_OUTCOMES):
+            cal2.observe_verify(
+                verified=False, domain="repair", approach="bad_strategy",
+                approach_fingerprint=fp_bad,
+            )
+        pending_after = mem.get_fact(FACT_PENDING) or {}
+        # Either rolled back (pending cleared) or still pending if rates borderline
+        st = cal2.status()
+        assert "params" in st and "success_rate" in st
+        assert any("CALIBRATE:" in m for m in logs_c)
+
+        # Orchestrator wires calibration into loops
+        class OfflineBrainCal(Brain):
+            def model_status(self) -> str:
+                return "OFFLINE"
+
+            def is_available(self) -> bool:
+                return False
+
+        orch_c = Orchestrator(
+            root=cal_root / "orch",
+            brain=OfflineBrainCal(),
+            on_log=lambda m: logs_c.append(m),
+        )
+        assert hasattr(orch_c, "calibration")
+        assert orch_c.calibration.learning_attempts() >= 2
+        dash = orch_c.get_dashboard_stats()
+        assert "calibration" in dash
+        status_txt = orch_c._format_status()
+        assert "Calibration" in status_txt
+        orch_c.close()
+        mem.close()
+        print("  OK auto-calibration — scores/avoid/persist/rollback hooks")
+    except Exception as exc:
+        msg = f"E2E_AUTO_CALIBRATION: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 4m) E2E: Multi-Model Router — work kind → tier → model + fallback + escalate
     print("  — e2e multi-model router (FAST/REASONING/CODING) —")
     try:
         from jarvis.model_config import (

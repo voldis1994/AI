@@ -40,6 +40,8 @@ class ResearchSystem:
         self.brain = brain
         self.on_log = on_log or (lambda _m: None)
         self.timeout = timeout
+        # May be overwritten by AutoCalibration via orchestrator
+        self.max_open_sources = MAX_QUERIES_LEARNING + 1  # default 4-ish
 
     def research(
         self,
@@ -171,12 +173,15 @@ class ResearchSystem:
                 open_and_extract,
             )
 
+            open_n = int(getattr(self, "max_open_sources", 4) or 4)
+            if mode_key != "learning":
+                open_n = min(open_n, 3)
             extracts, comparison = open_and_extract(
                 url_hits,
                 goal=goal_text,
                 on_log=self.on_log,
                 timeout=min(self.timeout + 2.0, 14.0),
-                max_open=4 if mode_key == "learning" else 3,
+                max_open=open_n,
             )
             opened = True
             knowledge_blob = knowledge_from_extracts(
