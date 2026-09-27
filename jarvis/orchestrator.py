@@ -35,6 +35,7 @@ from jarvis.intent import IntentClassifier
 logger = logging.getLogger("jarvis.orchestrator")
 
 MAX_REPAIR_ATTEMPTS = 5
+MAX_LEARNING_ATTEMPTS = 5
 
 # Layers that must NEVER trigger a skill rewrite (rewrite only for skill_code).
 _NON_REWRITE_LAYERS = frozenset({
@@ -48,6 +49,11 @@ _NON_REWRITE_LAYERS = frozenset({
     "test_harness",
     "dependency",
 })
+
+# Default skill-oriented test_idea from ResearchSystem — not valid learning notes.
+_SKILL_TEST_IDEA_RE = re.compile(
+    r"(?i)execute\s+skill\.run|independently verify artifacts"
+)
 
 
 class Orchestrator:
@@ -183,168 +189,355 @@ class Orchestrator:
         self, goal: str, original_request: Optional[str] = None
     ) -> dict[str, Any]:
         """
-        Learning / knowledge path:
+        Self-correcting learning / knowledge path:
 
-        REQUEST → RESEARCH → VERIFY knowledge → SAVE topic knowledge → DONE
+        RESEARCH → SAVE → VERIFY
+        on FAIL: OBSERVE → diagnose missing knowledge → new research questions
+                 → RESEARCH → update knowledge → VERIFY again
 
-        Does not match, build, repair, or activate any skill. Topic knowledge is
-        stored under knowledge:topic:{slug}, never under a prior skill name.
+        Repeats with a changed approach until PASS or MAX_LEARNING_ATTEMPTS.
+        Reuses prior failures + verified topic knowledge. Never repeats a failed
+        approach fingerprint. Does not build/repair skills.
         """
         user_request = (original_request or goal or "").strip()
         task_goal = TaskGoal.from_request(user_request, goal=goal)
         goal = task_goal.goal
         topic = IntentClassifier.topic_slug(goal)
+        learn_key = f"learning:{topic}"
         task_id = self.ledger.start_task(goal)
         self._status("REQUEST")
         self._log(f"[{task_id}] REQUEST (learning): {task_goal.user_request}")
         self.ledger.log(
             task_id,
             "REQUEST",
-            "Learning TaskGoal frozen (no skill inherit)",
+            "Learning TaskGoal frozen (self-correcting, no skill inherit)",
             {**task_goal.to_dict(), "topic": topic, "intent": "learning"},
         )
 
         try:
-            # Research the topic — never keyed to an existing skill
-            queries = [goal]
-            if self.brain.is_available():
-                try:
-                    extra = self.brain.generate(
-                        f"Learning request:\n{goal}\n\n"
-                        "Reply ONLY with JSON: {\"queries\":[\"...\"]}\n"
-                        "3-6 focused research queries for this topic. "
-                        "Do not mention skills, file creation, or prior capabilities.",
-                        system="You plan research queries for knowledge learning.",
-                        temperature=0.2,
-                    )
-                    parsed = self.brain._parse_json(extra, {"queries": []})
-                    if isinstance(parsed.get("queries"), list) and parsed["queries"]:
-                        queries = [str(q) for q in parsed["queries"][:6]]
-                except Exception:
-                    pass
-            if goal not in queries:
-                queries = [goal] + [q for q in queries if q != goal]
-
-            self._status("RESEARCH")
-            self._log(
-                f"[{task_id}] LEARNING RESEARCH topic={topic!r} "
-                f"(no skill build/repair)"
-            )
-            research = self.research.research(queries, goal=goal)
-            # Persist under topic namespace — NOT under any skill (e.g. create_file)
-            saved = self.memory.save_topic_knowledge(
-                topic,
-                research,
-                goal=goal,
-                queries=queries,
-                summary=str(research.get("approach") or ""),
-                verified=False,
-            )
-            self.ledger.log(task_id, "RESEARCH", "Topic research complete", {
-                "topic": topic,
-                "libraries": research.get("libraries"),
-                "results": len(research.get("results") or []),
-                "knowledge_entries": len(saved.get("history") or []),
-                "skill_inherit": False,
-            })
-            self._log(
-                f"[{task_id}] KNOWLEDGE SAVED: topic:{topic} "
-                f"entries={len(saved.get('history') or [])} "
-                f"(not bound to any skill)"
-            )
-
-            # VERIFY knowledge covers the original request (no skill execution)
-            self._status("VERIFY")
-            verification = self._verify_learning_knowledge(
-                task_goal, research, saved.get("entry") or {}
-            )
-            self.ledger.log(
-                task_id,
-                "VERIFY",
-                verification.get("reason"),
-                {
-                    "verifier_result": verification,
-                    "topic": topic,
-                    "task_goal": task_goal.to_dict(),
-                },
-            )
-            self._log(
-                f"[{task_id}] LEARNING VERIFY: "
-                f"{'PASS' if verification.get('verified') else 'FAIL'} — "
-                f"{verification.get('reason')}"
-            )
-
-            if not verification.get("verified"):
-                outcome = (
-                    f"LEARNING VERIFY FAIL: {verification.get('reason')}. "
-                    f"DONE nav atļauts. Knowledge draft under topic:{topic}."
+            # Reuse previously verified knowledge + failed approaches for this topic
+            prior_history = self.memory.get_topic_knowledge(topic, limit=8)
+            verified_prior = [
+                e for e in prior_history
+                if isinstance(e, dict) and e.get("verified")
+            ]
+            failed_approaches = self.memory.get_failed_approaches(learn_key)
+            research: dict[str, Any] = {}
+            if verified_prior:
+                latest = verified_prior[-1]
+                research = {
+                    "approach": latest.get("approach") or latest.get("summary") or "",
+                    "libraries": list(latest.get("libraries") or []),
+                    "key_apis": list(latest.get("key_apis") or []),
+                    "pitfalls": list(latest.get("pitfalls") or []),
+                    "test_idea": latest.get("test_idea") or "",
+                    "sources": list(latest.get("sources") or []),
+                    "results": [],
+                    "raw": str(latest.get("summary") or ""),
+                    "from_prior_verified": True,
+                }
+                self._log(
+                    f"[{task_id}] Reusing {len(verified_prior)} verified "
+                    f"knowledge entries for topic:{topic}"
                 )
-                self.memory.save_experience(
-                    goal, outcome, False,
-                    details={
+
+            queries = self._initial_learning_queries(goal)
+            current_approach = "initial_topic_research"
+            verification: dict[str, Any] = {}
+            saved: dict[str, Any] = {}
+            diagnosis: Optional[dict] = None
+
+            for attempt in range(1, MAX_LEARNING_ATTEMPTS + 1):
+                # Never reuse a failed approach fingerprint
+                ap_fp = Observer.fingerprint_approach(current_approach)
+                failed_fps = {
+                    str(a.get("approach_fingerprint") or "")
+                    for a in failed_approaches
+                }
+                if ap_fp in failed_fps:
+                    current_approach = (
+                        f"{current_approach}::alt::{attempt}::{len(failed_fps)}"
+                    )
+                    ap_fp = Observer.fingerprint_approach(current_approach)
+
+                self._status("RESEARCH")
+                self._log(
+                    f"[{task_id}] LEARNING RESEARCH attempt={attempt}/"
+                    f"{MAX_LEARNING_ATTEMPTS} topic={topic!r} "
+                    f"approach={current_approach!r} queries={len(queries)}"
+                )
+                fresh = self.research.research(queries, goal=goal)
+                # Strip skill-oriented defaults; enrich with learning notes
+                fresh = self._learning_strip_skill_defaults(fresh)
+                fresh = self._enrich_learning_research(
+                    fresh,
+                    goal=goal,
+                    missing=(diagnosis or {}).get("missing_knowledge") if diagnosis else None,
+                    approach_label=current_approach,
+                )
+                research = (
+                    self._merge_research(research, fresh) if research else fresh
+                )
+                research["approach_label"] = current_approach
+                research["attempt"] = attempt
+
+                # SAVE draft knowledge after every research pass
+                saved = self.memory.save_topic_knowledge(
+                    topic,
+                    research,
+                    goal=goal,
+                    queries=queries,
+                    summary=str(research.get("approach") or ""),
+                    verified=False,
+                )
+                self.ledger.log(task_id, "RESEARCH", "Topic research saved", {
+                    "topic": topic,
+                    "attempt": attempt,
+                    "approach": current_approach,
+                    "libraries": research.get("libraries"),
+                    "key_apis": list(research.get("key_apis") or [])[:8],
+                    "results": len(research.get("results") or []),
+                    "knowledge_entries": len(saved.get("history") or []),
+                    "queries": queries[:6],
+                    "skill_inherit": False,
+                })
+                self._log(
+                    f"[{task_id}] KNOWLEDGE SAVED: topic:{topic} "
+                    f"attempt={attempt} entries={len(saved.get('history') or [])} "
+                    f"(draft, not bound to any skill)"
+                )
+
+                # VERIFY against original TaskGoal
+                self._status("VERIFY")
+                verification = self._verify_learning_knowledge(
+                    task_goal, research, saved.get("entry") or {}
+                )
+                self.ledger.log(
+                    task_id,
+                    "VERIFY",
+                    verification.get("reason"),
+                    {
+                        "verifier_result": verification,
                         "topic": topic,
-                        "verification": verification,
-                        "task_id": task_id,
-                        "intent": "learning",
+                        "attempt": attempt,
+                        "approach": current_approach,
+                        "task_goal": task_goal.to_dict(),
                     },
                 )
-                self.ledger.finish(task_id, False, {"outcome": outcome, "topic": topic})
-                return {
-                    "type": "learning",
-                    "success": False,
-                    "task_id": task_id,
-                    "reply": outcome,
-                    "outcome": outcome,
-                    "topic": topic,
-                    "verification": verification,
-                }
+                self._log(
+                    f"[{task_id}] LEARNING VERIFY: "
+                    f"{'PASS' if verification.get('verified') else 'FAIL'} "
+                    f"attempt={attempt} — {verification.get('reason')}"
+                )
 
-            # Re-save with verified flag
-            saved = self.memory.save_topic_knowledge(
-                topic,
-                research,
-                goal=goal,
-                queries=queries,
-                summary=str(
-                    verification.get("summary")
-                    or research.get("approach")
-                    or goal
-                ),
-                verified=True,
-            )
+                if verification.get("verified"):
+                    saved = self.memory.save_topic_knowledge(
+                        topic,
+                        research,
+                        goal=goal,
+                        queries=queries,
+                        summary=str(
+                            verification.get("summary")
+                            or research.get("approach")
+                            or goal
+                        ),
+                        verified=True,
+                    )
+                    outcome = (
+                        f"DONE. Learning complete — knowledge verified & saved.\n"
+                        f"Topic: {topic}\n"
+                        f"Attempts: {attempt}\n"
+                        f"Approach: {current_approach}\n"
+                        f"Summary: {(saved.get('entry') or {}).get('summary', '')[:400]}\n"
+                        f"Sources: {len((research.get('sources') or []))}"
+                    )
+                    self._status("SAVE_EXPERIENCE")
+                    self.memory.save_experience(
+                        goal, outcome, True,
+                        details={
+                            "topic": topic,
+                            "verification": verification,
+                            "knowledge": saved.get("entry"),
+                            "task_id": task_id,
+                            "intent": "learning",
+                            "attempts": attempt,
+                            "approach": current_approach,
+                        },
+                    )
+                    self.ledger.finish(
+                        task_id,
+                        True,
+                        {
+                            "topic": topic,
+                            "verified": True,
+                            "intent": "learning",
+                            "attempts": attempt,
+                        },
+                    )
+                    self._status("DONE")
+                    self._log(
+                        f"[{task_id}] DONE (learning topic={topic} "
+                        f"attempts={attempt})"
+                    )
+                    return {
+                        "type": "learning",
+                        "success": True,
+                        "task_id": task_id,
+                        "reply": outcome,
+                        "outcome": outcome,
+                        "topic": topic,
+                        "knowledge": saved.get("entry"),
+                        "verification": verification,
+                        "attempts": attempt,
+                    }
+
+                # ── VERIFY FAIL → OBSERVE → diagnose → new questions ──
+                self._status("OBSERVE")
+                observation = self.observer.observe_failure(
+                    goal=goal,
+                    skill_name=learn_key,
+                    version=attempt,
+                    phase="VERIFY",
+                    skill_code="",
+                    context={
+                        "goal": goal,
+                        "user_request": task_goal.user_request,
+                        "topic": topic,
+                        "approach": current_approach,
+                        "queries": queries,
+                        "key_apis": list(research.get("key_apis") or []),
+                        "mode": "learning",
+                    },
+                    test_result={
+                        "ok": False,
+                        "error": verification.get("reason"),
+                        "result": {
+                            "topic": topic,
+                            "key_apis": list(research.get("key_apis") or []),
+                        },
+                        "evidence": str(research.get("approach") or "")[:1000],
+                        "returncode": 0,
+                    },
+                    verification=verification,
+                    prior_approaches=failed_approaches,
+                )
+                observation["error_fingerprint"] = Observer.fingerprint_error(
+                    observation
+                )
+                failure_id = self.memory.save_failure(
+                    learn_key, goal, observation,
+                    version=attempt,
+                    phase="VERIFY",
+                )
+                self.memory.record_failed_approach(
+                    learn_key,
+                    current_approach,
+                    ap_fp,
+                    last_error=str(verification.get("reason") or "")[:1000],
+                )
+                self.ledger.log(task_id, "OBSERVE", f"failure_id={failure_id}", {
+                    "attempt": attempt,
+                    "approach": current_approach,
+                    "missing": verification.get("missing_knowledge"),
+                    "error_fingerprint": observation.get("error_fingerprint"),
+                })
+
+                self._status("DIAGNOSE")
+                failed_approaches = self.memory.get_failed_approaches(learn_key)
+                diagnosis = self._diagnose_learning_gap(
+                    task_goal=task_goal,
+                    observation=observation,
+                    verification=verification,
+                    research=research,
+                    failed_approaches=failed_approaches,
+                    prior_knowledge=prior_history + list(
+                        (saved.get("history") or [])
+                    ),
+                    attempt=attempt,
+                )
+                # Enforce approach change — never repeat a failed fingerprint
+                new_approach = str(
+                    diagnosis.get("approach") or f"learning_repair_v{attempt + 1}"
+                )
+                new_fp = Observer.fingerprint_approach(new_approach)
+                used_fps = {
+                    str(a.get("approach_fingerprint") or "")
+                    for a in failed_approaches
+                }
+                if new_fp in used_fps or new_fp == ap_fp:
+                    new_approach = (
+                        f"{new_approach}::divergent::{attempt + 1}::"
+                        f"{observation.get('error_fingerprint', '')[:8]}"
+                    )
+                    diagnosis["approach"] = new_approach
+                    diagnosis["approach_changed"] = True
+                diagnosis["approach_fingerprint"] = Observer.fingerprint_approach(
+                    diagnosis["approach"]
+                )
+                self.memory.save_diagnosis(
+                    learn_key, goal, diagnosis, failure_id=failure_id
+                )
+                self.ledger.log(
+                    task_id,
+                    "DIAGNOSE",
+                    diagnosis.get("root_cause") or diagnosis.get("diagnosis"),
+                    {
+                        "missing_knowledge": diagnosis.get("missing_knowledge"),
+                        "approach": diagnosis.get("approach"),
+                        "approach_changed": diagnosis.get("approach_changed"),
+                        "research_queries": diagnosis.get("research_queries"),
+                        "attempt": attempt,
+                    },
+                )
+                self._log(
+                    f"[{task_id}] LEARNING DIAGNOSE: "
+                    f"{diagnosis.get('root_cause', '')[:160]} "
+                    f"| missing={diagnosis.get('missing_knowledge')!r} "
+                    f"| next_approach={diagnosis.get('approach')!r}"
+                )
+
+                queries = list(diagnosis.get("research_queries") or []) or [
+                    f"{goal} — fill gap: {g}"
+                    for g in (diagnosis.get("missing_knowledge") or ["coverage"])[:4]
+                ]
+                if goal not in queries:
+                    queries = [goal] + queries
+                queries = queries[:6]
+                current_approach = str(diagnosis.get("approach") or current_approach)
+                # Refresh prior history for next merge
+                prior_history = self.memory.get_topic_knowledge(topic, limit=8)
+
             outcome = (
-                f"DONE. Learning complete — knowledge verified & saved.\n"
-                f"Topic: {topic}\n"
-                f"Summary: {(saved.get('entry') or {}).get('summary', '')[:400]}\n"
-                f"Sources: {len((research.get('sources') or []))}"
+                f"LEARNING VERIFY FAIL after {MAX_LEARNING_ATTEMPTS} attempts: "
+                f"{(verification or {}).get('reason')}. DONE nav atļauts. "
+                f"Knowledge draft under topic:{topic}."
             )
-            self._status("SAVE_EXPERIENCE")
             self.memory.save_experience(
-                goal, outcome, True,
+                goal, outcome, False,
                 details={
                     "topic": topic,
                     "verification": verification,
-                    "knowledge": saved.get("entry"),
                     "task_id": task_id,
                     "intent": "learning",
+                    "attempts": MAX_LEARNING_ATTEMPTS,
+                    "failed_approaches": [
+                        a.get("approach") for a in failed_approaches[:10]
+                    ],
                 },
             )
             self.ledger.finish(
-                task_id,
-                True,
-                {"topic": topic, "verified": True, "intent": "learning"},
+                task_id, False,
+                {"outcome": outcome, "topic": topic, "attempts": MAX_LEARNING_ATTEMPTS},
             )
-            self._status("DONE")
-            self._log(f"[{task_id}] DONE (learning topic={topic})")
             return {
                 "type": "learning",
-                "success": True,
+                "success": False,
                 "task_id": task_id,
                 "reply": outcome,
                 "outcome": outcome,
                 "topic": topic,
-                "knowledge": saved.get("entry"),
                 "verification": verification,
+                "attempts": MAX_LEARNING_ATTEMPTS,
             }
         except Exception as exc:
             tb = traceback.format_exc()
@@ -360,6 +553,234 @@ class Orchestrator:
                 "outcome": outcome,
             }
 
+    def _initial_learning_queries(self, goal: str) -> list[str]:
+        queries = [goal]
+        if self.brain.is_available():
+            try:
+                extra = self.brain.generate(
+                    f"Learning request:\n{goal}\n\n"
+                    "Reply ONLY with JSON: {\"queries\":[\"...\"]}\n"
+                    "3-6 focused research queries for this topic. "
+                    "Do not mention skills, file creation, or prior capabilities.",
+                    system="You plan research queries for knowledge learning.",
+                    temperature=0.2,
+                )
+                parsed = self.brain._parse_json(extra, {"queries": []})
+                if isinstance(parsed.get("queries"), list) and parsed["queries"]:
+                    queries = [str(q) for q in parsed["queries"][:6]]
+            except Exception:
+                pass
+        if goal not in queries:
+            queries = [goal] + [q for q in queries if q != goal]
+        return queries[:6]
+
+    @classmethod
+    def _learning_strip_skill_defaults(cls, research: dict[str, Any]) -> dict[str, Any]:
+        """Remove skill-repair defaults that pollute learning knowledge."""
+        out = dict(research or {})
+        test_idea = str(out.get("test_idea") or "")
+        if _SKILL_TEST_IDEA_RE.search(test_idea):
+            out["test_idea"] = ""
+        approach = str(out.get("approach") or "")
+        if any(
+            tok in approach.lower()
+            for tok in (
+                "skill must define skill_meta",
+                "return concrete result.path",
+                "implement python solution for",
+            )
+        ):
+            # Keep raw; clear skill-centric approach so enrich can rebuild
+            out["approach"] = ""
+        return out
+
+    def _enrich_learning_research(
+        self,
+        research: dict[str, Any],
+        *,
+        goal: str,
+        missing: Optional[list] = None,
+        approach_label: str = "",
+    ) -> dict[str, Any]:
+        """Ensure learning research has structured notes (universal, no topic hardcode)."""
+        out = dict(research or {})
+        missing = [str(m) for m in (missing or []) if m]
+
+        if self.brain.is_available():
+            try:
+                notes = self.brain.research_notes(
+                    f"LEARNING (not a skill): {goal}\n"
+                    f"Missing knowledge to fill: {missing or ['core concepts', 'practice checks']}\n"
+                    f"Approach label: {approach_label}",
+                    str(out.get("raw") or "")[:8000],
+                )
+                if isinstance(notes, dict):
+                    if notes.get("approach"):
+                        out["approach"] = notes["approach"]
+                    for key in ("libraries", "key_apis", "pitfalls"):
+                        merged = list(out.get(key) or [])
+                        for item in notes.get(key) or []:
+                            if item not in merged:
+                                merged.append(item)
+                        out[key] = merged
+                    tip = str(notes.get("test_idea") or "")
+                    if tip and not _SKILL_TEST_IDEA_RE.search(tip):
+                        out["test_idea"] = tip
+            except Exception as exc:
+                self._log(f"LEARNING enrich brain notes failed ({exc}); offline")
+
+        # Offline structured extraction when still thin
+        key_apis = list(out.get("key_apis") or [])
+        pitfalls = list(out.get("pitfalls") or [])
+        test_idea = str(out.get("test_idea") or "")
+        approach = str(out.get("approach") or "").strip()
+        raw = str(out.get("raw") or "")
+
+        if not key_apis:
+            # Pull significant tokens / Hint lines from gathered research
+            for line in raw.splitlines():
+                s = line.strip().lstrip("-").strip()
+                if s.lower().startswith("hint:"):
+                    tip = s.split(":", 1)[-1].strip()
+                    if tip and tip not in key_apis:
+                        key_apis.append(tip)
+            for tok in IntentClassifier._keywords(goal):
+                if len(tok) >= 4 and tok not in key_apis:
+                    key_apis.append(tok)
+                if len(key_apis) >= 8:
+                    break
+            out["key_apis"] = key_apis[:12]
+
+        if not pitfalls and missing:
+            out["pitfalls"] = [
+                f"Previously missing: {m}" for m in missing[:6]
+            ]
+
+        if not test_idea or _SKILL_TEST_IDEA_RE.search(test_idea):
+            # Universal practice check derived from the request — not skill-run
+            concepts = IntentClassifier._keywords(goal)[:5]
+            out["test_idea"] = (
+                "Self-check: explain "
+                + (", ".join(concepts) if concepts else "the topic")
+                + " and answer 3 practice questions covering the USER REQUEST."
+            )
+
+        if not approach or len(approach) < 40:
+            apis = ", ".join(str(x) for x in (out.get("key_apis") or [])[:6])
+            out["approach"] = (
+                f"{approach_label or 'learning'}: study concepts for: {goal}. "
+                f"Focus points: {apis}. "
+                f"Verify with: {out.get('test_idea')}"
+            )[:1200]
+
+        return out
+
+    def _diagnose_learning_gap(
+        self,
+        *,
+        task_goal: TaskGoal,
+        observation: dict[str, Any],
+        verification: dict[str, Any],
+        research: dict[str, Any],
+        failed_approaches: list,
+        prior_knowledge: list,
+        attempt: int,
+    ) -> dict[str, Any]:
+        """Identify missing knowledge and propose a NEW research approach."""
+        missing = list(verification.get("missing_knowledge") or [])
+        if not missing:
+            missing = [
+                c.get("name")
+                for c in (verification.get("checks") or [])
+                if not c.get("ok") and c.get("name") != "brain_advisory"
+            ]
+        failed_labels = [
+            str(a.get("approach") or "")
+            for a in (failed_approaches or [])
+            if a.get("approach")
+        ]
+        root = str(verification.get("reason") or observation.get("exception") or "")[:500]
+
+        if self.brain.is_available():
+            try:
+                system = (
+                    "You diagnose a failed LEARNING/knowledge verification. "
+                    "Reply ONLY with JSON:\n"
+                    "{\n"
+                    '  "root_cause": "...",\n'
+                    '  "missing_knowledge": ["gap1", "gap2"],\n'
+                    '  "approach": "NEW strategy label not in failed_approaches",\n'
+                    '  "approach_changed": true,\n'
+                    '  "research_queries": ["..."],\n'
+                    '  "diagnosis": "summary"\n'
+                    "}\n"
+                    "Rules:\n"
+                    "- Identify what knowledge is missing vs the USER REQUEST.\n"
+                    "- research_queries must target those gaps (2-6 queries).\n"
+                    "- approach MUST differ from every failed_approaches label.\n"
+                    "- This is learning — do NOT propose skill code or file creation.\n"
+                    "- No topic hardcoding; stay grounded in the request + failure."
+                )
+                payload = {
+                    "user_request": task_goal.user_request,
+                    "goal": task_goal.goal,
+                    "verification": {
+                        "reason": verification.get("reason"),
+                        "missing_knowledge": missing,
+                        "checks": verification.get("checks"),
+                    },
+                    "research_summary": {
+                        "approach": research.get("approach"),
+                        "key_apis": list(research.get("key_apis") or [])[:10],
+                        "pitfalls": list(research.get("pitfalls") or [])[:8],
+                        "test_idea": research.get("test_idea"),
+                    },
+                    "failed_approaches": failed_labels[:10],
+                    "prior_knowledge_count": len(prior_knowledge or []),
+                    "attempt": attempt,
+                }
+                raw = self.brain.generate(
+                    json.dumps(payload, ensure_ascii=False, default=str)[:10000],
+                    system=system,
+                    temperature=0.3,
+                )
+                parsed = self.brain._parse_json(raw, {})
+                if isinstance(parsed, dict) and parsed.get("research_queries"):
+                    parsed.setdefault("missing_knowledge", missing)
+                    parsed.setdefault("root_cause", root)
+                    parsed.setdefault(
+                        "approach",
+                        f"fill_gaps_v{attempt + 1}",
+                    )
+                    parsed["approach_changed"] = True
+                    return parsed
+            except Exception as exc:
+                self._log(f"LEARNING diagnose brain failed ({exc}); offline")
+
+        # Offline gap → query synthesis (universal)
+        queries = [
+            f"{task_goal.user_request} — deepen: {m}"
+            for m in (missing or ["core concepts"])[:4]
+        ]
+        queries.append(f"fundamentals and practice checks for: {task_goal.goal}")
+        for tok in IntentClassifier._keywords(task_goal.user_request)[:4]:
+            queries.append(f"{tok} explained with examples and self-test questions")
+        # Dedupe
+        out_q: list[str] = []
+        for q in queries:
+            q = " ".join(str(q).split())
+            if q and q not in out_q:
+                out_q.append(q)
+        approach = f"fill_missing_{'+'.join(missing[:3]) or 'coverage'}_v{attempt + 1}"
+        return {
+            "root_cause": root,
+            "missing_knowledge": missing or ["structured_notes", "topic_alignment"],
+            "approach": approach,
+            "approach_changed": True,
+            "research_queries": out_q[:6],
+            "diagnosis": f"Learning verify failed; missing={missing}",
+        }
+
     def _verify_learning_knowledge(
         self,
         task_goal: TaskGoal,
@@ -368,10 +789,13 @@ class Orchestrator:
     ) -> dict[str, Any]:
         """Independent checks that researched knowledge matches the USER REQUEST."""
         checks: list[dict[str, Any]] = []
+        missing: list[str] = []
         request = task_goal.user_request
         raw = str(research.get("raw") or "")
         approach = str(research.get("approach") or entry.get("summary") or "")
         key_apis = list(research.get("key_apis") or [])
+        pitfalls = list(research.get("pitfalls") or [])
+        test_idea = str(research.get("test_idea") or entry.get("test_idea") or "")
         sources = list(research.get("sources") or [])
         results = list(research.get("results") or [])
 
@@ -384,6 +808,8 @@ class Orchestrator:
                 f"key_apis={len(key_apis)}"
             ),
         })
+        if not has_body:
+            missing.append("knowledge_body")
 
         has_sources = bool(sources) or bool(results)
         checks.append({
@@ -391,30 +817,57 @@ class Orchestrator:
             "ok": has_sources,
             "detail": f"sources={len(sources)} results={len(results)}",
         })
+        if not has_sources:
+            missing.append("knowledge_sources")
 
-        # Topic tokens from the request must appear in gathered knowledge
+        # Structured learning notes — raw dump / skill defaults are not enough
+        learning_test = bool(test_idea) and not _SKILL_TEST_IDEA_RE.search(test_idea)
+        has_structure = bool(key_apis) or bool(pitfalls) or learning_test
+        # Approach must exist and not be only a skill-template sentence
+        approach_ok = bool(approach.strip()) and not any(
+            tok in approach.lower()
+            for tok in (
+                "skill must define skill_meta",
+                "return concrete result.path",
+            )
+        )
+        structured_ok = has_structure and approach_ok
+        checks.append({
+            "name": "structured_notes",
+            "ok": structured_ok,
+            "detail": (
+                f"key_apis={len(key_apis)} pitfalls={len(pitfalls)} "
+                f"learning_test={learning_test} approach_ok={approach_ok}"
+            ),
+        })
+        if not structured_ok:
+            missing.append("structured_notes")
+
+        # Topic tokens must appear in STRUCTURED notes (not only raw scrape)
         tokens = [
             t for t in IntentClassifier._keywords(request)
             if len(t) >= 4
         ][:8]
-        blob = (raw + "\n" + approach + "\n" + " ".join(str(x) for x in key_apis)).lower()
-        hit = 0
-        for t in tokens:
-            if t.lower() in blob or t.lower() in request.lower():
-                # Count request tokens present in knowledge OR trivially in request
-                # Prefer presence in research body
-                if t.lower() in blob:
-                    hit += 1
-        # If we have few tokens, require at least one hit in body; else >= half
+        structured_blob = (
+            approach + "\n"
+            + " ".join(str(x) for x in key_apis) + "\n"
+            + " ".join(str(x) for x in pitfalls) + "\n"
+            + test_idea
+        ).lower()
+        hit = sum(1 for t in tokens if t.lower() in structured_blob)
         need = 1 if len(tokens) <= 2 else max(1, len(tokens) // 2)
-        topic_ok = hit >= need if tokens else has_body
+        topic_ok = hit >= need if tokens else structured_ok
         checks.append({
             "name": "topic_alignment",
             "ok": topic_ok,
-            "detail": f"token_hits={hit}/{len(tokens)} need>={need}",
+            "detail": f"structured_token_hits={hit}/{len(tokens)} need>={need}",
         })
+        if not topic_ok:
+            missing.append("topic_alignment")
+            for t in tokens:
+                if t.lower() not in structured_blob and t.lower() not in missing:
+                    missing.append(f"concept:{t}")
 
-        # Reject accidental skill-repair contamination in a learning summary
         repair_jargon = (
             "rewrite_skill", "skill body not implemented", "fault_layer",
             "protect_active", "pending_path",
@@ -429,9 +882,11 @@ class Orchestrator:
                 else "knowledge contaminated by prior skill repair jargon"
             ),
         })
+        if contaminated:
+            missing.append("no_skill_inherit")
 
         summary = approach or (raw[:500] if raw else "")
-        if self.brain.is_available() and has_body:
+        if self.brain.is_available() and has_body and structured_ok:
             try:
                 judgment = self.brain.verify_claim(
                     request,
@@ -451,7 +906,6 @@ class Orchestrator:
                 })
 
         substantive = [c for c in checks if c["name"] != "brain_advisory"]
-        # Advisory may fail without blocking if substantive pass
         verified = all(c["ok"] for c in substantive) and bool(substantive)
         reason = (
             "LEARNING VERIFY PASS — topic knowledge covers USER REQUEST"
@@ -464,6 +918,7 @@ class Orchestrator:
             "verified": verified,
             "reason": reason,
             "checks": checks,
+            "missing_knowledge": missing,
             "summary": summary[:2000],
         }
 
