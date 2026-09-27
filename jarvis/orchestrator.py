@@ -1,11 +1,12 @@
 """
 JARVIS orchestrator — the autonomous learning cycle.
 
-REQUEST → PLAN → check capabilities → research → learn → build skill →
-install deps → test → repair loop → verify → save ACTIVE skill →
-execute original task → save experience → DONE
+REQUEST → PLAN → check capabilities → research → learn → build/reuse skill →
+install deps → TEST skill (process) → EXECUTE original task →
+collect artifacts → VERIFY against original TaskGoal → DONE.
 
-DONE is only allowed after factual verification.
+TEST PASS is never task success. DONE requires EXECUTE then VERIFY PASS.
+On VERIFY FAIL: repair with full TaskGoal context (never unchanged approach).
 """
 
 from __future__ import annotations
@@ -161,8 +162,8 @@ class Orchestrator:
         )
         self.observer = Observer(self.workspace, on_log=self._log)
         self.contexts = ContextBuilder(brain=self.brain, on_log=self._log)
-        # Ephemeral: last repair VERIFY PASS proof (skip duplicate execute+verify)
-        self._activation_proof: Optional[dict[str, Any]] = None
+        # Last EXECUTE+VERIFY bundle for this task (never from TEST alone)
+        self._verified_exec_bundle: Optional[dict[str, Any]] = None
         # Per-request reuse cache + performance telemetry
         self._request_cache: dict[str, Any] = {}
         self.perf = PerfTracker()
@@ -1538,6 +1539,8 @@ class Orchestrator:
         goal = task_goal.goal  # planner summary; VERIFY always uses task_goal
 
         task_id = self.ledger.start_task(goal)
+        # Fresh cycle — never carry TEST/prior EXECUTE proof into DONE
+        self._verified_exec_bundle = None
         self._status("REQUEST")
         self._log(f"[{task_id}] REQUEST: {task_goal.user_request}")
         self.ledger.log(
@@ -1687,11 +1690,9 @@ class Orchestrator:
 
             skill_record = None
             exec_result = None
-            reused_compatible = False
 
             if matched and not plan.get("needs_new_skill"):
                 skill_record = matched[0]
-                reused_compatible = True
                 self._log(f"[{task_id}] Reusing ACTIVE skill: {skill_record['name']}")
                 # Refresh args with skill meta hints — still grounded to TaskGoal
                 task_args = self.contexts.build(
@@ -1750,21 +1751,7 @@ class Orchestrator:
                         task_id, skill_record, goal, task_args, task_goal
                     )
 
-            # VERIFY final execution against USER REQUEST — not skill self-proof
-            # (skipped when repair already VERIFY'd — proof reused below)
-            proof_v = None
-            if (
-                isinstance(exec_result, dict)
-                and exec_result.get("_from_activation_proof")
-                and isinstance(exec_result.get("_verification"), dict)
-                and exec_result["_verification"].get("verified")
-            ):
-                proof_v = exec_result["_verification"]
-                self._log(
-                    f"[{task_id}] Reusing repair VERIFY PASS "
-                    f"(skip duplicate execute+VERIFY)"
-                )
-
+            # VERIFY only after EXECUTE of the original task (TEST ≠ task success)
             self._status("VERIFY")
             if not exec_result:
                 outcome = "Neizdevās izpildīt uzdevumu: nav skill / nav izpildes rezultāta."
@@ -1785,8 +1772,29 @@ class Orchestrator:
                 }
 
             self._log(
-                f"[{task_id}] SKILL RESULT: ok={exec_result.get('ok')} "
+                f"[{task_id}] SKILL RESULT (EXECUTE): ok={exec_result.get('ok')} "
                 f"rc={exec_result.get('returncode')} error={exec_result.get('error')}"
+            )
+            # Reuse VERIFY from EXECUTE+VERIFY bundle when learn loop already proved it
+            proof_v = None
+            if (
+                isinstance(exec_result, dict)
+                and exec_result.get("_from_verified_exec_bundle")
+                and isinstance(exec_result.get("_verification"), dict)
+                and exec_result["_verification"].get("verified")
+            ):
+                proof_v = exec_result["_verification"]
+            # Collect workspace artifacts for VERIFY / repair context
+            actual_artifacts = (
+                list(exec_result.get("_actual_artifacts") or [])
+                if proof_v is not None
+                else self._list_workspace_artifacts()
+            )
+            if not actual_artifacts:
+                actual_artifacts = self._list_workspace_artifacts()
+            self._log(
+                f"[{task_id}] ARTIFACTS after EXECUTE: "
+                f"{len(actual_artifacts)} file(s)"
             )
             if proof_v is not None:
                 verification = proof_v
@@ -1799,7 +1807,9 @@ class Orchestrator:
                         "verifier_result": verification.get("verifier_result"),
                         "args": task_args,
                         "task_goal": task_goal.to_dict(),
-                        "reused_activation_proof": True,
+                        "actual_artifacts": actual_artifacts[:20],
+                        "after_execute": True,
+                        "reused_verified_exec_bundle": True,
                     },
                 )
             else:
@@ -1821,6 +1831,8 @@ class Orchestrator:
                         "verifier_result": verification.get("verifier_result"),
                         "args": task_args,
                         "task_goal": task_goal.to_dict(),
+                        "actual_artifacts": actual_artifacts[:20],
+                        "after_execute": True,
                     },
                 )
             self._emit_verify(verification, context="execute")
@@ -1906,21 +1918,27 @@ class Orchestrator:
                     task_goal=task_goal,
                 )
                 if skill_record and skill_record.get("status") == "ACTIVE":
+                    # EXECUTE+VERIFY after repair — reuse bundle only if post-EXECUTE
                     exec_result = self._exec_after_repair(
                         task_id, skill_record, goal, task_args, task_goal
                     )
                     self._status("VERIFY")
                     if (
                         isinstance(exec_result, dict)
-                        and exec_result.get("_from_activation_proof")
+                        and exec_result.get("_from_verified_exec_bundle")
                         and isinstance(exec_result.get("_verification"), dict)
                     ):
                         verification = exec_result["_verification"]
+                        actual_artifacts = list(
+                            exec_result.get("_actual_artifacts")
+                            or self._list_workspace_artifacts()
+                        )
                         self._log(
-                            f"[{task_id}] Reusing repair VERIFY PASS "
+                            f"[{task_id}] Reusing EXECUTE+VERIFY PASS "
                             f"(after outer VERIFY FAIL repair)"
                         )
                     else:
+                        actual_artifacts = self._list_workspace_artifacts()
                         verification = self.verifier.verify(
                             goal,
                             exec_result,
@@ -1939,7 +1957,9 @@ class Orchestrator:
                             "verifier_result": verification.get("verifier_result"),
                             "args": task_args,
                             "task_goal": task_goal.to_dict(),
+                            "actual_artifacts": actual_artifacts[:20],
                             "after_repair": True,
+                            "after_execute": True,
                         },
                     )
                     self._log(
@@ -2054,7 +2074,13 @@ class Orchestrator:
         """
         Universal learning loop (no task-specific hardcoding):
 
-        BUILD → TEST → OBSERVE → DIAGNOSE → RESEARCH? → REPAIR → RETEST → VERIFY → ACTIVE
+        BUILD/REPAIR → TEST (process only) → EXECUTE original task →
+        collect artifacts → VERIFY vs TaskGoal → ACTIVE + verified bundle.
+
+        TEST PASS never activates or marks task success. On VERIFY FAIL:
+        OBSERVE → DIAGNOSE → REPAIR with full TaskGoal context (never an
+        unchanged repair approach). Outer run_cycle may reuse the verified
+        EXECUTE bundle for DONE, or re-enter here with verify_failure.
 
         TaskGoal (original USER REQUEST) is immutable across the whole loop.
         Returns (skill_record, task_args, task_goal).
@@ -2192,6 +2218,8 @@ class Orchestrator:
         # Seed from a final-EXECUTE verifier failure so the first loop iteration
         # OBSERVE→DIAGNOSE that mismatch (defaults / wrong artifact vs USER REQUEST).
         if verify_failure and repair_of:
+            expected_arts = list(task_goal.artifacts)
+            actual_arts = self._list_workspace_artifacts()
             seed_obs = self.observer.observe_failure(
                 goal=goal,
                 skill_name=skill_name,
@@ -2201,16 +2229,27 @@ class Orchestrator:
                 context={
                     "goal": goal,
                     "user_request": task_goal.user_request,
+                    "task_goal": task_goal.to_dict(),
                     "args": args,
                     "workspace": str(self.workspace),
+                    "expected_artifacts": expected_arts,
+                    "actual_artifacts": actual_arts[:40],
+                    "content_requirements": list(task_goal.content_requirements),
+                    "success_criteria": list(task_goal.success_criteria),
+                    "verifier_error": str(verify_failure.get("reason") or "")[:2000],
+                    "previous_failures": failed_approaches[:8],
                 },
                 dependencies=list(repair_of.get("dependencies") or []),
                 test_result={
-                    "ok": True,
+                    "ok": bool((verify_failure.get("skill_result") or {}).get("ok", True)),
                     "error": verify_failure.get("reason"),
                     "result": (verify_failure.get("skill_result") or {}).get("result"),
                     "evidence": (verify_failure.get("skill_result") or {}).get("evidence"),
-                    "returncode": 0,
+                    "stdout": (verify_failure.get("skill_result") or {}).get("stdout"),
+                    "stderr": (verify_failure.get("skill_result") or {}).get("stderr"),
+                    "returncode": (verify_failure.get("skill_result") or {}).get(
+                        "returncode", 0
+                    ),
                 },
                 verification=verify_failure,
                 prior_approaches=failed_approaches,
@@ -2330,6 +2369,42 @@ class Orchestrator:
                         source=built.get("source") or phase_build,
                         code=str(built.get("code") or "")[:12000],
                     )
+                # Never accept an unchanged skill_code repair as progress
+                if (
+                    built.get("ok")
+                    and last_code
+                    and (diagnosis or {}).get("rewrite_skill", True)
+                ):
+                    new_fp = Observer.fingerprint_code(str(built.get("code") or ""))
+                    old_fp = Observer.fingerprint_code(str(last_code or ""))
+                    if new_fp and new_fp == old_fp:
+                        self._log(
+                            f"[{task_id}] REPAIR REJECTED: unchanged skill code "
+                            f"(fp={new_fp[:8]}) approach={current_approach!r} — "
+                            f"forcing divergent approach"
+                        )
+                        self.memory.record_failed_approach(
+                            skill_name,
+                            current_approach,
+                            Observer.fingerprint_approach(current_approach),
+                            last_error="unchanged_repair_code",
+                        )
+                        current_approach = (
+                            f"{current_approach}::changed_code::{attempt_version}"
+                        )
+                        if isinstance(diagnosis, dict):
+                            diagnosis = dict(diagnosis)
+                            diagnosis["approach"] = current_approach
+                            diagnosis["approach_changed"] = True
+                            diagnosis["approach_fingerprint"] = (
+                                Observer.fingerprint_approach(current_approach)
+                            )
+                        # Treat as failed build iteration — re-diagnose / rebuild
+                        built = {
+                            **built,
+                            "ok": False,
+                            "error": "unchanged repair code rejected",
+                        }
                 self.ledger.log(
                     task_id,
                     phase_build,
@@ -2491,18 +2566,52 @@ class Orchestrator:
                 or not test_result.get("ok")
             )
             verification = None
+            exec_result: Optional[dict[str, Any]] = None
+            actual_artifacts: list[dict[str, Any]] = []
+
             if not test_failed:
-                # ── VERIFY against original TaskGoal (not skill claims) ─
+                # TEST PASS ≠ task success — EXECUTE original task, then VERIFY TaskGoal
+                self._log(
+                    f"[{task_id}] SKILL TEST PASS — running EXECUTE of original task "
+                    f"before TaskGoal VERIFY"
+                )
+                self._status("EXECUTE")
+                from jarvis.skill_runner import run_skill_subprocess
+
+                exec_result = run_skill_subprocess(
+                    skill_path=built["path"],
+                    goal=goal,
+                    workspace=self.workspace,
+                    args=args,
+                    mode="execute",
+                    timeout=float(getattr(self.tester, "timeout", 60.0) or 60.0),
+                )
+                self._emit_subprocess(exec_result, mode="execute")
+                self.ledger.log(
+                    task_id,
+                    "EXECUTE",
+                    f"ok={exec_result.get('ok')} rc={exec_result.get('returncode')}",
+                    {
+                        "error": exec_result.get("error"),
+                        "args": args,
+                        "after_test": True,
+                    },
+                )
+                actual_artifacts = self._list_workspace_artifacts()
+                self._log(
+                    f"[{task_id}] ARTIFACTS after EXECUTE: "
+                    f"{len(actual_artifacts)} file(s)"
+                )
                 self._status("VERIFY")
                 verification = self.verifier.verify(
                     goal,
-                    test_result,
+                    exec_result,
                     args=args,
                     user_request=task_goal.user_request,
                     constraints=task_goal.with_args(args).constraints,
                     task_goal=task_goal,
                 )
-                self._emit_verify(verification, context="repair")
+                self._emit_verify(verification, context="after_execute")
                 self.ledger.log(
                     task_id,
                     "VERIFY",
@@ -2512,18 +2621,21 @@ class Orchestrator:
                         "verifier_result": verification.get("verifier_result"),
                         "args": args,
                         "task_goal": task_goal.to_dict(),
+                        "actual_artifacts": actual_artifacts[:20],
+                        "after_execute": True,
                     },
                 )
                 self.calibration.observe_verify(
                     verified=bool(verification.get("verified")),
                     domain="repair",
                     approach=current_approach,
-                    approach_fingerprint=Observer.fingerprint_approach(current_approach),
+                    approach_fingerprint=Observer.fingerprint_approach(
+                        current_approach
+                    ),
                     skill_or_topic=skill_name,
-                    extra={"attempt": attempt, "phase": "inner_verify"},
+                    extra={"attempt": attempt, "phase": "execute_verify"},
                 )
                 if verification.get("verified"):
-                    # ── ACTIVE + remember solution ──────────────────────
                     skill = self._activate_and_remember(
                         task_id=task_id,
                         skill_name=skill_name,
@@ -2538,26 +2650,48 @@ class Orchestrator:
                         diagnosis=diagnosis,
                         description=description,
                     )
-                    # Reuse this VERIFY'd exec — avoid re-execute + re-VERIFY tax
-                    self._activation_proof = {
+                    # Bundle is from EXECUTE+VERIFY — safe for DONE (not TEST)
+                    self._verified_exec_bundle = {
                         "task_id": task_id,
                         "skill_name": skill_name,
-                        "exec_result": test_result,
+                        "exec_result": exec_result,
                         "verification": verification,
                         "args": dict(args or {}),
+                        "actual_artifacts": actual_artifacts[:20],
                     }
                     return skill, args, task_goal
 
-            # ── OBSERVE → DIAGNOSE → fix the correct layer ─────────────
+            # ── OBSERVE → DIAGNOSE (TEST fail OR EXECUTE/VERIFY fail) ───
+            fail_phase = (
+                "VERIFY"
+                if (not test_failed and verification and not verification.get("verified"))
+                else phase_test
+            )
+            fail_result = exec_result if exec_result is not None else test_result
             obs = self.observer.observe_failure(
                 goal=goal,
                 skill_name=skill_name,
                 version=attempt_version,
-                phase="VERIFY" if (not test_failed and verification) else phase_test,
+                phase=fail_phase,
                 skill_code=(built or {}).get("code"),
-                context=test_context,
+                context={
+                    **test_context,
+                    "user_request": task_goal.user_request,
+                    "task_goal": task_goal.to_dict(),
+                    "expected_artifacts": list(task_goal.artifacts),
+                    "actual_artifacts": actual_artifacts[:40]
+                    or self._list_workspace_artifacts()[:40],
+                    "content_requirements": list(task_goal.content_requirements),
+                    "success_criteria": list(task_goal.success_criteria),
+                    "verifier_error": str(
+                        (verification or {}).get("reason")
+                        or (fail_result or {}).get("error")
+                        or ""
+                    )[:2000],
+                    "previous_failures": failed_approaches[:8],
+                },
                 dependencies=deps_list,
-                test_result=test_result,
+                test_result=fail_result,
                 verification=verification,
                 prior_approaches=failed_approaches,
                 prior_diagnoses=[
@@ -3314,10 +3448,11 @@ class Orchestrator:
         task_goal: TaskGoal,
     ) -> dict:
         """
-        Prefer VERIFY'd repair proof over a second execute+VERIFY cycle.
+        Prefer a just-completed EXECUTE+VERIFY PASS bundle from the learn loop.
+        Never treat TEST-only proof as success — bundle is always post-EXECUTE.
         """
-        proof = self._activation_proof
-        self._activation_proof = None
+        proof = self._verified_exec_bundle
+        self._verified_exec_bundle = None
         if (
             isinstance(proof, dict)
             and proof.get("task_id") == task_id
@@ -3327,8 +3462,13 @@ class Orchestrator:
             and isinstance(proof.get("exec_result"), dict)
         ):
             out = dict(proof["exec_result"])
-            out["_from_activation_proof"] = True
+            out["_from_verified_exec_bundle"] = True
             out["_verification"] = proof["verification"]
+            out["_actual_artifacts"] = list(proof.get("actual_artifacts") or [])
+            self._log(
+                f"[{task_id}] Reusing EXECUTE+VERIFY PASS bundle "
+                f"(skip duplicate execute+VERIFY)"
+            )
             return out
         return self._execute_trusted(
             task_id, skill, goal, args=task_args, task_goal=task_goal
