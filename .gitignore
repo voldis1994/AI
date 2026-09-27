@@ -1,0 +1,14 @@
+data/
+workspace_runtime/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+skills/*.bak.py
+skills/*.v*.bak.py
+!skills/__init__.py
+*.log
+.DS_Store
