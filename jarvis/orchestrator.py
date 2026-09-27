@@ -1539,6 +1539,8 @@ class Orchestrator:
         goal = task_goal.goal  # planner summary; VERIFY always uses task_goal
 
         task_id = self.ledger.start_task(goal)
+        # Fresh cycle — never carry TEST/prior EXECUTE proof into DONE
+        self._verified_exec_bundle = None
         self._status("REQUEST")
         self._log(f"[{task_id}] REQUEST: {task_goal.user_request}")
         self.ledger.log(
