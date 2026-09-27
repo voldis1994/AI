@@ -341,11 +341,30 @@ class ContextBuilder:
         empty_or_partial = (not ctx_args) or bool(missing and any(
             m not in ctx_args or ctx_args.get(m) in (None, "") for m in missing
         ))
-        args_signal = bool(parsed) or any(
-            tok in err.lower()
-            for tok in ("argument", "args", "missing", "required", "keyerror")
+        err_l = err.lower()
+        phase = str(observation.get("phase") or "").upper()
+        # VERIFY goal-mismatch / defaults are skill faults — do not reclassify
+        # as context_args just because the reason text contains "missing".
+        verify_goal_fault = phase == "VERIFY" and any(
+            tok in err_l
+            for tok in (
+                "default", "placeholder", "untrusted", "reject_defaults",
+                "claim_aligns", "user request", "user constraints",
+                "not in user",
+            )
         )
-        if empty_or_partial and args_signal:
+        args_signal = bool(parsed) or (
+            any(
+                tok in err_l
+                for tok in ("argument", "args", "required", "keyerror")
+            )
+            or (
+                "missing" in err_l
+                and "missing from expected" not in err_l
+                and "user constraints" not in err_l
+            )
+        )
+        if empty_or_partial and args_signal and not verify_goal_fault:
             diagnosis["fault_layer"] = "context_args"
             diagnosis["rewrite_skill"] = False
             if not diagnosis.get("approach") or diagnosis.get("approach") in (
@@ -357,6 +376,9 @@ class ContextBuilder:
                 diagnosis["what_to_change"] = (
                     "Prepare structured context['args'] from the user goal and retest"
                 )
+        elif verify_goal_fault:
+            diagnosis["fault_layer"] = "skill_code"
+            diagnosis["rewrite_skill"] = True
 
         suggested = dict(diagnosis.get("suggested_args") or {})
         if diagnosis.get("fault_layer") == "context_args" or missing:

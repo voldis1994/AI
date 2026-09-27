@@ -314,6 +314,8 @@ class Brain:
             "CRITICAL argument rules:\n"
             "- Read parameters ONLY from context['args'] (and goal/workspace as needed).\n"
             "- NEVER invent/guess missing argument values.\n"
+            "- NEVER use placeholder/default paths or default content when the goal/args "
+            "specify real values — implement exactly what the user requested.\n"
             "- If required args are missing from context['args'], return ok=False with "
             "error listing the missing keys — do not fabricate them.\n"
             "Use only stdlib + declared dependencies. Be concrete and correct. "
@@ -386,9 +388,12 @@ class Brain:
             "context (especially context.args), dependencies, artifacts.\n"
             "- If context.args is empty/missing keys the skill needs, fault_layer MUST be "
             "context_args and rewrite_skill=false. Fill suggested_args from the goal.\n"
-            "- Only set fault_layer=skill_code / rewrite_skill=true when the code itself is wrong "
-            "even with correct args.\n"
-            "- dependency: import/install failures. verifier: skill ok but evidence fails checks. "
+            "- If VERIFY failed because the skill used default/placeholder values or created "
+            "artifacts that do not match the USER REQUEST / goal constraints, fault_layer MUST "
+            "be skill_code and rewrite_skill=true — the skill must implement the real request.\n"
+            "- Only set fault_layer=verifier when the verifier harness itself is wrong "
+            "(not when the skill output simply fails user constraints).\n"
+            "- dependency: import/install failures. "
             "test_harness: runner did not pass context correctly.\n"
             "- If the same approach already failed, set approach_changed=true "
             "and propose a meaningfully different approach.\n"
@@ -419,25 +424,50 @@ class Brain:
         ctx_args = ctx.get("args") if isinstance(ctx, dict) else {}
         empty_args = not isinstance(ctx_args, dict) or len(ctx_args) == 0
         err = str(observation.get("exception") or "").lower()
+        phase = str(observation.get("phase") or "").upper()
         args_fault = empty_args and any(
             tok in err for tok in ("argument", "args", "missing", "required", "keyerror")
         )
+        # VERIFY mismatch / defaults → skill must be rewritten to honor USER REQUEST
+        goal_mismatch = phase == "VERIFY" and any(
+            tok in err
+            for tok in (
+                "default", "placeholder", "untrusted", "claim_aligns",
+                "not in user", "user constraints", "user request",
+                "contains(", "missing from expected", "reject_defaults",
+            )
+        )
+        if args_fault and not goal_mismatch:
+            fb_layer = "context_args"
+        elif goal_mismatch:
+            fb_layer = "skill_code"
+        else:
+            fb_layer = "skill_code"
         fallback = {
             "root_cause": str(observation.get("exception") or "unknown")[:500],
-            "fault_layer": "context_args" if args_fault else "skill_code",
-            "rewrite_skill": not args_fault,
+            "fault_layer": fb_layer,
+            "rewrite_skill": fb_layer == "skill_code",
             "what_to_change": (
                 "Prepare structured context['args'] from the user goal and retest"
-                if args_fault
-                else "Revise skill logic based on stderr/traceback"
+                if fb_layer == "context_args"
+                else (
+                    "Rewrite skill to satisfy USER REQUEST constraints "
+                    "(no default/placeholder artifacts)"
+                    if goal_mismatch
+                    else "Revise skill logic based on stderr/traceback"
+                )
             ),
             "approach": (
                 "context_args_prep"
-                if args_fault
-                else f"alt_approach_v{(observation.get('version') or 0) + 1}"
+                if fb_layer == "context_args"
+                else (
+                    "honor_user_request"
+                    if goal_mismatch
+                    else f"alt_approach_v{(observation.get('version') or 0) + 1}"
+                )
             ),
             "approach_changed": True,
-            "needs_research": not args_fault,
+            "needs_research": fb_layer == "skill_code" and not goal_mismatch,
             "research_queries": [
                 f"python {observation.get('goal', '')}",
                 str(observation.get("exception") or "")[:120],
@@ -446,7 +476,10 @@ class Brain:
             "missing_args": [],
             "required_args": [],
             "suggested_args": {},
-            "test_plan": "Re-run skill in subprocess with prepared args; verify artifacts",
+            "test_plan": (
+                "Retest with prepared args; VERIFY must match USER REQUEST "
+                "(reject defaults / skill self-proof)"
+            ),
             "expected_artifacts": [],
             "is_unfixable": False,
             "diagnosis": str(observation.get("exception") or "failure")[:500],
@@ -459,6 +492,10 @@ class Brain:
         }
         if layer not in valid_layers:
             layer = fallback["fault_layer"]
+        # Force skill rewrite when VERIFY proves goal mismatch / defaults
+        if goal_mismatch:
+            layer = "skill_code"
+            result["rewrite_skill"] = True
         result["fault_layer"] = layer
         if "rewrite_skill" not in result:
             result["rewrite_skill"] = layer == "skill_code"
@@ -478,6 +515,9 @@ class Brain:
         layer = str(result.get("fault_layer") or layer).lower()
         if layer not in valid_layers:
             layer = fallback["fault_layer"]
+        if goal_mismatch:
+            layer = "skill_code"
+            result["rewrite_skill"] = True
         result["fault_layer"] = layer
         if layer == "context_args":
             result["rewrite_skill"] = False

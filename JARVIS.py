@@ -613,6 +613,30 @@ def run(context: dict) -> dict:
         assert "skill_result" in vres and "verifier_result" in vres
         assert vres["verifier_result"]["pass"]
 
+        # Defaults / skill self-proof must NOT earn PASS against a different USER REQUEST
+        (ws / "default_path.txt").write_text("default content\n", encoding="utf-8")
+        bad_sr = {
+            "ok": True,
+            "result": {
+                "path": str(ws / "default_path.txt"),
+                "contains": "default content",
+            },
+            "evidence": f"wrote {ws / 'default_path.txt'}",
+            "error": None,
+            "returncode": 0,
+        }
+        bad = ver.verify(
+            'Create "notes.txt" containing "hello world"',
+            bad_sr,
+            args={"dest": "notes.txt", "body": "hello world"},
+            user_request='Create "notes.txt" containing "hello world"',
+        )
+        assert not bad.get("verified"), bad
+        assert any(
+            c.get("name") == "reject_defaults" and not c.get("ok")
+            for c in bad.get("checks") or []
+        ), bad.get("checks")
+
         # Promote path
         reg.promote_candidate(
             "write_hello_file", str(skill_path), 1,
@@ -1114,6 +1138,224 @@ def run(context: dict) -> dict:
         print("  OK args     empty args → context_args diagnose → retest (no rewrite)")
     except Exception as exc:
         msg = f"E2E_ARGS: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 4c) E2E: default artifact must VERIFY FAIL → skill rewrite → honor USER REQUEST
+    print("  — e2e verifier rejects defaults; repair honors USER REQUEST —")
+    try:
+        def_root = root / "data" / "_e2e_defaults"
+        if def_root.exists():
+            shutil.rmtree(def_root)
+        def_root.mkdir(parents=True)
+
+        class DefaultTrapBrain(Brain):
+            def __init__(self) -> None:
+                super().__init__()
+                self.build_count = 0
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": user_text.split()[:8],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                return {
+                    "steps": ["create requested artifact"],
+                    "can_reuse": [],
+                    "missing": [goal],
+                    "needs_research": True,
+                    "needs_new_skill": True,
+                    "skill_name": "make_artifact",
+                    "skill_description": goal,
+                    "research_queries": [goal],
+                    "args": {"dest": "user_note.txt", "body": "REAL_PAYLOAD"},
+                    "required_args": ["dest", "body"],
+                }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                return {"dest": "user_note.txt", "body": "REAL_PAYLOAD"}
+
+            def research_notes(self, query: str, gathered: str) -> dict:
+                return {
+                    "approach": "default_trap_then_honor_request",
+                    "libraries": [],
+                    "key_apis": [query],
+                    "pitfalls": ["never use default_path / default content"],
+                    "test_idea": "verifier must match USER REQUEST",
+                }
+
+            def write_skill_code(
+                self,
+                skill_name,
+                description,
+                research,
+                previous_code=None,
+                error_log=None,
+                diagnosis=None,
+                failed_approaches=None,
+                test_plan=None,
+            ) -> str:
+                self.build_count += 1
+                import json as _json
+                desc_lit = _json.dumps(description or "")
+                # First build: intentionally writes defaults (must VERIFY FAIL)
+                if self.build_count == 1 and not (
+                    diagnosis and diagnosis.get("rewrite_skill")
+                ):
+                    return f'''
+from pathlib import Path
+SKILL_META = {{
+    "name": "{skill_name}",
+    "description": {desc_lit},
+    "capabilities": ["make_artifact"],
+    "dependencies": [],
+    "version": 1,
+    "required_args": ["dest", "body"],
+}}
+def run(context: dict) -> dict:
+    workspace = Path(context.get("workspace") or ".")
+    path = workspace / "default_path.txt"
+    path.write_text("default content\\n", encoding="utf-8")
+    return {{
+        "ok": True,
+        "result": {{"path": str(path), "contains": "default content"}},
+        "error": None,
+        "evidence": f"wrote {{path}}",
+    }}
+'''
+                # Repair: honor context args / user request
+                return f'''
+from pathlib import Path
+SKILL_META = {{
+    "name": "{skill_name}",
+    "description": {desc_lit},
+    "capabilities": ["make_artifact"],
+    "dependencies": [],
+    "version": {self.build_count},
+    "required_args": ["dest", "body"],
+}}
+def run(context: dict) -> dict:
+    args = context.get("args") or {{}}
+    required = list(SKILL_META.get("required_args") or [])
+    missing = [k for k in required if args.get(k) in (None, "")]
+    if missing:
+        return {{
+            "ok": False,
+            "result": None,
+            "error": "missing required arguments: " + repr(missing),
+            "evidence": "",
+        }}
+    workspace = Path(context.get("workspace") or ".")
+    path = workspace / str(args["dest"])
+    path.write_text(str(args["body"]) + "\\n", encoding="utf-8")
+    return {{
+        "ok": True,
+        "result": {{"path": str(path), "contains": str(args["body"])}},
+        "error": None,
+        "evidence": f"wrote {{path}}",
+    }}
+'''
+
+            def diagnose(self, observation, failed_approaches=None, prior_solutions=None):
+                from jarvis.observer import Observer
+                from jarvis.context_builder import ContextBuilder
+
+                err = str(observation.get("exception") or "")
+                phase = str(observation.get("phase") or "")
+                if phase == "VERIFY" or "default" in err.lower() or "VERIFIER" in err:
+                    approach = "honor_user_request"
+                    fp = Observer.fingerprint_approach(approach)
+                    d = {
+                        "root_cause": "skill used default artifact instead of USER REQUEST",
+                        "fault_layer": "skill_code",
+                        "rewrite_skill": True,
+                        "what_to_change": "Write dest/body from context args; no defaults",
+                        "approach": approach,
+                        "approach_fingerprint": fp,
+                        "approach_changed": True,
+                        "needs_research": False,
+                        "research_queries": [],
+                        "needs_new_deps": [],
+                        "missing_args": [],
+                        "required_args": ["dest", "body"],
+                        "suggested_args": {
+                            "dest": "user_note.txt",
+                            "body": "REAL_PAYLOAD",
+                        },
+                        "test_plan": "VERIFY against USER REQUEST",
+                        "expected_artifacts": ["user_note.txt"],
+                        "is_unfixable": False,
+                        "diagnosis": err[:300],
+                    }
+                    return ContextBuilder.enrich_diagnosis_args(
+                        d, observation, str(observation.get("goal") or "")
+                    )
+                approach = "generic_fix"
+                fp = Observer.fingerprint_approach(approach)
+                return {
+                    "root_cause": err[:500],
+                    "fault_layer": "skill_code",
+                    "rewrite_skill": True,
+                    "what_to_change": "fix skill",
+                    "approach": approach,
+                    "approach_fingerprint": fp,
+                    "approach_changed": True,
+                    "needs_research": False,
+                    "research_queries": [],
+                    "needs_new_deps": [],
+                    "missing_args": [],
+                    "required_args": [],
+                    "suggested_args": {},
+                    "test_plan": "retest",
+                    "expected_artifacts": [],
+                    "is_unfixable": False,
+                    "diagnosis": err[:300],
+                }
+
+            def verify_claim(self, goal, result, evidence) -> dict:
+                return {"achieved": True, "confidence": 0.9, "reason": "advisory"}
+
+            def converse(self, user_text, history=None) -> str:
+                return "ok"
+
+        phases_d: list[str] = []
+        logs_d: list[str] = []
+        brain_d = DefaultTrapBrain()
+        orch_d = Orchestrator(
+            root=def_root,
+            brain=brain_d,
+            on_status=lambda s: phases_d.append(s),
+            on_log=lambda m: logs_d.append(m),
+        )
+        goal_d = 'Create "user_note.txt" containing "REAL_PAYLOAD"'
+        result_d = orch_d.run_cycle(goal_d)
+        assert result_d.get("success"), result_d
+        note = def_root / "workspace_runtime" / "user_note.txt"
+        assert note.exists() and "REAL_PAYLOAD" in note.read_text(encoding="utf-8"), note
+        assert not (def_root / "workspace_runtime" / "default_path.txt").exists() or (
+            "REAL_PAYLOAD" in note.read_text(encoding="utf-8")
+        )
+        assert brain_d.build_count >= 2, brain_d.build_count
+        assert "VERIFY" in phases_d and "OBSERVE" in phases_d and "DIAGNOSE" in phases_d
+        assert any("reject_defaults" in m or "VERIFIER FAIL" in m or "default" in m.lower()
+                   for m in logs_d), logs_d[-40:]
+        orch_d.close()
+        print("  OK defaults VERIFY FAIL → rewrite → USER REQUEST honored")
+    except Exception as exc:
+        msg = f"E2E_DEFAULTS: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)
