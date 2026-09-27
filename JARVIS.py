@@ -918,8 +918,11 @@ def run(context: dict) -> dict:
             tg.user_request,
             {"path": "user_provided_path", "content": "user_provided_content"},
         )
-        assert [f.get("path") for f in built.get("files") or []] == ["test.txt"], built
-        assert "DARBOJAS" not in str(built.get("files"))
+        file_paths = [f.get("path") for f in built.get("files") or []]
+        assert file_paths == ["test.txt"], built
+        # Content token stays as contains — never a second invented file path
+        assert "DARBOJAS" not in file_paths, built
+        assert (built.get("files") or [{}])[0].get("contains") == "DARBOJAS", built
         # user_provided_* must not become file constraints
         assert not any(
             "user_provided" in str(f.get("path") or "").lower()
