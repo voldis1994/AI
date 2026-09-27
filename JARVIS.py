@@ -1842,6 +1842,93 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
+    # 4g) E2E: learning self-correct — VERIFY fail → OBSERVE → new research → PASS
+    print("  — e2e learning self-correct (OBSERVE→research→VERIFY loop) —")
+    try:
+        sc_root = root / "data" / "_e2e_learning_self_correct"
+        if sc_root.exists():
+            shutil.rmtree(sc_root)
+        sc_root.mkdir(parents=True)
+
+        class OfflineBrainSC(Brain):
+            def model_status(self) -> str:
+                return "OFFLINE"
+
+            def is_available(self) -> bool:
+                return False
+
+        class SelfCorrectOrch(Orchestrator):
+            """First enrich leaves thin notes so VERIFY fails once, then recovers."""
+
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self._enrich_calls = 0
+
+            def _enrich_learning_research(self, research, **kw):
+                self._enrich_calls += 1
+                if self._enrich_calls == 1:
+                    thin = self._learning_strip_skill_defaults(dict(research))
+                    thin["approach"] = ""
+                    thin["key_apis"] = []
+                    thin["pitfalls"] = []
+                    thin["test_idea"] = (
+                        "Execute skill.run and independently verify artifacts"
+                    )
+                    return thin
+                return super()._enrich_learning_research(research, **kw)
+
+        logs_sc: list[str] = []
+        phases_sc: list[str] = []
+        orch_sc = SelfCorrectOrch(
+            root=sc_root,
+            brain=OfflineBrainSC(),
+            on_log=lambda m: logs_sc.append(m),
+            on_status=lambda s: phases_sc.append(s),
+        )
+        req_sc = "Learn graph basics and create practical tests to verify knowledge"
+        result_sc = orch_sc.handle_user_message(req_sc)
+        assert result_sc.get("type") == "learning", result_sc
+        assert result_sc.get("success"), result_sc
+        assert (result_sc.get("attempts") or 0) >= 2, result_sc
+        assert orch_sc._enrich_calls >= 2
+        assert "OBSERVE" in phases_sc and "DIAGNOSE" in phases_sc
+        assert phases_sc.count("RESEARCH") >= 2
+        assert phases_sc.count("VERIFY") >= 2
+        assert any("LEARNING VERIFY: FAIL" in m for m in logs_sc), logs_sc[-40:]
+        assert any("LEARNING VERIFY: PASS" in m for m in logs_sc), logs_sc[-40:]
+        assert any("LEARNING DIAGNOSE" in m for m in logs_sc), logs_sc[-40:]
+        topic_sc = result_sc["topic"]
+        failed = orch_sc.memory.get_failed_approaches(f"learning:{topic_sc}")
+        assert failed, failed
+        # Failed approach must not be repeated as the success path label
+        failed_labels = {str(a.get("approach") or "") for a in failed}
+        assert "initial_topic_research" in failed_labels
+        verified_hist = [
+            e for e in orch_sc.memory.get_topic_knowledge(topic_sc)
+            if isinstance(e, dict) and e.get("verified")
+        ]
+        assert verified_hist, orch_sc.memory.get_topic_knowledge(topic_sc)
+
+        # Reuse verified knowledge on a fresh orchestrator (same DB root)
+        logs_ru: list[str] = []
+        orch_ru = Orchestrator(
+            root=sc_root,
+            brain=OfflineBrainSC(),
+            on_log=lambda m: logs_ru.append(m),
+        )
+        result_ru = orch_ru.handle_user_message(req_sc)
+        assert result_ru.get("success"), result_ru
+        assert (result_ru.get("attempts") or 1) == 1, result_ru
+        assert any("Reusing" in m and "verified" in m for m in logs_ru), logs_ru[:30]
+        orch_sc.close()
+        orch_ru.close()
+        print("  OK learning self-correct FAIL→OBSERVE→RESEARCH→PASS + reuse")
+    except Exception as exc:
+        msg = f"E2E_LEARNING_SELF_CORRECT: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
     # 5) Orchestrator boots + conversation logs must not echo USER/JARVIS replies
     try:
         echoed: list[str] = []
