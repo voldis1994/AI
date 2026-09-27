@@ -174,37 +174,56 @@ class Brain:
         return self.chat(messages, system=system, temperature=0.5)
 
     def classify_intent(self, user_text: str) -> dict[str, Any]:
-        """Decide if the request is conversation or a task to execute/learn."""
+        """
+        Classify THIS user request independently (never inherit prior skill).
+
+        conversation — greetings / Q&A / chat
+        learning     — research + verify + save knowledge (no skill build)
+        task         — external action that may use/build/repair a skill
+        """
+        from jarvis.intent import IntentClassifier
+
         system = (
-            "Classify the user message. Reply ONLY with JSON:\n"
-            '{"intent":"conversation"|"task","goal":"<short goal>",'
-            '"needs_capability":true|false,"keywords":["..."]}\n'
-            "intent=conversation for greetings, questions, chat.\n"
-            "intent=task when the user wants an action done "
-            "(create file, fetch data, convert, scrape, compute, automate, etc.)."
+            "Classify the user message independently. Reply ONLY with JSON:\n"
+            '{"intent":"conversation"|"learning"|"task","goal":"<short goal>",'
+            '"needs_capability":true|false,"needs_research":true|false,'
+            '"keywords":["..."]}\n'
+            "Rules:\n"
+            "- conversation: greetings, opinions, simple Q&A with no research/action.\n"
+            "- learning: user wants to learn/study/research/understand a topic, "
+            "build knowledge, quizzes/tests of knowledge. needs_research=true, "
+            "needs_capability=false. Do NOT treat this as a skill/capability task.\n"
+            "- task: user wants an external action "
+            "(create/write a file, fetch URL, convert, scrape, install, automate, etc.). "
+            "needs_capability=true.\n"
+            "- Classify only the CURRENT message. Never reuse or inherit a previous "
+            "skill/capability name.\n"
+            "- Pedagogical 'create tests/quiz to verify knowledge' is learning, "
+            "not a file/skill task, unless a concrete file/path/URL artifact is requested."
         )
         raw = self.generate(user_text, system=system, temperature=0.1)
-        return self._parse_json(raw, {
-            "intent": "conversation",
-            "goal": user_text,
-            "needs_capability": False,
-            "keywords": [],
-        })
+        parsed = self._parse_json(raw, IntentClassifier.classify_offline(user_text))
+        return IntentClassifier.normalize(parsed, user_text)
 
     def plan(self, goal: str, known_capabilities: list[str]) -> dict[str, Any]:
         """Create an execution plan and decide if research/learning is needed."""
         caps = "\n".join(f"- {c}" for c in known_capabilities) or "(none yet)"
         system = (
-            "You are JARVIS planner. Reply ONLY with JSON:\n"
+            "You are JARVIS planner for an ACTION task. Reply ONLY with JSON:\n"
             '{"steps":["..."],"can_reuse":["skill_name"],'
             '"missing":["what we cannot do"],"needs_research":true|false,'
             '"needs_new_skill":true|false,"skill_name":"snake_case_name",'
             '"skill_description":"...","research_queries":["..."],'
             '"args":{"any_key":"value extracted from the user goal"},'
             '"required_args":["arg_names_the_skill_will_need"]}\n'
-            "Prefer reusing existing capabilities. Only request a new skill if none fit.\n"
-            "Extract structured args from the user goal into args — do not leave them empty "
-            "when the goal clearly contains parameters (filenames, text, urls, numbers, etc.). "
+            "Rules:\n"
+            "- Only put a skill in can_reuse if it clearly performs THIS goal's action. "
+            "Never reuse an unrelated prior skill just because it is ACTIVE.\n"
+            "- If no existing skill fits, needs_new_skill=true and skill_name MUST be a "
+            "new snake_case name derived from THIS goal (not an old unrelated skill).\n"
+            "- Extract structured args from the user goal into args — do not leave them "
+            "empty when the goal clearly contains parameters "
+            "(filenames, text, urls, numbers, etc.). "
             "Arg names should match what a Python skill would read from context['args']."
         )
         prompt = f"GOAL:\n{goal}\n\nKNOWN CAPABILITIES:\n{caps}"

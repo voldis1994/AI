@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -29,6 +30,7 @@ from jarvis.skill_loader import SkillLoader
 from jarvis.observer import Observer
 from jarvis.context_builder import ContextBuilder
 from jarvis.task_goal import TaskGoal
+from jarvis.intent import IntentClassifier
 
 logger = logging.getLogger("jarvis.orchestrator")
 
@@ -120,15 +122,20 @@ class Orchestrator:
             self._status("IDLE")
             return {"type": "help", "reply": reply}
 
-        # Classify intent
+        # Classify THIS request independently (never inherit prior skill)
         model_status = self.brain.model_status()
         brain_up = model_status == "ONLINE"
         if not brain_up:
             intent = self._offline_classify(text)
         else:
             intent = self.brain.classify_intent(text)
+        intent = IntentClassifier.normalize(intent, text)
+        self._log(
+            f"INTENT: {intent.get('intent')} needs_capability="
+            f"{intent.get('needs_capability')} goal={intent.get('goal')!r}"
+        )
 
-        if intent.get("intent") == "conversation" and not intent.get("needs_capability"):
+        if intent.get("intent") == "conversation":
             self._status("CONVERSING")
             history = self.memory.chat_history_for_llm(10)
             history = [m for m in history if not (m["role"] == "user" and m["content"] == text)]
@@ -148,18 +155,320 @@ class Orchestrator:
                 )
             self.memory.add_message("assistant", reply)
             self._status("IDLE")
-            return {"type": "conversation", "reply": reply}
+            return {"type": "conversation", "reply": reply, "intent": intent}
 
-        # Task path — full learning cycle
+        # Learning / knowledge request — research + verify + save topic knowledge.
+        # Must NOT enter skill build/repair or inherit previous capabilities.
+        if intent.get("intent") == "learning":
+            goal = intent.get("goal") or text
+            result = self.run_learning_cycle(goal, original_request=text)
+            reply = result.get("reply") or result.get("outcome") or str(result)
+            self.memory.add_message(
+                "assistant", reply, meta={"task_id": result.get("task_id"), "intent": "learning"}
+            )
+            self._status("IDLE" if result.get("success") else "ERROR")
+            result["intent"] = intent
+            return result
+
+        # Action task path — use/build/repair a skill for THIS request only
         goal = intent.get("goal") or text
         result = self.run_cycle(goal, original_request=text)
         reply = result.get("reply") or result.get("outcome") or str(result)
         self.memory.add_message("assistant", reply, meta={"task_id": result.get("task_id")})
         self._status("IDLE" if result.get("success") else "ERROR")
+        result["intent"] = intent
         return result
 
+    def run_learning_cycle(
+        self, goal: str, original_request: Optional[str] = None
+    ) -> dict[str, Any]:
+        """
+        Learning / knowledge path:
+
+        REQUEST → RESEARCH → VERIFY knowledge → SAVE topic knowledge → DONE
+
+        Does not match, build, repair, or activate any skill. Topic knowledge is
+        stored under knowledge:topic:{slug}, never under a prior skill name.
+        """
+        user_request = (original_request or goal or "").strip()
+        task_goal = TaskGoal.from_request(user_request, goal=goal)
+        goal = task_goal.goal
+        topic = IntentClassifier.topic_slug(goal)
+        task_id = self.ledger.start_task(goal)
+        self._status("REQUEST")
+        self._log(f"[{task_id}] REQUEST (learning): {task_goal.user_request}")
+        self.ledger.log(
+            task_id,
+            "REQUEST",
+            "Learning TaskGoal frozen (no skill inherit)",
+            {**task_goal.to_dict(), "topic": topic, "intent": "learning"},
+        )
+
+        try:
+            # Research the topic — never keyed to an existing skill
+            queries = [goal]
+            if self.brain.is_available():
+                try:
+                    extra = self.brain.generate(
+                        f"Learning request:\n{goal}\n\n"
+                        "Reply ONLY with JSON: {\"queries\":[\"...\"]}\n"
+                        "3-6 focused research queries for this topic. "
+                        "Do not mention skills, file creation, or prior capabilities.",
+                        system="You plan research queries for knowledge learning.",
+                        temperature=0.2,
+                    )
+                    parsed = self.brain._parse_json(extra, {"queries": []})
+                    if isinstance(parsed.get("queries"), list) and parsed["queries"]:
+                        queries = [str(q) for q in parsed["queries"][:6]]
+                except Exception:
+                    pass
+            if goal not in queries:
+                queries = [goal] + [q for q in queries if q != goal]
+
+            self._status("RESEARCH")
+            self._log(
+                f"[{task_id}] LEARNING RESEARCH topic={topic!r} "
+                f"(no skill build/repair)"
+            )
+            research = self.research.research(queries, goal=goal)
+            # Persist under topic namespace — NOT under any skill (e.g. create_file)
+            saved = self.memory.save_topic_knowledge(
+                topic,
+                research,
+                goal=goal,
+                queries=queries,
+                summary=str(research.get("approach") or ""),
+                verified=False,
+            )
+            self.ledger.log(task_id, "RESEARCH", "Topic research complete", {
+                "topic": topic,
+                "libraries": research.get("libraries"),
+                "results": len(research.get("results") or []),
+                "knowledge_entries": len(saved.get("history") or []),
+                "skill_inherit": False,
+            })
+            self._log(
+                f"[{task_id}] KNOWLEDGE SAVED: topic:{topic} "
+                f"entries={len(saved.get('history') or [])} "
+                f"(not bound to any skill)"
+            )
+
+            # VERIFY knowledge covers the original request (no skill execution)
+            self._status("VERIFY")
+            verification = self._verify_learning_knowledge(
+                task_goal, research, saved.get("entry") or {}
+            )
+            self.ledger.log(
+                task_id,
+                "VERIFY",
+                verification.get("reason"),
+                {
+                    "verifier_result": verification,
+                    "topic": topic,
+                    "task_goal": task_goal.to_dict(),
+                },
+            )
+            self._log(
+                f"[{task_id}] LEARNING VERIFY: "
+                f"{'PASS' if verification.get('verified') else 'FAIL'} — "
+                f"{verification.get('reason')}"
+            )
+
+            if not verification.get("verified"):
+                outcome = (
+                    f"LEARNING VERIFY FAIL: {verification.get('reason')}. "
+                    f"DONE nav atļauts. Knowledge draft under topic:{topic}."
+                )
+                self.memory.save_experience(
+                    goal, outcome, False,
+                    details={
+                        "topic": topic,
+                        "verification": verification,
+                        "task_id": task_id,
+                        "intent": "learning",
+                    },
+                )
+                self.ledger.finish(task_id, False, {"outcome": outcome, "topic": topic})
+                return {
+                    "type": "learning",
+                    "success": False,
+                    "task_id": task_id,
+                    "reply": outcome,
+                    "outcome": outcome,
+                    "topic": topic,
+                    "verification": verification,
+                }
+
+            # Re-save with verified flag
+            saved = self.memory.save_topic_knowledge(
+                topic,
+                research,
+                goal=goal,
+                queries=queries,
+                summary=str(
+                    verification.get("summary")
+                    or research.get("approach")
+                    or goal
+                ),
+                verified=True,
+            )
+            outcome = (
+                f"DONE. Learning complete — knowledge verified & saved.\n"
+                f"Topic: {topic}\n"
+                f"Summary: {(saved.get('entry') or {}).get('summary', '')[:400]}\n"
+                f"Sources: {len((research.get('sources') or []))}"
+            )
+            self._status("SAVE_EXPERIENCE")
+            self.memory.save_experience(
+                goal, outcome, True,
+                details={
+                    "topic": topic,
+                    "verification": verification,
+                    "knowledge": saved.get("entry"),
+                    "task_id": task_id,
+                    "intent": "learning",
+                },
+            )
+            self.ledger.finish(
+                task_id,
+                True,
+                {"topic": topic, "verified": True, "intent": "learning"},
+            )
+            self._status("DONE")
+            self._log(f"[{task_id}] DONE (learning topic={topic})")
+            return {
+                "type": "learning",
+                "success": True,
+                "task_id": task_id,
+                "reply": outcome,
+                "outcome": outcome,
+                "topic": topic,
+                "knowledge": saved.get("entry"),
+                "verification": verification,
+            }
+        except Exception as exc:
+            tb = traceback.format_exc()
+            outcome = f"Learning error: {exc}"
+            self._log(f"[{task_id}] EXCEPTION: {tb}")
+            self.ledger.finish(task_id, False, {"error": str(exc), "traceback": tb})
+            self.memory.save_experience(goal, outcome, False, details={"traceback": tb})
+            return {
+                "type": "learning",
+                "success": False,
+                "task_id": task_id,
+                "reply": outcome,
+                "outcome": outcome,
+            }
+
+    def _verify_learning_knowledge(
+        self,
+        task_goal: TaskGoal,
+        research: dict[str, Any],
+        entry: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Independent checks that researched knowledge matches the USER REQUEST."""
+        checks: list[dict[str, Any]] = []
+        request = task_goal.user_request
+        raw = str(research.get("raw") or "")
+        approach = str(research.get("approach") or entry.get("summary") or "")
+        key_apis = list(research.get("key_apis") or [])
+        sources = list(research.get("sources") or [])
+        results = list(research.get("results") or [])
+
+        has_body = bool(raw.strip()) or bool(approach.strip()) or bool(key_apis)
+        checks.append({
+            "name": "knowledge_body",
+            "ok": has_body,
+            "detail": (
+                f"raw_len={len(raw)} approach_len={len(approach)} "
+                f"key_apis={len(key_apis)}"
+            ),
+        })
+
+        has_sources = bool(sources) or bool(results)
+        checks.append({
+            "name": "knowledge_sources",
+            "ok": has_sources,
+            "detail": f"sources={len(sources)} results={len(results)}",
+        })
+
+        # Topic tokens from the request must appear in gathered knowledge
+        tokens = [
+            t for t in IntentClassifier._keywords(request)
+            if len(t) >= 4
+        ][:8]
+        blob = (raw + "\n" + approach + "\n" + " ".join(str(x) for x in key_apis)).lower()
+        hit = 0
+        for t in tokens:
+            if t.lower() in blob or t.lower() in request.lower():
+                # Count request tokens present in knowledge OR trivially in request
+                # Prefer presence in research body
+                if t.lower() in blob:
+                    hit += 1
+        # If we have few tokens, require at least one hit in body; else >= half
+        need = 1 if len(tokens) <= 2 else max(1, len(tokens) // 2)
+        topic_ok = hit >= need if tokens else has_body
+        checks.append({
+            "name": "topic_alignment",
+            "ok": topic_ok,
+            "detail": f"token_hits={hit}/{len(tokens)} need>={need}",
+        })
+
+        # Reject accidental skill-repair contamination in a learning summary
+        repair_jargon = (
+            "rewrite_skill", "skill body not implemented", "fault_layer",
+            "protect_active", "pending_path",
+        )
+        contaminated = any(tok in approach.lower() for tok in repair_jargon)
+        checks.append({
+            "name": "no_skill_inherit",
+            "ok": not contaminated,
+            "detail": (
+                "knowledge not bound to unrelated skill repair"
+                if not contaminated
+                else "knowledge contaminated by prior skill repair jargon"
+            ),
+        })
+
+        summary = approach or (raw[:500] if raw else "")
+        if self.brain.is_available() and has_body:
+            try:
+                judgment = self.brain.verify_claim(
+                    request,
+                    {"result": {"topic_knowledge": True, "key_apis": key_apis}},
+                    summary or raw[:2000],
+                )
+                checks.append({
+                    "name": "brain_advisory",
+                    "ok": bool(judgment.get("achieved")),
+                    "detail": str(judgment.get("reason") or "")[:300],
+                })
+            except Exception as exc:
+                checks.append({
+                    "name": "brain_advisory",
+                    "ok": True,
+                    "detail": f"skipped ({exc})",
+                })
+
+        substantive = [c for c in checks if c["name"] != "brain_advisory"]
+        # Advisory may fail without blocking if substantive pass
+        verified = all(c["ok"] for c in substantive) and bool(substantive)
+        reason = (
+            "LEARNING VERIFY PASS — topic knowledge covers USER REQUEST"
+            if verified
+            else "LEARNING VERIFY FAIL — " + "; ".join(
+                f"{c['name']}:{c.get('detail')}" for c in substantive if not c["ok"]
+            )
+        )
+        return {
+            "verified": verified,
+            "reason": reason,
+            "checks": checks,
+            "summary": summary[:2000],
+        }
+
     def run_cycle(self, goal: str, original_request: Optional[str] = None) -> dict[str, Any]:
-        """Execute the full REQUEST→…→DONE learning/execution cycle."""
+        """Execute the full REQUEST→…→DONE action/skill cycle."""
         # Immutable TaskGoal for the whole cycle — never overwrite user_request.
         user_request = (original_request or goal or "").strip()
         task_goal = TaskGoal.from_request(user_request, goal=goal)
@@ -210,25 +519,30 @@ class Orchestrator:
                 {"args": task_args, "constraints": task_goal.constraints},
             )
 
-            # CHECK CAPABILITIES
+            # CHECK CAPABILITIES — only skills that fit THIS request
             self._status("CHECK_CAPABILITIES")
+            plan = self._sanitize_action_plan(plan, goal)
             reuse = plan.get("can_reuse") or []
             matched = []
             for name in reuse:
                 sk = self.registry.get_skill(name)
-                if sk and sk["status"] == "ACTIVE":
+                if sk and sk["status"] == "ACTIVE" and self._skill_fits_goal(sk, goal):
                     matched.append(sk)
-            if not matched:
+            # Loose keyword fallback only when planner did not demand a new skill
+            if not matched and not plan.get("needs_new_skill"):
                 keywords = plan.get("research_queries") or [goal]
                 tokens = []
                 for k in keywords:
                     tokens.extend(str(k).split())
-                matched = self.registry.match_skills(tokens, only_active=True)
+                tokens.extend(str(goal).split())
+                for sk in self.registry.match_skills(tokens, only_active=True):
+                    if self._skill_fits_goal(sk, goal):
+                        matched.append(sk)
             self.ledger.log(
                 task_id,
                 "CHECK_CAPABILITIES",
-                f"Matched {len(matched)} active skills",
-                {"names": [m["name"] for m in matched]},
+                f"Matched {len(matched)} active skills (goal-filtered)",
+                {"names": [m["name"] for m in matched], "plan_skill": plan.get("skill_name")},
             )
 
             skill_record = None
@@ -501,10 +815,21 @@ class Orchestrator:
         """
         if task_goal is None:
             task_goal = TaskGoal.from_request(goal, goal=goal)
+        # Skill name from THIS goal — never inherit an unrelated EXISTING skill
+        planned_name = str(plan.get("skill_name") or "").strip()
+        if planned_name and not repair_of:
+            existing_planned = self.registry.get_skill(planned_name)
+            if existing_planned and not self._skill_fits_goal(existing_planned, goal):
+                self._log(
+                    f"[{task_id}] Ignoring unrelated existing skill_name="
+                    f"{planned_name!r} for goal={goal!r}"
+                )
+                planned_name = ""
         skill_name = (
             (repair_of or {}).get("name")
-            or plan.get("skill_name")
+            or planned_name
             or self.brain._slug(goal)[:40]
+            or "new_skill"
         )
         description = plan.get("skill_description") or goal
         version = self.registry.next_version(skill_name)
@@ -1540,28 +1865,88 @@ class Orchestrator:
     # ── Offline / helpers ───────────────────────────────────────────────
 
     def _offline_classify(self, text: str) -> dict:
-        action_words = (
-            "izveido", "uzraksti", "izpildi", "lejupielādē", "saglabā", "pārveido",
-            "create", "write", "make", "download", "fetch", "convert", "run",
-            "generate", "build", "install", "scrape", "parse", "compute", "calculate",
-        )
-        low = text.lower()
-        if any(w in low for w in action_words):
-            return {
-                "intent": "task",
-                "goal": text,
-                "needs_capability": True,
-                "keywords": text.split()[:8],
-            }
-        return {
-            "intent": "conversation",
-            "goal": text,
-            "needs_capability": False,
-            "keywords": [],
+        return IntentClassifier.classify_offline(text)
+
+    def _sanitize_action_plan(self, plan: dict, goal: str) -> dict:
+        """Drop unrelated can_reuse / skill_name inherited from prior capabilities."""
+        plan = dict(plan or {})
+        reuse = []
+        for name in plan.get("can_reuse") or []:
+            sk = self.registry.get_skill(str(name))
+            if sk and self._skill_fits_goal(sk, goal):
+                reuse.append(sk["name"])
+        plan["can_reuse"] = reuse
+        planned = str(plan.get("skill_name") or "").strip()
+        if planned:
+            existing = self.registry.get_skill(planned)
+            # Only reject when the name refers to an EXISTING unrelated skill.
+            # Fresh planner names (not yet registered) are kept.
+            if existing and not self._skill_fits_goal(existing, goal):
+                plan["skill_name"] = Brain._slug(goal)[:40] or "new_skill"
+                plan["needs_new_skill"] = True
+        else:
+            plan["skill_name"] = Brain._slug(goal)[:40] or "new_skill"
+        if not reuse and not plan.get("needs_new_skill"):
+            # No fitting skill → must build for THIS goal
+            plan["needs_new_skill"] = True
+            plan["needs_research"] = True
+        return plan
+
+    @staticmethod
+    def _name_fits_goal(name: str, goal: str) -> bool:
+        """True if skill/plan name shares meaningful tokens with the goal."""
+        if not name or not goal:
+            return False
+        name_l = str(name).lower().replace("-", "_")
+        goal_l = str(goal).lower()
+        if name_l in goal_l:
+            return True
+        parts = [p for p in re.split(r"[_\s]+", name_l) if len(p) >= 4]
+        # Generic verbs alone are not enough to claim a fit
+        generic = {
+            "create", "write", "make", "build", "file", "files", "skill",
+            "data", "test", "tests", "run", "exec", "handle", "new",
         }
+        meaningful = [p for p in parts if p not in generic]
+        if not meaningful:
+            # Name is only generic tokens — require full slug fragment in goal
+            return any(p in goal_l for p in parts) and len(parts) >= 2
+        hits = sum(1 for p in meaningful if p in goal_l)
+        return hits >= 1
+
+    def _skill_fits_goal(self, skill: dict, goal: str) -> bool:
+        """Whether an ACTIVE skill is relevant to THIS user goal (not prior context)."""
+        if not skill or not goal:
+            return False
+        if self._name_fits_goal(str(skill.get("name") or ""), goal):
+            return True
+        hay_parts = [
+            str(skill.get("description") or ""),
+            *list(skill.get("capabilities") or []),
+        ]
+        hay = " ".join(hay_parts).lower()
+        goal_tokens = [
+            t.lower() for t in re.findall(r"[A-Za-z0-9_]{4,}", goal)
+            if t.lower() not in {
+                "create", "write", "make", "build", "file", "files",
+                "with", "that", "this", "from", "into", "please",
+                "izveido", "uzraksti", "failu", "saturu", "learn",
+                "study", "basics", "knowledge", "using", "about",
+            }
+        ]
+        if not goal_tokens:
+            return False
+        hits = sum(1 for t in goal_tokens if t in hay or t in str(skill.get("name") or "").lower())
+        # Need solid overlap — one shared generic word is not enough
+        return hits >= 2 or (
+            hits >= 1 and self._name_fits_goal(str(skill.get("name") or ""), goal)
+        )
 
     def _offline_plan(self, goal: str, caps: list[str]) -> dict:
-        matched = self.registry.match_skills(goal.split(), only_active=True)
+        matched = [
+            m for m in self.registry.match_skills(goal.split(), only_active=True)
+            if self._skill_fits_goal(m, goal)
+        ]
         # Universal offline arg draft — no task-specific key hardcoding
         draft_args = ContextBuilder._offline_extract(goal)
         return {
@@ -1570,7 +1955,7 @@ class Orchestrator:
             "missing": [] if matched else [goal],
             "needs_research": not bool(matched),
             "needs_new_skill": not bool(matched),
-            "skill_name": Brain._slug(goal)[:40],
+            "skill_name": Brain._slug(goal)[:40] or "new_skill",
             "skill_description": goal,
             "research_queries": [goal],
             "args": draft_args,
