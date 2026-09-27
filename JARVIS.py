@@ -2,7 +2,8 @@
 """
 JARVIS — Autonomous self-learning AI agent.
 
-Main entry point. Brain: Ollama (qwen2.5-coder:7b).
+Main entry point. Brain: Ollama multi-model router
+(FAST / REASONING / CODING — see jarvis/model_config.py).
 Learning happens by creating/repairing Python skills — not by hardcoding
 every future capability into this core.
 
@@ -43,6 +44,7 @@ if str(ROOT) not in sys.path:
 (ROOT / "skills").mkdir(exist_ok=True)
 
 from jarvis.brain import Brain, DEFAULT_MODEL
+from jarvis.model_config import TIER_MODELS, TIER_FAST, TIER_REASONING, TIER_CODING
 from jarvis.orchestrator import Orchestrator
 
 logging.basicConfig(
@@ -90,7 +92,7 @@ class JarvisGUI:
 
         self.orch = Orchestrator(
             root=root_dir,
-            brain=Brain(model=DEFAULT_MODEL),
+            brain=Brain(),
             on_log=self._ui_log,
             on_status=self._ui_status,
         )
@@ -288,23 +290,31 @@ class JarvisGUI:
 
     def _boot_banner(self) -> None:
         status = self.orch.brain.model_status()
+        fast = TIER_MODELS[TIER_FAST]["primary"]
+        reason = TIER_MODELS[TIER_REASONING]["primary"]
+        coding = TIER_MODELS[TIER_CODING]["primary"]
         hint = {
             "ONLINE": "CONNECTED",
-            "MODEL MISSING": f"MODEL MISSING — ollama pull {DEFAULT_MODEL}",
+            "MODEL MISSING": f"MODEL MISSING — ollama pull {fast}",
             "OFFLINE": "OFFLINE (start ollama serve)",
         }.get(status, status)
+        catalog = ""
+        if hasattr(self.orch.brain, "model_catalog_summary"):
+            catalog = self.orch.brain.model_catalog_summary()
         # Explicit + required: adjacent literals + trailing "═" * 56 would parse as
         # (...banner body including "═") * 56 and spam the log dozens of times.
         banner = (
             ("═" * 56)
             + "\n  JARVIS online. Core stable. Skills learn themselves.\n"
-            + f"  Brain: Ollama / {DEFAULT_MODEL} — {hint}\n"
+            + f"  Brain: Ollama multi-model — {hint}\n"
+            + f"  FAST={fast} · REASONING={reason} · CODING={coding}\n"
+            + (f"  {catalog}\n" if catalog else "")
             + "  Type a message, a task, or /help\n"
             + ("═" * 56)
         )
         self._append("system", banner)
         self._ui_status("IDLE")
-        self.brain_var.set(f"BRAIN: {status} · {DEFAULT_MODEL}")
+        self.brain_var.set(f"BRAIN: {status} · multi-model")
 
     def _append(self, tag: str, text: str) -> None:
         """Append one line to the conversation/log widget (thread-safe)."""
@@ -365,9 +375,10 @@ class JarvisGUI:
         brain = dash.get("brain_status") or (
             "ONLINE" if dash["brain_online"] else "OFFLINE"
         )
+        catalog = dash.get("model_catalog") or "multi-model"
         stats = (
             f"Brain   {brain}\n"
-            f"Model   {dash['model']}\n"
+            f"Router  {catalog}\n"
             f"──────────────\n"
             f"Conv    {mem['conversations']}\n"
             f"Exper.  {mem['experiences']} (ok {mem['successes']})\n"
@@ -395,7 +406,7 @@ class JarvisGUI:
             self.skills_text,
             "\n".join(lines) if lines else "(none yet — give JARVIS a task)",
         )
-        self.brain_var.set(f"BRAIN: {brain} · {dash['model']}")
+        self.brain_var.set(f"BRAIN: {brain} · multi-model")
 
     def _tick_stats(self) -> None:
         if not self.busy:
@@ -483,11 +494,16 @@ def run_cli(root: Path) -> int:
 
     orch = Orchestrator(
         root=root,
-        brain=Brain(model=DEFAULT_MODEL),
+        brain=Brain(),
         on_log=on_log,
         on_status=on_status,
     )
-    print(f"Brain: {orch.brain.model_status()} ({DEFAULT_MODEL})")
+    catalog = ""
+    if hasattr(orch.brain, "model_catalog_summary"):
+        catalog = orch.brain.model_catalog_summary()
+    print(f"Brain: {orch.brain.model_status()} (multi-model)")
+    if catalog:
+        print(f"Models: {catalog}")
     try:
         while True:
             try:
@@ -2143,6 +2159,122 @@ def run(context: dict) -> dict:
         print("  OK request routing isolation — conversation ≠ prior learning DONE")
     except Exception as exc:
         msg = f"E2E_REQUEST_ROUTING: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 4j) E2E: Multi-Model Router — work kind → tier → model + fallback + escalate
+    print("  — e2e multi-model router (FAST/REASONING/CODING) —")
+    try:
+        from jarvis.model_config import (
+            TIER_MODELS,
+            TIER_FAST,
+            TIER_REASONING,
+            TIER_CODING,
+            tier_for_work,
+            models_for_tier,
+        )
+        from jarvis.model_router import ModelRouter
+
+        assert tier_for_work("intent") == TIER_FAST
+        assert tier_for_work("extract_args") == TIER_FAST
+        assert tier_for_work("query_generation") == TIER_FAST
+        assert tier_for_work("converse") == TIER_FAST
+        assert tier_for_work("plan") == TIER_REASONING
+        assert tier_for_work("learning") == TIER_REASONING
+        assert tier_for_work("research") == TIER_REASONING
+        assert tier_for_work("diagnose") == TIER_REASONING
+        assert tier_for_work("semantic") == TIER_REASONING
+        assert tier_for_work("skill_code") == TIER_CODING
+        assert tier_for_work("code_repair") == TIER_CODING
+
+        assert TIER_MODELS[TIER_FAST]["primary"] == "qwen3:4b"
+        assert TIER_MODELS[TIER_REASONING]["primary"] == "qwen3:30b"
+        assert TIER_MODELS[TIER_CODING]["primary"] == "qwen3-coder:30b"
+        # qwen2.5 kept as fallback
+        assert "qwen2.5-coder:7b" in models_for_tier(TIER_CODING)
+        assert "qwen2.5-coder:7b" in models_for_tier(TIER_FAST)
+
+        route_logs: list[str] = []
+
+        # Only legacy coding model installed → FAST/REASONING/CODING all fallback
+        installed = ["qwen2.5-coder:7b"]
+
+        def _list() -> list[str]:
+            return list(installed)
+
+        router = ModelRouter(list_models=_list, on_log=lambda m: route_logs.append(m))
+        d_fast = router.route(work="intent")
+        assert d_fast.tier == TIER_FAST
+        assert d_fast.model == "qwen2.5-coder:7b"
+        assert d_fast.used_fallback is True
+        assert any(m.startswith("MODEL ROUTE: FAST →") for m in route_logs), route_logs
+        assert any("MODEL FALLBACK:" in m for m in route_logs), route_logs
+
+        route_logs.clear()
+        d_code = router.route(work="skill_code")
+        assert d_code.tier == TIER_CODING
+        assert d_code.model == "qwen2.5-coder:7b"
+        assert any(m.startswith("MODEL ROUTE: CODING →") for m in route_logs), route_logs
+
+        # Primary available — no fallback
+        installed = ["qwen3:4b", "qwen3:30b", "qwen3-coder:30b", "qwen2.5-coder:7b"]
+        router.invalidate_cache()
+        route_logs.clear()
+        d_r = router.route(work="plan")
+        assert d_r.tier == TIER_REASONING
+        assert d_r.model == "qwen3:30b"
+        assert d_r.used_fallback is False
+        assert any(m == "MODEL ROUTE: REASONING → qwen3:30b" for m in route_logs), route_logs
+
+        route_logs.clear()
+        esc = router.escalate(TIER_FAST, work="intent")
+        assert esc is not None
+        assert esc.tier == TIER_REASONING
+        assert any(m == "MODEL ESCALATION: FAST → REASONING" for m in route_logs), route_logs
+
+        route_logs.clear()
+        retry = router.escalate(TIER_CODING, work="code_repair")
+        assert retry is not None
+        assert retry.tier == TIER_CODING
+        assert any("MODEL RETRY: CODING" in m for m in route_logs), route_logs
+
+        assert ModelRouter.result_insufficient("")
+        assert ModelRouter.result_insufficient("[BRAIN ERROR] boom")
+        assert ModelRouter.result_insufficient("sorry no", expect_json=True)
+        assert not ModelRouter.result_insufficient('{"ok": true}', expect_json=True)
+
+        # Brain.chat uses router + escalates FAST → REASONING on empty
+        calls: list[str] = []
+
+        class RouterProbeBrain(Brain):
+            def _list_model_names(self):
+                return ["qwen3:4b", "qwen3:30b", "qwen2.5-coder:7b"]
+
+            def _chat_on_model(self, messages, temperature, model):
+                calls.append(model)
+                # FAST primary returns empty → escalate to REASONING
+                if model == "qwen3:4b":
+                    return ""
+                return '{"intent":"conversation","goal":"hi","needs_capability":false}'
+
+        probe_logs: list[str] = []
+        probe = RouterProbeBrain(on_log=lambda m: probe_logs.append(m))
+        out = probe.generate(
+            "hi",
+            system="Reply JSON",
+            work="intent",
+            allow_escalate=True,
+            expect_json=True,
+        )
+        assert "qwen3:4b" in calls and "qwen3:30b" in calls, calls
+        assert "intent" in out or "conversation" in out
+        assert any("MODEL ESCALATION: FAST → REASONING" in m for m in probe_logs), probe_logs
+        assert any("MODEL ROUTE: FAST → qwen3:4b" in m for m in probe_logs), probe_logs
+
+        print("  OK multi-model router — route/fallback/escalate + work→tier map")
+    except Exception as exc:
+        msg = f"E2E_MULTI_MODEL_ROUTER: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)

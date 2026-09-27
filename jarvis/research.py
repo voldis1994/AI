@@ -13,6 +13,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger("jarvis.research")
@@ -47,17 +48,41 @@ class ResearchSystem:
             "snippet": gathered_parts[-1][:500],
         })
 
-        for q in queries[:5]:
+        # Independent network lookups in parallel (no shared request_id / brain state)
+        query_list = list(queries[:5])
+        for q in query_list:
             self.on_log(f"RESEARCH: query → {q}")
+
+        def _fetch_one(q: str) -> tuple[str, list[str], list[dict[str, Any]]]:
+            parts: list[str] = []
+            local_results: list[dict[str, Any]] = []
             html_notes, ddg_results = self._duckduckgo_search(q)
             if html_notes:
-                gathered_parts.append(f"### Search: {q}\n{html_notes}")
-            results.extend(ddg_results)
-
+                parts.append(f"### Search: {q}\n{html_notes}")
+            local_results.extend(ddg_results)
             pypi_notes, pypi_results = self._pypi_lookup(q)
             if pypi_notes:
-                gathered_parts.append(f"### PyPI hint: {q}\n{pypi_notes}")
-            results.extend(pypi_results)
+                parts.append(f"### PyPI hint: {q}\n{pypi_notes}")
+            local_results.extend(pypi_results)
+            return q, parts, local_results
+
+        if len(query_list) <= 1:
+            for q in query_list:
+                _, parts, local_results = _fetch_one(q)
+                gathered_parts.extend(parts)
+                results.extend(local_results)
+        else:
+            # Preserve query order when merging parallel results
+            by_query: dict[str, tuple[list[str], list[dict[str, Any]]]] = {}
+            with ThreadPoolExecutor(max_workers=min(4, len(query_list))) as pool:
+                futs = {pool.submit(_fetch_one, q): q for q in query_list}
+                for fut in as_completed(futs):
+                    q, parts, local_results = fut.result()
+                    by_query[q] = (parts, local_results)
+            for q in query_list:
+                parts, local_results = by_query.get(q, ([], []))
+                gathered_parts.extend(parts)
+                results.extend(local_results)
 
         gathered = "\n\n".join(gathered_parts)
 
