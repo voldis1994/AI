@@ -10,10 +10,12 @@ from __future__ import annotations
 import json
 import re
 import logging
+import time
 from typing import Any, Callable, Optional
 
 from jarvis.model_config import DEFAULT_HOST, DEFAULT_MODEL
 from jarvis.model_router import ModelRouter
+from jarvis.perf import get_active_tracker
 
 logger = logging.getLogger("jarvis.brain")
 
@@ -200,7 +202,15 @@ class Brain:
             tier=tier,
             force_model=model,
         )
+        t0 = time.perf_counter()
         text = self._chat_on_model(full, temperature, decision.model)
+        self._record_model_timing(
+            work=work or decision.work,
+            tier=decision.tier,
+            model=decision.model,
+            ms=(time.perf_counter() - t0) * 1000.0,
+            ok=not str(text).startswith("[BRAIN ERROR]"),
+        )
 
         if allow_escalate and ModelRouter.result_insufficient(
             text,
@@ -219,7 +229,16 @@ class Brain:
             if esc is not None and (
                 esc.model != decision.model or esc.tier != decision.tier
             ):
+                t1 = time.perf_counter()
                 text2 = self._chat_on_model(full, temperature, esc.model)
+                self._record_model_timing(
+                    work=work or decision.work,
+                    tier=esc.tier,
+                    model=esc.model,
+                    ms=(time.perf_counter() - t1) * 1000.0,
+                    ok=not str(text2).startswith("[BRAIN ERROR]"),
+                    escalated=True,
+                )
                 if not ModelRouter.result_insufficient(
                     text2,
                     expect_json=expect_json,
@@ -235,10 +254,39 @@ class Brain:
             elif esc is not None and esc.tier == decision.tier:
                 # CODING retry path — same tier, caller should add failure context;
                 # still re-hit once if first output was empty/error.
+                t1 = time.perf_counter()
                 text2 = self._chat_on_model(full, temperature, esc.model)
+                self._record_model_timing(
+                    work=work or decision.work,
+                    tier=esc.tier,
+                    model=esc.model,
+                    ms=(time.perf_counter() - t1) * 1000.0,
+                    ok=not str(text2).startswith("[BRAIN ERROR]"),
+                    retry=True,
+                )
                 if text2.strip() and not text2.startswith("[BRAIN ERROR]"):
                     return text2
         return text
+
+    @staticmethod
+    def _record_model_timing(
+        *,
+        work: str,
+        tier: str,
+        model: str,
+        ms: float,
+        ok: bool = True,
+        **meta: Any,
+    ) -> None:
+        tracker = get_active_tracker()
+        if tracker is None:
+            return
+        try:
+            tracker.record_model(
+                work=work, tier=tier, model=model, ms=ms, ok=ok, **meta
+            )
+        except Exception:
+            pass
 
     def _chat_on_model(
         self,
@@ -417,7 +465,9 @@ class Brain:
             "- Extract structured args from the user goal into args — do not leave them "
             "empty when the goal clearly contains parameters "
             "(filenames, text, urls, numbers, etc.). "
-            "Arg names should match what a Python skill would read from context['args']."
+            "Arg names should match what a Python skill would read from context['args'].\n"
+            "- NEVER invent one arg key per word in the request. Use a small schema "
+            "(typically path/content/url-style keys), not sentence tokens."
         )
         prompt = f"GOAL:\n{goal}\n\nKNOWN CAPABILITIES:\n{caps}"
         raw = self.generate(
@@ -458,7 +508,9 @@ class Brain:
             "Reply ONLY with JSON object of argument key→value pairs "
             '(optionally wrap as {"args":{...}}).\n'
             "Rules:\n"
-            "- Infer useful keys from the goal (whatever the task needs).\n"
+            "- Prefer keys from skill_meta.required_args / diagnosis missing_args.\n"
+            "- Do NOT invent a new key for every word in the sentence.\n"
+            "- Do NOT use request tokens (individual words) as argument names.\n"
             "- Do NOT invent values not implied by the goal.\n"
             "- If diagnosis lists missing/required args, prioritize filling those keys "
             "from the goal text.\n"
@@ -638,6 +690,13 @@ class Brain:
         diagnosis: Optional[dict[str, Any]] = None,
         failed_approaches: Optional[list] = None,
         test_plan: Optional[str] = None,
+        *,
+        user_request: Optional[str] = None,
+        task_goal: Optional[dict[str, Any]] = None,
+        grounded_args: Optional[dict[str, Any]] = None,
+        artifacts: Optional[list] = None,
+        missing_requirements: Optional[list] = None,
+        constraints: Optional[dict[str, Any]] = None,
     ) -> str:
         """Generate or repair a complete Python skill module from diagnosis/research."""
         system = (
@@ -661,15 +720,43 @@ class Brain:
             "Do not pretend success — set ok=False on failure.\n"
             "FORBIDDEN: do not leave a TODO/stub body and do not return "
             "'Skill body not implemented yet'. You MUST implement a real run() from the "
-            "RESEARCH / knowledge_history / DIAGNOSIS provided.\n"
+            "USER REQUEST / TaskGoal / RESEARCH / DIAGNOSIS provided.\n"
+            "Honor the immutable USER REQUEST and TaskGoal constraints exactly. "
             "If a DIAGNOSIS is provided and fault_layer is skill_code, implement the fix. "
             "Do not repeat failed approaches listed below."
         )
         parts = [
             f"Skill name: {skill_name}",
             f"Description: {description}",
-            f"Research: {json.dumps(research, ensure_ascii=False)[:6000]}",
         ]
+        if user_request:
+            parts.append(f"USER REQUEST (immutable TaskGoal source):\n{user_request}")
+        if task_goal:
+            parts.append(
+                "TASK GOAL (structured):\n"
+                + json.dumps(task_goal, ensure_ascii=False, default=str)[:4000]
+            )
+        elif constraints:
+            parts.append(
+                "CONSTRAINTS / SUCCESS CRITERIA:\n"
+                + json.dumps(constraints, ensure_ascii=False, default=str)[:3000]
+            )
+        if grounded_args is not None:
+            parts.append(
+                "GROUNDED ARGS (skill contract — read these from context['args']):\n"
+                + json.dumps(grounded_args, ensure_ascii=False, default=str)[:2000]
+            )
+        if artifacts:
+            parts.append(
+                "WORKSPACE ARTIFACTS (what already exists):\n"
+                + json.dumps(artifacts, ensure_ascii=False, default=str)[:2000]
+            )
+        if missing_requirements:
+            parts.append(
+                "MISSING REQUIREMENTS (must satisfy next):\n"
+                + json.dumps(missing_requirements, ensure_ascii=False, default=str)[:2000]
+            )
+        parts.append(f"Research: {json.dumps(research, ensure_ascii=False)[:6000]}")
         if research.get("knowledge_history"):
             parts.append(
                 "SAVED KNOWLEDGE HISTORY (reuse these insights):\n"
@@ -688,9 +775,11 @@ class Brain:
         if test_plan:
             parts.append(f"TEST PLAN for next version:\n{test_plan}")
         if previous_code:
-            parts.append(f"PREVIOUS CODE:\n{previous_code[:8000]}")
+            parts.append(f"PREVIOUS / EXISTING CODE:\n{previous_code[:8000]}")
         if error_log:
-            parts.append(f"LAST ERROR / OBSERVATION SUMMARY:\n{error_log[:4000]}")
+            parts.append(
+                "VERIFIER / ERROR SUMMARY (fix this):\n" + error_log[:4000]
+            )
         # Slightly higher temperature on repair to encourage approach change
         is_repair = bool(diagnosis or error_log or previous_code)
         temperature = 0.35 if is_repair else 0.15
