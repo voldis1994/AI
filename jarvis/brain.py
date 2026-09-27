@@ -1,8 +1,8 @@
 """
-JARVIS Brain — Ollama interface (qwen2.5-coder:7b).
+JARVIS Brain — multi-model Ollama interface via ModelRouter.
 
-Provides structured prompting for planning, coding, research, repair,
-and casual conversation. Never invents "DONE" — verification is external.
+Work kind → FAST / REASONING / CODING → best available model.
+Never invents "DONE" — verification is external (Python checks, not LLM trust).
 """
 
 from __future__ import annotations
@@ -10,27 +10,53 @@ from __future__ import annotations
 import json
 import re
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+from jarvis.model_config import DEFAULT_HOST, DEFAULT_MODEL
+from jarvis.model_router import ModelRouter
 
 logger = logging.getLogger("jarvis.brain")
 
-DEFAULT_MODEL = "qwen2.5-coder:7b"
-DEFAULT_HOST = "http://127.0.0.1:11434"
+# Re-export for callers that import from jarvis.brain
+__all__ = ["Brain", "DEFAULT_MODEL", "DEFAULT_HOST"]
 
 
 class Brain:
-    """Thin wrapper around the Ollama HTTP/Python API."""
+    """Ollama API wrapper with universal Multi-Model routing."""
 
     def __init__(
         self,
         model: str = DEFAULT_MODEL,
         host: str = DEFAULT_HOST,
         timeout: float = 180.0,
+        on_log: Optional[Callable[[str], None]] = None,
+        router: Optional[ModelRouter] = None,
     ) -> None:
+        # Legacy single-model hint / forced override (tests may pin a model)
         self.model = model
         self.host = host.rstrip("/")
         self.timeout = timeout
         self._client = None
+        self._force_single_model = False
+        self.on_log = on_log or (lambda _m: None)
+        self.router = router or ModelRouter(
+            list_models=self._list_model_names,
+            on_log=self._route_log,
+        )
+        # Keep router logger in sync if Brain logger changes later
+        self.router.set_logger(self._route_log)
+
+    def set_logger(self, on_log: Callable[[str], None]) -> None:
+        self.on_log = on_log or (lambda _m: None)
+        self.router.set_logger(self._route_log)
+
+    def _route_log(self, msg: str) -> None:
+        try:
+            self.on_log(msg)
+        except Exception:
+            pass
+        if msg.startswith("MODEL "):
+            logger.info(msg)
 
     def _get_client(self):
         if self._client is None:
@@ -44,32 +70,34 @@ class Brain:
         return self._client
 
     def is_available(self) -> bool:
-        """True only when Ollama is up AND the exact model exists."""
+        """True when Ollama is up AND at least one configured model is installed."""
         return self.model_status() == "ONLINE"
 
     def model_status(self) -> str:
         """
         Return:
-          ONLINE        — server reachable and exact model present
-          MODEL MISSING — server reachable but model not installed
+          ONLINE        — server reachable and ≥1 configured model present
+          MODEL MISSING — server reachable but none of the catalog installed
           OFFLINE       — server unreachable
         """
-        tags = self._list_model_names()
-        if tags is None:
-            return "OFFLINE"
-        if self._model_in_tags(tags):
-            return "ONLINE"
-        return "MODEL MISSING"
+        if self._force_single_model:
+            tags = self._list_model_names()
+            if tags is None:
+                return "OFFLINE"
+            if self.router.model_in_tags(self.model, tags):
+                return "ONLINE"
+            return "MODEL MISSING"
+        return self.router.status()
 
-    def _model_in_tags(self, names: list[str]) -> bool:
-        target = self.model.strip().lower()
-        # Exact match preferred; also accept name without tag if identical base+tag listed
-        normalized = {n.strip().lower() for n in names}
-        if target in normalized:
-            return True
-        # ollama sometimes lists "qwen2.5-coder:7b" and "qwen2.5-coder:7b-..." variants
-        # Require exact model string match only (user requirement).
-        return False
+    def model_catalog_summary(self) -> str:
+        """Short multi-model summary for GUI/CLI."""
+        detail = self.router.status_detail()
+        parts = []
+        for tier, info in (detail.get("tiers") or {}).items():
+            resolved = info.get("resolved") or info.get("primary")
+            mark = "✓" if info.get("online") else "·"
+            parts.append(f"{tier}:{resolved}{mark}")
+        return " | ".join(parts)
 
     def _list_model_names(self) -> Optional[list[str]]:
         """Return model name list, or None if server unreachable."""
@@ -108,36 +136,95 @@ class Brain:
         messages: list[dict[str, str]],
         system: Optional[str] = None,
         temperature: float = 0.3,
+        *,
+        work: str = "",
+        tier: Optional[str] = None,
+        allow_escalate: bool = False,
+        expect_json: bool = False,
+        expect_code: bool = False,
+        model: Optional[str] = None,
     ) -> str:
-        """Send a chat completion request. Returns assistant text or an error string."""
+        """
+        Chat completion via ModelRouter.
+
+        work/tier select FAST|REASONING|CODING. On insufficient FAST output,
+        optionally escalate once to REASONING.
+        """
         full: list[dict[str, str]] = []
         if system:
             full.append({"role": "system", "content": system})
         full.extend(messages)
 
+        if self._force_single_model and not model:
+            model = self.model
+
+        decision = self.router.route(
+            work=work or ("forced" if model else "chat"),
+            tier=tier,
+            force_model=model,
+        )
+        text = self._chat_on_model(full, temperature, decision.model)
+
+        if allow_escalate and ModelRouter.result_insufficient(
+            text, expect_json=expect_json, expect_code=expect_code
+        ):
+            esc = self.router.escalate(decision.tier, work=work or decision.work)
+            if esc is not None and (
+                esc.model != decision.model or esc.tier != decision.tier
+            ):
+                text2 = self._chat_on_model(full, temperature, esc.model)
+                if not ModelRouter.result_insufficient(
+                    text2, expect_json=expect_json, expect_code=expect_code
+                ):
+                    return text2
+                # Prefer non-empty escalated text over empty first try
+                if text2.strip() and (
+                    not text.strip() or text.startswith("[BRAIN ERROR]")
+                ):
+                    return text2
+            elif esc is not None and esc.tier == decision.tier:
+                # CODING retry path — same tier, caller should add failure context;
+                # still re-hit once if first output was empty/error.
+                text2 = self._chat_on_model(full, temperature, esc.model)
+                if text2.strip() and not text2.startswith("[BRAIN ERROR]"):
+                    return text2
+        return text
+
+    def _chat_on_model(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float,
+        model: str,
+    ) -> str:
         client = self._get_client()
         if client is not None:
             try:
                 resp = client.chat(
-                    model=self.model,
-                    messages=full,
+                    model=model,
+                    messages=messages,
                     options={"temperature": temperature},
                 )
                 content = resp.get("message", {}).get("content", "")
                 return (content or "").strip()
             except Exception as exc:
-                logger.error("ollama chat failed: %s", exc)
-                return self._http_chat(full, temperature)
+                logger.error("ollama chat failed (%s): %s", model, exc)
+                return self._http_chat(messages, temperature, model=model)
 
-        return self._http_chat(full, temperature)
+        return self._http_chat(messages, temperature, model=model)
 
-    def _http_chat(self, messages: list[dict[str, str]], temperature: float) -> str:
+    def _http_chat(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float,
+        model: Optional[str] = None,
+    ) -> str:
+        use_model = model or self.model
         try:
             import urllib.request
 
             payload = json.dumps(
                 {
-                    "model": self.model,
+                    "model": use_model,
                     "messages": messages,
                     "stream": False,
                     "options": {"temperature": temperature},
@@ -153,12 +240,34 @@ class Brain:
                 data = json.loads(resp.read().decode("utf-8"))
                 return (data.get("message", {}) or {}).get("content", "").strip()
         except Exception as exc:
-            logger.error("HTTP chat failed: %s", exc)
+            logger.error("HTTP chat failed (%s): %s", use_model, exc)
             return f"[BRAIN ERROR] Ollama unreachable: {exc}"
 
-    def generate(self, prompt: str, system: Optional[str] = None, temperature: float = 0.3) -> str:
+    def generate(
+        self,
+        prompt: str,
+        system: Optional[str] = None,
+        temperature: float = 0.3,
+        *,
+        work: str = "",
+        tier: Optional[str] = None,
+        allow_escalate: bool = False,
+        expect_json: bool = False,
+        expect_code: bool = False,
+        model: Optional[str] = None,
+    ) -> str:
         messages = [{"role": "user", "content": prompt}]
-        return self.chat(messages, system=system, temperature=temperature)
+        return self.chat(
+            messages,
+            system=system,
+            temperature=temperature,
+            work=work,
+            tier=tier,
+            allow_escalate=allow_escalate,
+            expect_json=expect_json,
+            expect_code=expect_code,
+            model=model,
+        )
 
     # ── Structured helpers ──────────────────────────────────────────────
 
@@ -175,7 +284,13 @@ class Brain:
         # Keep history short — conversation turns only (caller should pre-filter)
         messages = list(history or [])[-8:]
         messages.append({"role": "user", "content": user_text})
-        return self.chat(messages, system=system, temperature=0.5)
+        return self.chat(
+            messages,
+            system=system,
+            temperature=0.5,
+            work="converse",
+            allow_escalate=True,
+        )
 
     def classify_intent(self, user_text: str) -> dict[str, Any]:
         """
@@ -205,7 +320,14 @@ class Brain:
             "- Pedagogical 'create tests/quiz to verify knowledge' is learning, "
             "not a file/skill task, unless a concrete file/path/URL artifact is requested."
         )
-        raw = self.generate(user_text, system=system, temperature=0.1)
+        raw = self.generate(
+            user_text,
+            system=system,
+            temperature=0.1,
+            work="intent",
+            allow_escalate=True,
+            expect_json=True,
+        )
         parsed = self._parse_json(raw, IntentClassifier.classify_offline(user_text))
         return IntentClassifier.normalize(parsed, user_text)
 
@@ -231,7 +353,14 @@ class Brain:
             "Arg names should match what a Python skill would read from context['args']."
         )
         prompt = f"GOAL:\n{goal}\n\nKNOWN CAPABILITIES:\n{caps}"
-        raw = self.generate(prompt, system=system, temperature=0.2)
+        raw = self.generate(
+            prompt,
+            system=system,
+            temperature=0.2,
+            work="plan",
+            allow_escalate=False,
+            expect_json=True,
+        )
         return self._parse_json(raw, {
             "steps": [f"Handle: {goal}"],
             "can_reuse": [],
@@ -284,6 +413,9 @@ class Brain:
             json.dumps(payload, ensure_ascii=False, default=str)[:8000],
             system=system,
             temperature=0.1,
+            work="extract_args",
+            allow_escalate=True,
+            expect_json=True,
         )
         parsed = self._parse_json(raw, {})
         if isinstance(parsed.get("args"), dict):
@@ -306,7 +438,13 @@ class Brain:
             '"repair_insight":"what specifically to change in the next repair"}'
         )
         prompt = f"QUERY: {query}\n\nGATHERED INFO:\n{gathered[:8000]}"
-        raw = self.generate(prompt, system=system, temperature=0.2)
+        raw = self.generate(
+            prompt,
+            system=system,
+            temperature=0.2,
+            work="research",
+            expect_json=True,
+        )
         return self._parse_json(raw, {
             "approach": gathered[:500],
             "libraries": [],
@@ -366,6 +504,9 @@ class Brain:
             json.dumps(payload, ensure_ascii=False, default=str)[:10000],
             system=system,
             temperature=0.3,
+            work="query_generation",
+            allow_escalate=True,
+            expect_json=True,
         )
         parsed = self._parse_json(raw, {})
         queries = parsed.get("research_queries")
@@ -482,9 +623,44 @@ class Brain:
         if error_log:
             parts.append(f"LAST ERROR / OBSERVATION SUMMARY:\n{error_log[:4000]}")
         # Slightly higher temperature on repair to encourage approach change
-        temperature = 0.35 if (diagnosis or error_log) else 0.15
-        raw = self.generate("\n\n".join(parts), system=system, temperature=temperature)
-        return self._extract_python(raw)
+        is_repair = bool(diagnosis or error_log or previous_code)
+        temperature = 0.35 if is_repair else 0.15
+        work = "code_repair" if is_repair else "skill_code"
+        raw = self.generate(
+            "\n\n".join(parts),
+            system=system,
+            temperature=temperature,
+            work=work,
+            expect_code=True,
+        )
+        code = self._extract_python(raw)
+        # Failed CODING → retry CODING with failure context (same tier, not REASONING)
+        needs_retry = (
+            ModelRouter.result_insufficient(raw, expect_code=True)
+            or ModelRouter.result_insufficient(code, expect_code=True)
+            or ("def run" not in (code or "") and "SKILL_META" not in (code or ""))
+        )
+        if needs_retry:
+            esc = self.router.escalate("CODING", work="code_repair")
+            if esc is not None:
+                retry_parts = list(parts) + [
+                    "PREVIOUS MODEL OUTPUT WAS INSUFFICIENT — regenerate complete "
+                    "valid Python skill with SKILL_META and def run(context)."
+                ]
+                if error_log:
+                    retry_parts.append(f"FAILURE CONTEXT:\n{str(error_log)[:4000]}")
+                raw2 = self.generate(
+                    "\n\n".join(retry_parts),
+                    system=system,
+                    temperature=0.4,
+                    work="code_repair",
+                    model=esc.model,
+                    expect_code=True,
+                )
+                code2 = self._extract_python(raw2)
+                if code2 and ("def run" in code2 or "SKILL_META" in code2):
+                    return code2
+        return code
 
     def diagnose(
         self,
@@ -565,6 +741,8 @@ class Brain:
             json.dumps(payload, ensure_ascii=False, default=str)[:14000],
             system=system,
             temperature=0.25,
+            work="diagnose",
+            expect_json=True,
         )
         from jarvis.task_goal import TaskGoal
         from jarvis.context_builder import ContextBuilder
@@ -771,7 +949,13 @@ class Brain:
             f"GOAL: {goal}\nRESULT: {json.dumps(result, ensure_ascii=False, default=str)}\n"
             f"EVIDENCE:\n{evidence[:4000]}"
         )
-        raw = self.generate(prompt, system=system, temperature=0.1)
+        raw = self.generate(
+            prompt,
+            system=system,
+            temperature=0.1,
+            work="verify_claim",
+            expect_json=True,
+        )
         return self._parse_json(raw, {
             "achieved": False,
             "confidence": 0.0,
@@ -787,6 +971,7 @@ class Brain:
         Semantically judge whether acquired knowledge answers the USER REQUEST.
 
         Do NOT require exact keyword/token matches — judge meaning and goal coverage.
+        Advisory only — orchestrator still applies deterministic Python checks.
         """
         system = (
             "You verify LEARNING results for JARVIS. "
@@ -815,7 +1000,13 @@ class Brain:
             f"USER REQUEST:\n{user_request}\n\n"
             f"KNOWLEDGE:\n{json.dumps(knowledge, ensure_ascii=False, default=str)[:9000]}"
         )
-        raw = self.generate(prompt, system=system, temperature=0.1)
+        raw = self.generate(
+            prompt,
+            system=system,
+            temperature=0.1,
+            work="semantic",
+            expect_json=True,
+        )
         fallback = {
             "covers_goal": False,
             "confidence": 0.0,
@@ -857,7 +1048,13 @@ class Brain:
             f"USER REQUEST:\n{user_request}\n\n"
             f"KNOWLEDGE:\n{json.dumps(knowledge, ensure_ascii=False, default=str)[:8000]}"
         )
-        raw = self.generate(prompt, system=system, temperature=0.15)
+        raw = self.generate(
+            prompt,
+            system=system,
+            temperature=0.15,
+            work="learning",
+            expect_json=True,
+        )
         parsed = self._parse_json(raw, {
             "answer": "",
             "result": None,

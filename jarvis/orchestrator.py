@@ -83,7 +83,10 @@ class Orchestrator:
         self._active_request_id: Optional[str] = None
 
         db = self.data_dir / "jarvis.db"
-        self.brain = brain or Brain()
+        self.brain = brain or Brain(on_log=self._log)
+        # Multi-model route logs (MODEL ROUTE / FALLBACK / ESCALATION) → cycle log
+        if hasattr(self.brain, "set_logger"):
+            self.brain.set_logger(self._log)
         self.memory = Memory(db)
         self.ledger = Ledger(db)
         self.registry = CapabilityRegistry(db)
@@ -258,15 +261,18 @@ class Orchestrator:
         if brain_up:
             reply = self.brain.converse(text, history=history)
         elif model_status == "MODEL MISSING":
+            from jarvis.model_config import TIER_MODELS, TIER_FAST
+
+            primary = TIER_MODELS[TIER_FAST]["primary"]
             reply = (
-                f"[MODEL MISSING] Ollama darbojas, bet modelis "
-                f"{self.brain.model} nav atrasts. Palaid: "
-                f"ollama pull {self.brain.model}. Saņēmu: {text}"
+                f"[MODEL MISSING] Ollama darbojas, bet katalogā nav neviena "
+                f"konfigurēta modeļa. Palaid piem.: ollama pull {primary}. "
+                f"Saņēmu: {text}"
             )
         else:
             reply = (
-                "[Ollama OFFLINE] Esmu JARVIS. Palaiž Ollama ar modeli "
-                f"{self.brain.model}, lai runātu un mācītos. "
+                "[Ollama OFFLINE] Esmu JARVIS. Palaiž Ollama (multi-model: "
+                "FAST/REASONING/CODING), lai runātu un mācītos. "
                 f"Saņēmu: {text}"
             )
         return self._ensure_fresh_reply(
@@ -767,6 +773,9 @@ class Orchestrator:
                     "Do not mention skills, file creation, or prior capabilities.",
                     system="You plan research queries for knowledge learning.",
                     temperature=0.2,
+                    work="query_generation",
+                    allow_escalate=True,
+                    expect_json=True,
                 )
                 parsed = self.brain._parse_json(extra, {"queries": []})
                 if isinstance(parsed.get("queries"), list) and parsed["queries"]:
@@ -983,6 +992,8 @@ class Orchestrator:
                     json.dumps(payload, ensure_ascii=False, default=str)[:10000],
                     system=system,
                     temperature=0.3,
+                    work="diagnose",
+                    expect_json=True,
                 )
                 parsed = self.brain._parse_json(raw, {})
                 if isinstance(parsed, dict) and parsed.get("research_queries"):
@@ -2661,8 +2672,11 @@ class Orchestrator:
         reg = self.registry.stats()
         led = self.ledger.stats()
         brain = self.brain.model_status()
+        catalog = ""
+        if hasattr(self.brain, "model_catalog_summary"):
+            catalog = f"\nModels — {self.brain.model_catalog_summary()}"
         return (
-            f"Brain (Ollama/{self.brain.model}): {brain}\n"
+            f"Brain (Ollama multi-model): {brain}{catalog}\n"
             f"Memory — conv:{mem['conversations']} exp:{mem['experiences']} "
             f"ok:{mem['successes']} facts:{mem['facts']} "
             f"fail:{mem.get('learning_failures', 0)} "
@@ -2690,6 +2704,15 @@ class Orchestrator:
 
     def get_dashboard_stats(self) -> dict[str, Any]:
         status = self.brain.model_status()
+        catalog = ""
+        detail: dict[str, Any] = {}
+        if hasattr(self.brain, "model_catalog_summary"):
+            catalog = self.brain.model_catalog_summary()
+        if hasattr(self.brain, "router"):
+            try:
+                detail = self.brain.router.status_detail()
+            except Exception:
+                detail = {}
         return {
             "memory": self.memory.stats(),
             "skills": self.registry.stats(),
@@ -2697,6 +2720,8 @@ class Orchestrator:
             "brain_online": status == "ONLINE",
             "brain_status": status,
             "model": self.brain.model,
+            "model_catalog": catalog,
+            "model_tiers": detail.get("tiers") or {},
             "skill_list": self.registry.list_skills(),
         }
 
