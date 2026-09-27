@@ -1,14 +1,17 @@
 """
-JARVIS cyber-HUD GUI — visual shell only.
+JARVIS cyber-HUD GUI — visual shell with integrated dynamic Workspace.
 
-Magenta neon aesthetic. Layout uses pack only (no place-based panels)
-so the input bar cannot collapse off-screen on Windows.
+Views (same window, no extra processes): CHAT | WORKSPACE | CODE | TERMINAL |
+RESEARCH | FILES. GUI only mirrors real backend events asynchronously.
 """
 
 from __future__ import annotations
 
+import queue
+import re
 import threading
 from pathlib import Path
+from typing import Any, Optional
 
 try:
     import tkinter as tk
@@ -22,6 +25,16 @@ except ModuleNotFoundError:  # pragma: no cover
 from jarvis.brain import Brain
 from jarvis.model_config import TIER_MODELS, TIER_FAST, TIER_REASONING, TIER_CODING
 from jarvis.orchestrator import Orchestrator
+from jarvis.workspace_events import (
+    VIEWS,
+    VIEW_CHAT,
+    VIEW_CODE,
+    VIEW_FILES,
+    VIEW_RESEARCH,
+    VIEW_TERMINAL,
+    VIEW_WORKSPACE,
+    view_for_status,
+)
 
 # ── Cyber HUD palette ───────────────────────────────────────────────────
 BG = "#030106"
@@ -39,6 +52,10 @@ FG_OK = "#39ff14"
 FG_WARN = "#ffcc00"
 FG_ERR = "#ff3355"
 FG_TITLE = "#ff3dd4"
+FG_KW = "#ff7af0"
+FG_STR = "#7dffb3"
+FG_CMT = "#6b145c"
+FG_NUM = "#5ec8ff"
 BORDER = "#ff2bd6"
 BORDER_DIM = "#6b145c"
 
@@ -47,10 +64,18 @@ FONT_TITLE = ("Consolas", 36, "bold")
 FONT_SUB = ("Consolas", 9)
 FONT_SMALL = ("Consolas", 9)
 FONT_STAT = ("Consolas", 10)
+FONT_CODE = ("Consolas", 10)
+
+_PY_KW = {
+    "and", "as", "assert", "async", "await", "break", "class", "continue",
+    "def", "del", "elif", "else", "except", "False", "finally", "for",
+    "from", "global", "if", "import", "in", "is", "lambda", "None",
+    "nonlocal", "not", "or", "pass", "raise", "return", "True", "try",
+    "while", "with", "yield",
+}
 
 
 def _mono() -> str:
-    """Pick first available monospace family (requires an existing Tk root)."""
     if tk is None or tkfont is None:
         return "Consolas"
     try:
@@ -72,13 +97,7 @@ def _mono() -> str:
 
 
 def _panel(parent: tk.Misc, **pack_kw) -> tk.Frame:
-    """Magenta-bordered panel that packs correctly (no place geometry)."""
-    outer = tk.Frame(
-        parent,
-        bg=BORDER,
-        highlightthickness=0,
-        bd=0,
-    )
+    outer = tk.Frame(parent, bg=BORDER, highlightthickness=0, bd=0)
     if pack_kw:
         outer.pack(**pack_kw)
     inner = tk.Frame(outer, bg=BG_PANEL, highlightthickness=0, bd=0)
@@ -88,29 +107,38 @@ def _panel(parent: tk.Misc, **pack_kw) -> tk.Frame:
 
 
 class JarvisGUI:
-    """Magenta cyber-HUD interface for JARVIS (visual shell)."""
+    """Magenta cyber-HUD with integrated dynamic Workspace views."""
 
     def __init__(self, root_dir: Path) -> None:
         if tk is None:
             raise RuntimeError("tkinter is required for GUI mode")
-        self.root_dir = root_dir
+        self.root_dir = Path(root_dir)
         self.busy = False
         self._request_seq = 0
         self._dot_phase = 0
         self._fullscreen = True
+        self._active_view = VIEW_CHAT
+        self._manual_view = False
+        self._event_q: queue.SimpleQueue = queue.SimpleQueue()
+        self._code_path: Optional[Path] = None
+        self._code_mtime: float = 0.0
+        self._phase = "IDLE"
+        self._research_lines: list[str] = []
+        self._view_btns: dict[str, tk.Button] = {}
 
         self.win = tk.Tk()
         self.win.title("JARVIS")
         self.win.configure(bg=BG)
-        self.win.minsize(900, 600)
+        self.win.minsize(1000, 680)
 
         family = _mono()
-        global FONT_MONO, FONT_TITLE, FONT_SUB, FONT_SMALL, FONT_STAT
+        global FONT_MONO, FONT_TITLE, FONT_SUB, FONT_SMALL, FONT_STAT, FONT_CODE
         FONT_MONO = (family, 11)
-        FONT_TITLE = (family, 36, "bold")
+        FONT_TITLE = (family, 32, "bold")
         FONT_SUB = (family, 9)
         FONT_SMALL = (family, 9)
         FONT_STAT = (family, 10)
+        FONT_CODE = (family, 10)
 
         self._build_ui()
         self._bind_keys()
@@ -121,12 +149,18 @@ class JarvisGUI:
             brain=Brain(),
             on_log=self._ui_log,
             on_status=self._ui_status,
+            on_event=self._ui_event,
         )
         self._refresh_stats()
         self._boot_banner()
+        self._show_view(VIEW_CHAT, manual=False)
         self.win.after(80, self._animate_status_dots)
+        self.win.after(50, self._drain_events)
         self.win.after(200, self._focus_entry)
+        self.win.after(1200, self._poll_active_file)
         self.win.after(4000, self._tick_stats)
+
+    # ── UI construction ─────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         root_border = tk.Frame(self.win, bg=BORDER, bd=0)
@@ -135,17 +169,10 @@ class JarvisGUI:
         shell.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         self.shell = shell
 
+        # Header
         header = tk.Frame(shell, bg=BG)
-        header.pack(fill=tk.X, padx=12, pady=(10, 4))
-
-        self.title_lbl = tk.Label(
-            header,
-            text="JARVIS",
-            fg=FG_TITLE,
-            bg=BG,
-            font=FONT_TITLE,
-        )
-        self.title_lbl.pack()
+        header.pack(fill=tk.X, padx=12, pady=(8, 2))
+        tk.Label(header, text="JARVIS", fg=FG_TITLE, bg=BG, font=FONT_TITLE).pack()
         tk.Label(
             header,
             text="AUTONOMOUS  •  SELF-LEARNING  •  VERIFIED",
@@ -154,175 +181,147 @@ class JarvisGUI:
             font=FONT_SUB,
         ).pack()
 
-        status_outer = _panel(shell, fill=tk.X, padx=12, pady=(4, 6))
+        # Status strip
+        status_outer = _panel(shell, fill=tk.X, padx=12, pady=(2, 4))
         sf = status_outer.body  # type: ignore[attr-defined]
-
         left_st = tk.Frame(sf, bg=BG_PANEL)
         left_st.pack(side=tk.LEFT, fill=tk.Y)
         self.status_var = tk.StringVar(value="STATUS: BOOT")
         self.status_lbl = tk.Label(
-            left_st,
-            textvariable=self.status_var,
-            fg=FG_GLOW,
-            bg=BG_PANEL,
-            font=FONT_MONO,
-            anchor="w",
+            left_st, textvariable=self.status_var, fg=FG_GLOW, bg=BG_PANEL,
+            font=FONT_MONO, anchor="w",
         )
-        self.status_lbl.pack(side=tk.LEFT, padx=(10, 0), pady=6)
+        self.status_lbl.pack(side=tk.LEFT, padx=(10, 0), pady=5)
         self._status_dots = tk.Label(
             left_st, text="", fg=FG_MAGENTA, bg=BG_PANEL, font=FONT_MONO
         )
         self._status_dots.pack(side=tk.LEFT)
+        self.phase_var = tk.StringVar(value="")
+        tk.Label(
+            left_st, textvariable=self.phase_var, fg=FG_DIM, bg=BG_PANEL, font=FONT_SUB
+        ).pack(side=tk.LEFT, padx=(12, 0))
 
         right_st = tk.Frame(sf, bg=BG_PANEL)
         right_st.pack(side=tk.RIGHT, fill=tk.Y, padx=10)
         self.brain_dot = tk.Label(
             right_st, text="●", fg=FG_OK, bg=BG_PANEL, font=FONT_MONO
         )
-        self.brain_dot.pack(side=tk.LEFT, pady=6)
+        self.brain_dot.pack(side=tk.LEFT, pady=5)
         self.brain_var = tk.StringVar(value="BRAIN: … | multi-model")
         self.brain_lbl = tk.Label(
-            right_st,
-            textvariable=self.brain_var,
-            fg=FG_OK,
-            bg=BG_PANEL,
-            font=FONT_SMALL,
-            anchor="e",
+            right_st, textvariable=self.brain_var, fg=FG_OK, bg=BG_PANEL,
+            font=FONT_SMALL, anchor="e",
         )
-        self.brain_lbl.pack(side=tk.LEFT, padx=(4, 0), pady=6)
+        self.brain_lbl.pack(side=tk.LEFT, padx=(4, 0), pady=5)
 
-        # Input FIRST with side=BOTTOM so it never collapses
-        input_outer = tk.Frame(shell, bg=BORDER, height=64)
-        input_outer.pack(fill=tk.X, padx=12, pady=(6, 12), side=tk.BOTTOM)
+        # Input bar (BOTTOM first)
+        input_outer = tk.Frame(shell, bg=BORDER, height=58)
+        input_outer.pack(fill=tk.X, padx=12, pady=(4, 10), side=tk.BOTTOM)
         input_outer.pack_propagate(False)
-
         input_frame = tk.Frame(input_outer, bg=BG_PANEL)
         input_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
-
         tk.Label(
-            input_frame,
-            text="›",
-            fg=FG_MAGENTA,
-            bg=BG_PANEL,
+            input_frame, text="›", fg=FG_MAGENTA, bg=BG_PANEL,
             font=(FONT_MONO[0], 18, "bold"),
         ).pack(side=tk.LEFT, padx=(10, 6))
-
         self.entry = tk.Entry(
-            input_frame,
-            bg=BG_INPUT,
-            fg=FG,
-            insertbackground=FG_GLOW,
-            font=FONT_MONO,
-            relief=tk.FLAT,
-            highlightbackground=BORDER_DIM,
-            highlightcolor=FG_MAGENTA,
-            highlightthickness=1,
+            input_frame, bg=BG_INPUT, fg=FG, insertbackground=FG_GLOW,
+            font=FONT_MONO, relief=tk.FLAT, highlightbackground=BORDER_DIM,
+            highlightcolor=FG_MAGENTA, highlightthickness=1,
         )
-        self.entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=8, ipady=4)
-
+        self.entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=6, ipady=3)
         self.send_btn = tk.Button(
-            input_frame,
-            text="SEND",
-            command=self._on_send,
-            bg=BG_PANEL_2,
-            fg=FG_GLOW,
-            activebackground=FG_MAGENTA,
-            activeforeground=BG,
-            font=(FONT_MONO[0], 11, "bold"),
-            relief=tk.FLAT,
-            padx=20,
-            pady=6,
-            highlightbackground=BORDER,
-            highlightthickness=2,
-            cursor="hand2",
+            input_frame, text="SEND", command=self._on_send, bg=BG_PANEL_2,
+            fg=FG_GLOW, activebackground=FG_MAGENTA, activeforeground=BG,
+            font=(FONT_MONO[0], 11, "bold"), relief=tk.FLAT, padx=18, pady=4,
+            highlightbackground=BORDER, highlightthickness=2, cursor="hand2",
         )
-        self.send_btn.pack(side=tk.LEFT, padx=(8, 10), pady=8)
+        self.send_btn.pack(side=tk.LEFT, padx=(8, 10), pady=6)
 
+        # Persistent TERMINAL strip above input
+        term_outer = _panel(shell, fill=tk.X, padx=12, pady=(2, 2), side=tk.BOTTOM)
+        term_body = term_outer.body  # type: ignore[attr-defined]
+        th = tk.Frame(term_body, bg=BG_PANEL)
+        th.pack(fill=tk.X, padx=4, pady=(2, 0))
+        tk.Label(
+            th, text="›  TERMINAL", fg=FG_BRIGHT, bg=BG_PANEL, font=FONT_SMALL
+        ).pack(side=tk.LEFT)
+        self.term_status = tk.Label(
+            th, text="idle", fg=BORDER_DIM, bg=BG_PANEL, font=FONT_SUB
+        )
+        self.term_status.pack(side=tk.RIGHT, padx=6)
+        self.term = scrolledtext.ScrolledText(
+            term_body, bg=BG_DEEP, fg=FG, font=FONT_CODE, relief=tk.FLAT,
+            height=7, wrap=tk.WORD, state=tk.DISABLED, highlightthickness=0,
+            takefocus=0, padx=6, pady=4,
+        )
+        self.term.pack(fill=tk.X, expand=False, padx=4, pady=4)
+        self.term.tag_configure("cmd", foreground=FG_MAGENTA)
+        self.term.tag_configure("out", foreground=FG)
+        self.term.tag_configure("err", foreground=FG_ERR)
+        self.term.tag_configure("ok", foreground=FG_OK)
+        self.term.tag_configure("dim", foreground=FG_DIM)
+
+        # View tabs
+        tabs = tk.Frame(shell, bg=BG)
+        tabs.pack(fill=tk.X, padx=12, pady=(2, 2))
+        for name in VIEWS:
+            btn = tk.Button(
+                tabs,
+                text=name,
+                command=lambda n=name: self._show_view(n, manual=True),
+                bg=BG_PANEL,
+                fg=FG_DIM,
+                activebackground=FG_MAGENTA,
+                activeforeground=BG,
+                font=FONT_SMALL,
+                relief=tk.FLAT,
+                padx=10,
+                pady=3,
+                highlightthickness=1,
+                highlightbackground=BORDER_DIM,
+                cursor="hand2",
+            )
+            btn.pack(side=tk.LEFT, padx=(0, 4))
+            self._view_btns[name] = btn
+
+        # Body: center stack + side
         body = tk.Frame(shell, bg=BG)
         body.pack(fill=tk.BOTH, expand=True, padx=12, pady=2)
 
-        log_outer = _panel(body)
-        log_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        log_frame = log_outer.body  # type: ignore[attr-defined]
+        center_outer = _panel(body)
+        center_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        center = center_outer.body  # type: ignore[attr-defined]
+        self.center = center
 
-        log_header = tk.Frame(log_frame, bg=BG_PANEL)
-        log_header.pack(fill=tk.X, padx=6, pady=(4, 0))
-        tk.Label(
-            log_header,
-            text="›  CONVERSATION / LOG",
-            fg=FG_BRIGHT,
-            bg=BG_PANEL,
-            font=FONT_SMALL,
-            anchor="w",
-        ).pack(side=tk.LEFT)
-        tk.Label(
-            log_header,
-            text="LIVE FEED",
-            fg=BORDER_DIM,
-            bg=BG_PANEL,
-            font=FONT_SUB,
-        ).pack(side=tk.RIGHT, padx=6)
+        # Stack frames for each view
+        self.view_frames: dict[str, tk.Frame] = {}
+        for name in VIEWS:
+            fr = tk.Frame(center, bg=BG_PANEL)
+            self.view_frames[name] = fr
 
-        self.log = scrolledtext.ScrolledText(
-            log_frame,
-            bg=BG_DEEP,
-            fg=FG,
-            insertbackground=FG_GLOW,
-            font=FONT_MONO,
-            wrap=tk.WORD,
-            relief=tk.FLAT,
-            borderwidth=0,
-            state=tk.DISABLED,
-            highlightthickness=0,
-            takefocus=0,
-            padx=10,
-            pady=8,
-        )
-        self.log.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self.log.bind("<Button-1>", lambda _e: self._focus_entry())
-        self.log.tag_configure("user", foreground=FG_USER)
-        self.log.tag_configure("jarvis", foreground=FG)
-        self.log.tag_configure("system", foreground=FG_DIM)
-        self.log.tag_configure("error", foreground=FG_ERR)
-        self.log.tag_configure("warn", foreground=FG_WARN)
-        self.log.tag_configure("ok", foreground=FG_OK)
-        try:
-            self.log.vbar.configure(
-                troughcolor=BG_PANEL,
-                background=FG_MAGENTA,
-                activebackground=FG_GLOW,
-                borderwidth=0,
-                width=12,
-            )
-        except Exception:
-            pass
+        self._build_chat_view(self.view_frames[VIEW_CHAT])
+        self._build_workspace_view(self.view_frames[VIEW_WORKSPACE])
+        self._build_code_view(self.view_frames[VIEW_CODE])
+        self._build_terminal_view(self.view_frames[VIEW_TERMINAL])
+        self._build_research_view(self.view_frames[VIEW_RESEARCH])
+        self._build_files_view(self.view_frames[VIEW_FILES])
 
-        side_col = tk.Frame(body, bg=BG, width=300)
+        # Side column
+        side_col = tk.Frame(body, bg=BG, width=280)
         side_col.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
         side_col.pack_propagate(False)
 
         mem_outer = _panel(side_col, fill=tk.X, pady=(0, 8))
         mem = mem_outer.body  # type: ignore[attr-defined]
         tk.Label(
-            mem,
-            text="▣  MEMORY / STATS",
-            fg=FG_BRIGHT,
-            bg=BG_PANEL,
-            font=FONT_SMALL,
-            anchor="w",
+            mem, text="▣  MEMORY / STATS", fg=FG_BRIGHT, bg=BG_PANEL,
+            font=FONT_SMALL, anchor="w",
         ).pack(fill=tk.X, padx=8, pady=(6, 0))
         self.stats_text = tk.Text(
-            mem,
-            bg=BG_DEEP,
-            fg=FG,
-            font=FONT_STAT,
-            relief=tk.FLAT,
-            height=14,
-            wrap=tk.WORD,
-            state=tk.DISABLED,
-            highlightthickness=0,
-            takefocus=0,
-            width=28,
+            mem, bg=BG_DEEP, fg=FG, font=FONT_STAT, relief=tk.FLAT, height=12,
+            wrap=tk.WORD, state=tk.DISABLED, highlightthickness=0, takefocus=0,
+            width=26,
         )
         self.stats_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.stats_text.tag_configure("ok", foreground=FG_OK)
@@ -332,29 +331,447 @@ class JarvisGUI:
         sk_outer = _panel(side_col, fill=tk.BOTH, expand=True)
         sk = sk_outer.body  # type: ignore[attr-defined]
         tk.Label(
-            sk,
-            text="☰  SKILLS REGISTRY",
-            fg=FG_BRIGHT,
-            bg=BG_PANEL,
-            font=FONT_SMALL,
-            anchor="w",
+            sk, text="☰  SKILLS REGISTRY", fg=FG_BRIGHT, bg=BG_PANEL,
+            font=FONT_SMALL, anchor="w",
         ).pack(fill=tk.X, padx=8, pady=(6, 0))
         self.skills_text = scrolledtext.ScrolledText(
-            sk,
-            bg=BG_DEEP,
-            fg=FG,
-            font=FONT_SMALL,
-            relief=tk.FLAT,
-            wrap=tk.WORD,
-            state=tk.DISABLED,
-            highlightthickness=0,
-            takefocus=0,
+            sk, bg=BG_DEEP, fg=FG, font=FONT_SMALL, relief=tk.FLAT, wrap=tk.WORD,
+            state=tk.DISABLED, highlightthickness=0, takefocus=0,
         )
         self.skills_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.skills_text.tag_configure("cand", foreground=FG_MAGENTA)
         self.skills_text.tag_configure("brok", foreground=FG_ERR)
         self.skills_text.tag_configure("actv", foreground=FG_OK)
         self.skills_text.tag_configure("dim", foreground=FG_DIM)
+
+    def _build_chat_view(self, parent: tk.Frame) -> None:
+        hdr = tk.Frame(parent, bg=BG_PANEL)
+        hdr.pack(fill=tk.X, padx=6, pady=(4, 0))
+        tk.Label(
+            hdr, text="›  CONVERSATION / LOG", fg=FG_BRIGHT, bg=BG_PANEL,
+            font=FONT_SMALL,
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            hdr, text="CHAT", fg=BORDER_DIM, bg=BG_PANEL, font=FONT_SUB
+        ).pack(side=tk.RIGHT, padx=6)
+        self.log = scrolledtext.ScrolledText(
+            parent, bg=BG_DEEP, fg=FG, font=FONT_MONO, wrap=tk.WORD,
+            relief=tk.FLAT, state=tk.DISABLED, highlightthickness=0, takefocus=0,
+            padx=10, pady=8,
+        )
+        self.log.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.log.bind("<Button-1>", lambda _e: self._focus_entry())
+        for tag, col in (
+            ("user", FG_USER), ("jarvis", FG), ("system", FG_DIM),
+            ("error", FG_ERR), ("warn", FG_WARN), ("ok", FG_OK),
+        ):
+            self.log.tag_configure(tag, foreground=col)
+
+    def _build_workspace_view(self, parent: tk.Frame) -> None:
+        hdr = tk.Frame(parent, bg=BG_PANEL)
+        hdr.pack(fill=tk.X, padx=6, pady=(4, 0))
+        tk.Label(
+            hdr, text="›  WORKSPACE", fg=FG_BRIGHT, bg=BG_PANEL, font=FONT_SMALL
+        ).pack(side=tk.LEFT)
+        self.ws_phase = tk.Label(
+            hdr, text="IDLE", fg=FG_OK, bg=BG_PANEL, font=FONT_SMALL
+        )
+        self.ws_phase.pack(side=tk.RIGHT, padx=6)
+        self.ws_summary = scrolledtext.ScrolledText(
+            parent, bg=BG_DEEP, fg=FG, font=FONT_MONO, wrap=tk.WORD,
+            relief=tk.FLAT, state=tk.DISABLED, highlightthickness=0, takefocus=0,
+            padx=8, pady=6,
+        )
+        self.ws_summary.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.ws_summary.tag_configure("hi", foreground=FG_BRIGHT)
+        self.ws_summary.tag_configure("ok", foreground=FG_OK)
+        self.ws_summary.tag_configure("err", foreground=FG_ERR)
+        self.ws_summary.tag_configure("dim", foreground=FG_DIM)
+
+    def _build_code_view(self, parent: tk.Frame) -> None:
+        hdr = tk.Frame(parent, bg=BG_PANEL)
+        hdr.pack(fill=tk.X, padx=6, pady=(4, 0))
+        tk.Label(
+            hdr, text="›  CODE WORKSPACE", fg=FG_BRIGHT, bg=BG_PANEL, font=FONT_SMALL
+        ).pack(side=tk.LEFT)
+        self.code_path_var = tk.StringVar(value="(no active file)")
+        tk.Label(
+            hdr, textvariable=self.code_path_var, fg=FG_DIM, bg=BG_PANEL, font=FONT_SUB
+        ).pack(side=tk.RIGHT, padx=6)
+        self.code_status = tk.Label(
+            parent, text="STATUS: —", fg=FG_MAGENTA, bg=BG_PANEL, font=FONT_SMALL,
+            anchor="w",
+        )
+        self.code_status.pack(fill=tk.X, padx=10, pady=(2, 0))
+        self.code_view = scrolledtext.ScrolledText(
+            parent, bg=BG_DEEP, fg=FG, font=FONT_CODE, wrap=tk.NONE,
+            relief=tk.FLAT, state=tk.DISABLED, highlightthickness=0, takefocus=0,
+            padx=8, pady=6,
+        )
+        self.code_view.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.code_view.tag_configure("kw", foreground=FG_KW)
+        self.code_view.tag_configure("str", foreground=FG_STR)
+        self.code_view.tag_configure("cmt", foreground=FG_CMT)
+        self.code_view.tag_configure("num", foreground=FG_NUM)
+
+    def _build_terminal_view(self, parent: tk.Frame) -> None:
+        hdr = tk.Frame(parent, bg=BG_PANEL)
+        hdr.pack(fill=tk.X, padx=6, pady=(4, 0))
+        tk.Label(
+            hdr, text="›  TERMINAL (full)", fg=FG_BRIGHT, bg=BG_PANEL, font=FONT_SMALL
+        ).pack(side=tk.LEFT)
+        self.term_full = scrolledtext.ScrolledText(
+            parent, bg=BG_DEEP, fg=FG, font=FONT_CODE, wrap=tk.WORD,
+            relief=tk.FLAT, state=tk.DISABLED, highlightthickness=0, takefocus=0,
+            padx=8, pady=6,
+        )
+        self.term_full.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        for tag, col in (
+            ("cmd", FG_MAGENTA), ("out", FG), ("err", FG_ERR),
+            ("ok", FG_OK), ("dim", FG_DIM),
+        ):
+            self.term_full.tag_configure(tag, foreground=col)
+
+    def _build_research_view(self, parent: tk.Frame) -> None:
+        hdr = tk.Frame(parent, bg=BG_PANEL)
+        hdr.pack(fill=tk.X, padx=6, pady=(4, 0))
+        tk.Label(
+            hdr, text="›  RESEARCH", fg=FG_BRIGHT, bg=BG_PANEL, font=FONT_SMALL
+        ).pack(side=tk.LEFT)
+        self.research_view = scrolledtext.ScrolledText(
+            parent, bg=BG_DEEP, fg=FG, font=FONT_MONO, wrap=tk.WORD,
+            relief=tk.FLAT, state=tk.DISABLED, highlightthickness=0, takefocus=0,
+            padx=8, pady=6,
+        )
+        self.research_view.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.research_view.tag_configure("hi", foreground=FG_BRIGHT)
+        self.research_view.tag_configure("ok", foreground=FG_OK)
+        self.research_view.tag_configure("dim", foreground=FG_DIM)
+        self.research_view.tag_configure("url", foreground=FG_USER)
+
+    def _build_files_view(self, parent: tk.Frame) -> None:
+        hdr = tk.Frame(parent, bg=BG_PANEL)
+        hdr.pack(fill=tk.X, padx=6, pady=(4, 0))
+        tk.Label(
+            hdr, text="›  FILES", fg=FG_BRIGHT, bg=BG_PANEL, font=FONT_SMALL
+        ).pack(side=tk.LEFT)
+        tk.Button(
+            hdr, text="REFRESH", command=self._refresh_files, bg=BG_PANEL_2,
+            fg=FG_GLOW, font=FONT_SUB, relief=tk.FLAT, padx=8, cursor="hand2",
+        ).pack(side=tk.RIGHT, padx=6)
+        self.files_view = scrolledtext.ScrolledText(
+            parent, bg=BG_DEEP, fg=FG, font=FONT_MONO, wrap=tk.WORD,
+            relief=tk.FLAT, state=tk.DISABLED, highlightthickness=0, takefocus=0,
+            padx=8, pady=6,
+        )
+        self.files_view.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.files_view.tag_configure("hi", foreground=FG_BRIGHT)
+        self.files_view.tag_configure("dim", foreground=FG_DIM)
+        self.files_view.tag_configure("path", foreground=FG_USER)
+
+    # ── View switching ──────────────────────────────────────────────────
+
+    def _show_view(self, name: str, *, manual: bool) -> None:
+        if name not in self.view_frames:
+            return
+        if manual:
+            self._manual_view = True
+        self._active_view = name
+        for n, fr in self.view_frames.items():
+            fr.pack_forget()
+        self.view_frames[name].pack(fill=tk.BOTH, expand=True)
+        for n, btn in self._view_btns.items():
+            if n == name:
+                btn.configure(fg=FG_GLOW, highlightbackground=BORDER, bg=BG_PANEL_2)
+            else:
+                btn.configure(fg=FG_DIM, highlightbackground=BORDER_DIM, bg=BG_PANEL)
+        if name == VIEW_FILES:
+            self._refresh_files()
+        if name == VIEW_CODE and self._code_path:
+            self._load_code_file(self._code_path, force=True)
+
+    def _auto_view(self, name: str) -> None:
+        if self._manual_view:
+            return
+        if name != self._active_view:
+            self._show_view(name, manual=False)
+
+    # ── Event intake (async — never blocks backend) ─────────────────────
+
+    def _ui_event(self, kind: str, payload: dict) -> None:
+        try:
+            self._event_q.put_nowait((kind, dict(payload or {})))
+        except Exception:
+            pass
+
+    def _drain_events(self) -> None:
+        try:
+            while True:
+                kind, payload = self._event_q.get_nowait()
+                self._handle_event(kind, payload)
+        except queue.Empty:
+            pass
+        self.win.after(50, self._drain_events)
+
+    def _handle_event(self, kind: str, p: dict[str, Any]) -> None:
+        if kind == "phase":
+            status = str(p.get("status") or "")
+            self._phase = status
+            self.phase_var.set(f"· {status}" if status else "")
+            self.ws_phase.configure(text=status or "IDLE")
+            self.code_status.configure(text=f"STATUS: {status or '—'}")
+            view = view_for_status(status)
+            if status in ("DONE", "IDLE"):
+                self._manual_view = False
+                if p.get("status") == "DONE" or status == "DONE":
+                    # VERIFY PASS / cycle end → return to CHAT
+                    self._auto_view(VIEW_CHAT)
+                else:
+                    self._auto_view(view)
+            else:
+                self._auto_view(view)
+            self._ws_line(f"PHASE → {status}", "hi")
+            return
+
+        if kind == "skill_file":
+            path = p.get("path")
+            code = p.get("code") or ""
+            if path:
+                self._code_path = Path(str(path))
+                self.code_path_var.set(str(self._code_path))
+                if code:
+                    self._set_code_text(str(code))
+                else:
+                    self._load_code_file(self._code_path, force=True)
+            self._auto_view(VIEW_CODE)
+            self._ws_line(
+                f"FILE {(p.get('source') or 'write')}: {path} "
+                f"v{p.get('version', '?')} ok={p.get('ok')}",
+                "ok" if p.get("ok") else "err",
+            )
+            self._refresh_files()
+            return
+
+        if kind == "subprocess":
+            mode = str(p.get("mode") or "run")
+            cmd = str(p.get("command") or mode)
+            self._term_write(f"$ {cmd}\n", "cmd")
+            self._term_write_full(f"$ {cmd}\n", "cmd")
+            out = str(p.get("stdout") or "")
+            err = str(p.get("stderr") or "")
+            tb = str(p.get("traceback") or "")
+            if out:
+                self._term_write(out if out.endswith("\n") else out + "\n", "out")
+                self._term_write_full(out if out.endswith("\n") else out + "\n", "out")
+            if err:
+                self._term_write(err if err.endswith("\n") else err + "\n", "err")
+                self._term_write_full(err if err.endswith("\n") else err + "\n", "err")
+            if tb:
+                self._term_write(tb if tb.endswith("\n") else tb + "\n", "err")
+                self._term_write_full(tb if tb.endswith("\n") else tb + "\n", "err")
+            rc = p.get("returncode")
+            tag = "ok" if p.get("ok") else "err"
+            line = f"[rc={rc}] ok={p.get('ok')} timed_out={p.get('timed_out')}\n"
+            if p.get("error"):
+                line += f"error: {p.get('error')}\n"
+            self._term_write(line, tag)
+            self._term_write_full(line, tag)
+            self.term_status.configure(
+                text=f"{mode} rc={rc}", fg=FG_OK if p.get("ok") else FG_ERR
+            )
+            self._auto_view(VIEW_TERMINAL)
+            self._ws_line(f"SUBPROCESS {mode} rc={rc} ok={p.get('ok')}", tag)
+            return
+
+        if kind == "research":
+            stage = str(p.get("stage") or "")
+            if stage == "start":
+                self._research_lines.clear()
+                self._research_set("RESEARCH START\n", "hi")
+                qs = p.get("queries") or []
+                for q in qs:
+                    self._research_add(f"  query: {q}\n", "dim")
+                self._auto_view(VIEW_RESEARCH)
+            elif stage == "search":
+                self._research_add(f"SEARCH → {p.get('query')}\n", "hi")
+                self._auto_view(VIEW_RESEARCH)
+            elif stage == "source":
+                self._research_add(
+                    f"SOURCE  {(p.get('title') or '')[:80]}\n"
+                    f"        {p.get('url')}\n",
+                    "url",
+                )
+            elif stage == "extract":
+                self._research_add(
+                    f"READING {(p.get('title') or '')[:80]} "
+                    f"chars={p.get('chars')} ok={p.get('ok')}\n",
+                    "ok" if p.get("ok") else "dim",
+                )
+                preview = str(p.get("preview") or "").strip()
+                if preview:
+                    self._research_add(f"  evid: {preview[:300]}\n", "dim")
+            elif stage == "done":
+                self._research_add("RESEARCH DONE\n", "ok")
+                for s in (p.get("sources") or [])[:10]:
+                    if isinstance(s, dict):
+                        self._research_add(
+                            f"  · {(s.get('title') or '')[:70]} | "
+                            f"{(s.get('url') or '')[:100]}\n",
+                            "url",
+                        )
+                for e in (p.get("extracts") or [])[:6]:
+                    if isinstance(e, dict) and e.get("preview"):
+                        self._research_add(
+                            f"  proof: {str(e.get('preview'))[:280]}\n", "dim"
+                        )
+                self._auto_view(VIEW_RESEARCH)
+            self._ws_line(f"RESEARCH/{stage}", "hi")
+            return
+
+        if kind == "verify":
+            verified = bool(p.get("verified"))
+            reason = str(p.get("reason") or "")
+            tag = "ok" if verified else "err"
+            msg = f"VERIFY {'PASS' if verified else 'FAIL'} — {reason}\n"
+            self._term_write(msg, tag)
+            self._term_write_full(msg, tag)
+            self._ws_line(msg.strip(), tag)
+            if verified:
+                self._manual_view = False
+                self._auto_view(VIEW_CHAT)
+            else:
+                self._auto_view(VIEW_TERMINAL)
+            return
+
+    # ── Code / files (real disk) ────────────────────────────────────────
+
+    def _set_code_text(self, code: str) -> None:
+        self.code_view.configure(state=tk.NORMAL)
+        self.code_view.delete("1.0", tk.END)
+        self.code_view.insert(tk.END, code)
+        self._highlight_python()
+        self.code_view.see(tk.END)
+        self.code_view.configure(state=tk.DISABLED)
+
+    def _load_code_file(self, path: Path, *, force: bool = False) -> None:
+        try:
+            p = Path(path)
+            if not p.is_file():
+                return
+            mtime = p.stat().st_mtime
+            if not force and mtime == self._code_mtime and p == self._code_path:
+                return
+            text = p.read_text(encoding="utf-8", errors="replace")
+            self._code_path = p
+            self._code_mtime = mtime
+            self.code_path_var.set(str(p))
+            self._set_code_text(text)
+        except Exception as exc:
+            self.code_path_var.set(f"read error: {exc}")
+
+    def _poll_active_file(self) -> None:
+        if self._code_path and self._active_view in (
+            VIEW_CODE, VIEW_WORKSPACE
+        ):
+            self._load_code_file(self._code_path, force=False)
+        self.win.after(1200, self._poll_active_file)
+
+    def _highlight_python(self) -> None:
+        text = self.code_view.get("1.0", tk.END)
+        for tag in ("kw", "str", "cmt", "num"):
+            self.code_view.tag_remove(tag, "1.0", tk.END)
+        for m in re.finditer(r"#.*?$", text, re.M):
+            self.code_view.tag_add("cmt", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        for m in re.finditer(r"('''[\s\S]*?'''|\"\"\"[\s\S]*?\"\"\"|'[^'\n]*'|\"[^\"\n]*\")", text):
+            self.code_view.tag_add("str", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        for m in re.finditer(r"\b\d+\.?\d*\b", text):
+            self.code_view.tag_add("num", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        for m in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]*\b", text):
+            if m.group(0) in _PY_KW:
+                self.code_view.tag_add("kw", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+
+    def _refresh_files(self) -> None:
+        roots = []
+        try:
+            roots = [
+                ("skills", Path(self.orch.skills_dir)),
+                ("workspace", Path(self.orch.workspace)),
+            ]
+        except Exception:
+            roots = [
+                ("skills", self.root_dir / "skills"),
+                ("workspace", self.root_dir / "workspace_runtime"),
+            ]
+        lines: list[tuple[str, str]] = []
+        for label, root in roots:
+            lines.append((f"[{label}] {root}\n", "hi"))
+            if not root.exists():
+                lines.append(("  (missing)\n", "dim"))
+                continue
+            try:
+                files = sorted(root.rglob("*"))
+            except Exception as exc:
+                lines.append((f"  error: {exc}\n", "dim"))
+                continue
+            n = 0
+            for f in files:
+                if not f.is_file():
+                    continue
+                if f.name.startswith(".") or f.suffix == ".pyc":
+                    continue
+                if "__pycache__" in f.parts:
+                    continue
+                rel = f.relative_to(root)
+                try:
+                    sz = f.stat().st_size
+                except Exception:
+                    sz = 0
+                lines.append((f"  {rel}  ({sz} B)\n", "path"))
+                n += 1
+                if n >= 80:
+                    lines.append(("  …\n", "dim"))
+                    break
+            if n == 0:
+                lines.append(("  (empty)\n", "dim"))
+        self.files_view.configure(state=tk.NORMAL)
+        self.files_view.delete("1.0", tk.END)
+        for text, tag in lines:
+            self.files_view.insert(tk.END, text, tag)
+        self.files_view.configure(state=tk.DISABLED)
+
+    # ── Terminal / research helpers ─────────────────────────────────────
+
+    def _term_write(self, text: str, tag: str = "out") -> None:
+        self.term.configure(state=tk.NORMAL)
+        self.term.insert(tk.END, text, tag)
+        self.term.see(tk.END)
+        self.term.configure(state=tk.DISABLED)
+
+    def _term_write_full(self, text: str, tag: str = "out") -> None:
+        self.term_full.configure(state=tk.NORMAL)
+        self.term_full.insert(tk.END, text, tag)
+        self.term_full.see(tk.END)
+        self.term_full.configure(state=tk.DISABLED)
+
+    def _ws_line(self, text: str, tag: str = "dim") -> None:
+        self.ws_summary.configure(state=tk.NORMAL)
+        self.ws_summary.insert(tk.END, text.rstrip() + "\n", tag)
+        self.ws_summary.see(tk.END)
+        self.ws_summary.configure(state=tk.DISABLED)
+
+    def _research_set(self, text: str, tag: str = "dim") -> None:
+        self.research_view.configure(state=tk.NORMAL)
+        self.research_view.delete("1.0", tk.END)
+        self.research_view.insert(tk.END, text, tag)
+        self.research_view.configure(state=tk.DISABLED)
+
+    def _research_add(self, text: str, tag: str = "dim") -> None:
+        self.research_view.configure(state=tk.NORMAL)
+        self.research_view.insert(tk.END, text, tag)
+        self.research_view.see(tk.END)
+        self.research_view.configure(state=tk.DISABLED)
+
+    # ── Window / keys ───────────────────────────────────────────────────
 
     def _go_fullscreen(self) -> None:
         try:
@@ -415,12 +832,14 @@ class JarvisGUI:
 
     def _animate_status_dots(self) -> None:
         status = self.status_var.get()
-        if "THINKING" in status or "WORKING" in status or "REPAIR" in status:
+        if any(x in status for x in ("THINKING", "WORKING", "REPAIR", "CODING", "TEST")):
             self._dot_phase = (self._dot_phase + 1) % 4
             self._status_dots.configure(text="." * self._dot_phase)
         else:
             self._status_dots.configure(text="")
         self.win.after(400, self._animate_status_dots)
+
+    # ── Boot / chat log ─────────────────────────────────────────────────
 
     def _boot_banner(self) -> None:
         status = self.orch.brain.model_status()
@@ -436,13 +855,15 @@ class JarvisGUI:
         if hasattr(self.orch.brain, "model_catalog_summary"):
             catalog = self.orch.brain.model_catalog_summary()
         banner = (
-            "[SYSTEM] JARVIS cyber-core online. Skills learn themselves.\n"
+            "[SYSTEM] JARVIS cyber-core online — integrated Workspace active.\n"
             f"[SYSTEM] Ollama multi-model — {hint}\n"
             f"[SYSTEM] FAST:{fast}  REASONING:{reason}  CODING:{coding}\n"
             + (f"[SYSTEM] {catalog}\n" if catalog else "")
-            + "[SYSTEM] Type below, then Enter or SEND  ·  F11 fullscreen  ·  Esc exit FS"
+            + "[SYSTEM] Views: CHAT WORKSPACE CODE TERMINAL RESEARCH FILES\n"
+            + "[SYSTEM] Type a goal below · F11 fullscreen · Esc exit FS"
         )
         self._append("system", banner)
+        self._term_write("[terminal ready — live subprocess output]\n", "dim")
         self._ui_status("IDLE")
         online_col = FG_OK if status == "ONLINE" else FG_ERR
         self.brain_lbl.configure(fg=online_col)
@@ -482,7 +903,10 @@ class JarvisGUI:
                 color = FG_OK
             elif status in ("REPAIR", "REPAIRING", "BROKEN"):
                 color = FG_WARN
-            elif status in ("THINKING", "WORKING", "PLAN", "RESEARCH"):
+            elif status in (
+                "THINKING", "WORKING", "PLAN", "RESEARCH",
+                "BUILD_SKILL", "TEST", "VERIFY",
+            ):
                 color = FG_MAGENTA
             self.status_lbl.configure(fg=color)
 
@@ -580,6 +1004,8 @@ class JarvisGUI:
             self._refresh_stats()
         self.win.after(4000, self._tick_stats)
 
+    # ── Interaction ─────────────────────────────────────────────────────
+
     def _on_send(self) -> None:
         if self.busy:
             return
@@ -591,8 +1017,10 @@ class JarvisGUI:
         self.busy = True
         self._request_seq += 1
         seq = self._request_seq
+        self._manual_view = False
         self.send_btn.configure(state=tk.DISABLED)
         self._append("user", f"[USER] {text}")
+        self._show_view(VIEW_CHAT, manual=False)
         self._ui_status("THINKING")
 
         def worker() -> None:
@@ -609,6 +1037,7 @@ class JarvisGUI:
                     if seq != self._request_seq:
                         return
                     self._append(tag, f"[JARVIS] {reply}")
+                    self._show_view(VIEW_CHAT, manual=False)
 
                 self.win.after(0, show_reply)
             except Exception as exc:
@@ -625,6 +1054,7 @@ class JarvisGUI:
                     self.busy = False
                     self.send_btn.configure(state=tk.NORMAL)
                     self._refresh_stats()
+                    self._refresh_files()
                     self._focus_entry()
                     self._ui_status("IDLE")
 

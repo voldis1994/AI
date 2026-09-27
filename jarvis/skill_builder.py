@@ -29,11 +29,13 @@ class SkillBuilder:
         skills_dir: str | Path,
         brain: Any = None,
         on_log: Optional[Callable[[str], None]] = None,
+        on_event: Optional[Callable[[str, dict], None]] = None,
     ) -> None:
         self.skills_dir = Path(skills_dir)
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         self.brain = brain
         self.on_log = on_log or (lambda _m: None)
+        self.on_event = on_event or (lambda _k, _p: None)
         init = self.skills_dir / "__init__.py"
         if not init.exists():
             init.write_text('"""JARVIS learned skills."""\n', encoding="utf-8")
@@ -187,6 +189,21 @@ class SkillBuilder:
             f"BUILD: wrote {path} via {source}"
             + (" (ACTIVE protected)" if protected else "")
         )
+        try:
+            self.on_event(
+                "skill_file",
+                {
+                    "path": str(path),
+                    "name": name,
+                    "version": version,
+                    "ok": True,
+                    "source": source,
+                    "code": code[:12000],
+                    "protected_active": protected,
+                },
+            )
+        except Exception:
+            pass
         return {
             "ok": True,
             "name": name,

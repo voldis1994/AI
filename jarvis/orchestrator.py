@@ -78,6 +78,7 @@ class Orchestrator:
         brain: Optional[Brain] = None,
         on_log: Optional[Callable[[str], None]] = None,
         on_status: Optional[Callable[[str], None]] = None,
+        on_event: Optional[Callable[[str, dict], None]] = None,
     ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -90,6 +91,8 @@ class Orchestrator:
 
         self.on_log = on_log or (lambda m: None)
         self.on_status = on_status or (lambda s: None)
+        # Optional structured workspace events for GUI (fire-and-forget)
+        self.on_event = on_event or (lambda _k, _p: None)
         # Isolates the in-flight USER REQUEST (never share final_result across turns)
         self._active_request_id: Optional[str] = None
 
@@ -132,14 +135,24 @@ class Orchestrator:
         self.research = ResearchSystem(
             brain=self.brain,
             on_log=self._log,
+            on_event=self._event,
             timeout=float(self.calibration.research_timeout()),
         )
         self.research.max_open_sources = int(self.calibration.max_open_sources())
         self.deps = DependencyManager(on_log=self._log)
-        self.builder = SkillBuilder(self.skills_dir, brain=self.brain, on_log=self._log)
-        self.tester = SkillTester(self.workspace, on_log=self._log)
+        self.builder = SkillBuilder(
+            self.skills_dir,
+            brain=self.brain,
+            on_log=self._log,
+            on_event=self._event,
+        )
+        self.tester = SkillTester(
+            self.workspace, on_log=self._log, on_event=self._event
+        )
         self.verifier = Verifier(self.workspace, brain=self.brain, on_log=self._log)
-        self.loader = SkillLoader(self.skills_dir, self.workspace)
+        self.loader = SkillLoader(
+            self.skills_dir, self.workspace, on_event=self._event
+        )
         self.observer = Observer(self.workspace, on_log=self._log)
         self.contexts = ContextBuilder(brain=self.brain, on_log=self._log)
         # Ephemeral: last repair VERIFY PASS proof (skip duplicate execute+verify)
@@ -743,6 +756,7 @@ class Orchestrator:
                 verification = self._verify_learning_knowledge(
                     task_goal, research, saved.get("entry") or {}
                 )
+                self._emit_verify(verification, context="learning")
                 self.ledger.log(
                     task_id,
                     "VERIFY",
@@ -1788,6 +1802,7 @@ class Orchestrator:
                         "task_goal": task_goal.to_dict(),
                     },
                 )
+            self._emit_verify(verification, context="execute")
             self._log(
                 f"[{task_id}] VERIFIER RESULT: "
                 f"{'PASS' if verification.get('verified') else 'FAIL'} — "
@@ -2236,6 +2251,16 @@ class Orchestrator:
                     constraints=task_goal.with_args(args).constraints,
                 )
                 self.perf.end(phase_build)
+                if built.get("path"):
+                    self._event(
+                        "skill_file",
+                        path=built.get("path"),
+                        name=built.get("name") or skill_name,
+                        version=attempt_version,
+                        ok=bool(built.get("ok")),
+                        source=built.get("source") or phase_build,
+                        code=str(built.get("code") or "")[:12000],
+                    )
                 self.ledger.log(
                     task_id,
                     phase_build,
@@ -2369,6 +2394,7 @@ class Orchestrator:
             test_result = self.tester.test(
                 built["path"], goal=goal, args=args
             )
+            self._emit_subprocess(test_result, mode=str(phase_test).lower())
             self.ledger.log(
                 task_id,
                 phase_test,
@@ -2407,6 +2433,7 @@ class Orchestrator:
                     constraints=task_goal.with_args(args).constraints,
                     task_goal=task_goal,
                 )
+                self._emit_verify(verification, context="repair")
                 self.ledger.log(
                     task_id,
                     "VERIFY",
@@ -2542,6 +2569,31 @@ class Orchestrator:
             network=True,
             use_brain=None,  # auto: available() only
             append_python=True,
+        )
+        self._event(
+            "research",
+            stage="done",
+            queries=list(queries)[:8],
+            sources=[
+                {
+                    "title": str(s.get("title") or "")[:100],
+                    "url": str(s.get("url") or "")[:200],
+                }
+                for s in (research.get("sources") or research.get("results") or [])[:12]
+                if isinstance(s, dict)
+            ],
+            extracts=[
+                {
+                    "title": str(e.get("title") or "")[:100],
+                    "url": str(e.get("url") or "")[:200],
+                    "chars": e.get("char_count"),
+                    "preview": str(e.get("text_preview") or e.get("text") or "")[:400],
+                }
+                for e in (research.get("extracts") or [])[:8]
+                if isinstance(e, dict)
+            ],
+            mode="skill",
+            goal=goal,
         )
         # Persist knowledge (history + latest snapshot) so repairs can reuse it
         saved = self.memory.save_research_knowledge(
@@ -3366,6 +3418,10 @@ class Orchestrator:
             args=exec_args,
             file_path=skill.get("file_path"),
         )
+        self._emit_subprocess(
+            {**result, "skill_path": skill.get("file_path") or skill.get("name")},
+            mode="execute",
+        )
         self.ledger.log(
             task_id,
             "EXECUTE",
@@ -3626,6 +3682,51 @@ class Orchestrator:
             self.on_status(status)
         except Exception:
             pass
+        # Mirror phase to workspace GUI (async consumer — never wait)
+        self._event("phase", status=status)
+
+    def _event(self, kind: str, payload: Any = None, **extra: Any) -> None:
+        """Fire structured workspace event; must never block the cycle.
+
+        Accepts either ``_event(kind, {..})`` or ``_event(kind, key=val)``.
+        """
+        data: dict[str, Any]
+        if isinstance(payload, dict):
+            data = dict(payload)
+        elif payload is None:
+            data = {}
+        else:
+            data = {"value": payload}
+        if extra:
+            data.update(extra)
+        try:
+            self.on_event(kind, data)
+        except Exception:
+            pass
+
+    def _emit_verify(self, verification: dict[str, Any], *, context: str = "") -> None:
+        self._event(
+            "verify",
+            verified=bool(verification.get("verified")),
+            reason=str(verification.get("reason") or "")[:500],
+            checks=verification.get("checks") or [],
+            context=context,
+        )
+
+    def _emit_subprocess(self, result: dict[str, Any], *, mode: str) -> None:
+        self._event(
+            "subprocess",
+            mode=mode,
+            command=f"skill:{Path(str(result.get('skill_path') or '')).name or mode}",
+            stdout=str(result.get("stdout") or "")[:8000],
+            stderr=str(result.get("stderr") or "")[:8000],
+            traceback=str(result.get("traceback") or "")[:8000],
+            returncode=result.get("returncode"),
+            timed_out=bool(result.get("timed_out")),
+            ok=bool(result.get("ok")),
+            error=str(result.get("error") or "")[:500],
+            skill_path=str(result.get("skill_path") or ""),
+        )
 
     def close(self) -> None:
         set_active_tracker(None)
