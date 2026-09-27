@@ -33,6 +33,7 @@ from jarvis.workspace_events import (
     VIEW_RESEARCH,
     VIEW_TERMINAL,
     VIEW_WORKSPACE,
+    action_summary_for_status,
     view_for_status,
 )
 
@@ -122,7 +123,9 @@ class JarvisGUI:
         self._event_q: queue.SimpleQueue = queue.SimpleQueue()
         self._code_path: Optional[Path] = None
         self._code_mtime: float = 0.0
+        self._code_streaming: bool = False
         self._phase = "IDLE"
+        self._last_action: str = ""
         self._research_lines: list[str] = []
         self._view_btns: dict[str, tk.Button] = {}
 
@@ -524,18 +527,50 @@ class JarvisGUI:
             if status in ("DONE", "IDLE"):
                 self._manual_view = False
                 if p.get("status") == "DONE" or status == "DONE":
-                    # VERIFY PASS / cycle end → return to CHAT
                     self._auto_view(VIEW_CHAT)
                 else:
                     self._auto_view(view)
             else:
                 self._auto_view(view)
-            self._ws_line(f"PHASE → {status}", "hi")
+            return
+
+        if kind == "action":
+            text = str(p.get("text") or "").strip()
+            if not text or text == self._last_action:
+                return
+            self._last_action = text
+            tag = "ok"
+            low = text.lower()
+            if "fail" in low or "error" in low:
+                tag = "err"
+            elif text.endswith("..."):
+                tag = "hi"
+            self._ws_line(text, tag)
+            self._append_action(text, tag)
+            return
+
+        if kind == "code_delta":
+            stage = str(p.get("stage") or "delta")
+            code = str(p.get("code") or "")
+            name = str(p.get("name") or "")
+            if stage == "start":
+                self._code_streaming = True
+                self._set_code_text("")
+                if name:
+                    self.code_path_var.set(f"generating: {name}")
+                self.code_status.configure(text="STATUS: GENERATING")
+            else:
+                self._code_streaming = stage != "done"
+                self._set_code_text(code)
+                if name and not self._code_path:
+                    self.code_path_var.set(f"generating: {name}")
+            self._auto_view(VIEW_CODE)
             return
 
         if kind == "skill_file":
             path = p.get("path")
             code = p.get("code") or ""
+            self._code_streaming = False
             if path:
                 self._code_path = Path(str(path))
                 self.code_path_var.set(str(self._code_path))
@@ -545,42 +580,48 @@ class JarvisGUI:
                     self._load_code_file(self._code_path, force=True)
             self._auto_view(VIEW_CODE)
             self._ws_line(
-                f"FILE {(p.get('source') or 'write')}: {path} "
-                f"v{p.get('version', '?')} ok={p.get('ok')}",
+                f"Skill file {(p.get('source') or 'write')}: "
+                f"{Path(str(path)).name if path else '?'} "
+                f"v{p.get('version', '?')}",
                 "ok" if p.get("ok") else "err",
             )
             self._refresh_files()
             return
 
         if kind == "subprocess":
+            # TERMINAL = real commands + real stdout/stderr only
             mode = str(p.get("mode") or "run")
-            cmd = str(p.get("command") or mode)
-            self._term_write(f"$ {cmd}\n", "cmd")
-            self._term_write_full(f"$ {cmd}\n", "cmd")
+            cmd = str(p.get("command") or "").strip() or mode
+            self._term_write(f"> {cmd}\n", "cmd")
+            self._term_write_full(f"> {cmd}\n", "cmd")
             out = str(p.get("stdout") or "")
             err = str(p.get("stderr") or "")
-            tb = str(p.get("traceback") or "")
             if out:
                 self._term_write(out if out.endswith("\n") else out + "\n", "out")
-                self._term_write_full(out if out.endswith("\n") else out + "\n", "out")
+                self._term_write_full(
+                    out if out.endswith("\n") else out + "\n", "out"
+                )
             if err:
                 self._term_write(err if err.endswith("\n") else err + "\n", "err")
-                self._term_write_full(err if err.endswith("\n") else err + "\n", "err")
-            if tb:
-                self._term_write(tb if tb.endswith("\n") else tb + "\n", "err")
-                self._term_write_full(tb if tb.endswith("\n") else tb + "\n", "err")
+                self._term_write_full(
+                    err if err.endswith("\n") else err + "\n", "err"
+                )
             rc = p.get("returncode")
             tag = "ok" if p.get("ok") else "err"
-            line = f"[rc={rc}] ok={p.get('ok')} timed_out={p.get('timed_out')}\n"
-            if p.get("error"):
-                line += f"error: {p.get('error')}\n"
-            self._term_write(line, tag)
-            self._term_write_full(line, tag)
+            footer = f"[rc={rc}]\n"
+            self._term_write(footer, tag)
+            self._term_write_full(footer, tag)
             self.term_status.configure(
                 text=f"{mode} rc={rc}", fg=FG_OK if p.get("ok") else FG_ERR
             )
             self._auto_view(VIEW_TERMINAL)
-            self._ws_line(f"SUBPROCESS {mode} rc={rc} ok={p.get('ok')}", tag)
+            summary = {
+                "test": "Testing...",
+                "retest": "Retesting...",
+                "execute": "Executing...",
+                "install_deps": "Installing dependencies...",
+            }.get(mode.lower(), f"Running ({mode})...")
+            self._ws_line(f"{summary} rc={rc}", tag)
             return
 
         if kind == "research":
@@ -625,22 +666,25 @@ class JarvisGUI:
                             f"  proof: {str(e.get('preview'))[:280]}\n", "dim"
                         )
                 self._auto_view(VIEW_RESEARCH)
-            self._ws_line(f"RESEARCH/{stage}", "hi")
             return
 
         if kind == "verify":
             verified = bool(p.get("verified"))
             reason = str(p.get("reason") or "")
             tag = "ok" if verified else "err"
-            msg = f"VERIFY {'PASS' if verified else 'FAIL'} — {reason}\n"
-            self._term_write(msg, tag)
-            self._term_write_full(msg, tag)
-            self._ws_line(msg.strip(), tag)
+            # VERIFY lives in WORKSPACE/CHAT actions — not TERMINAL
+            summary = action_summary_for_status(
+                "VERIFY", reason=reason, verified=verified
+            )
+            if summary and summary != self._last_action:
+                self._last_action = summary
+                self._ws_line(summary, tag)
+                self._append_action(summary, tag)
             if verified:
                 self._manual_view = False
                 self._auto_view(VIEW_CHAT)
             else:
-                self._auto_view(VIEW_TERMINAL)
+                self._auto_view(VIEW_WORKSPACE)
             return
 
     # ── Code / files (real disk) ────────────────────────────────────────
@@ -649,7 +693,9 @@ class JarvisGUI:
         self.code_view.configure(state=tk.NORMAL)
         self.code_view.delete("1.0", tk.END)
         self.code_view.insert(tk.END, code)
-        self._highlight_python()
+        # Highlight when settled; skip during high-frequency stream chunks
+        if not self._code_streaming:
+            self._highlight_python()
         self.code_view.see(tk.END)
         self.code_view.configure(state=tk.DISABLED)
 
@@ -670,8 +716,11 @@ class JarvisGUI:
             self.code_path_var.set(f"read error: {exc}")
 
     def _poll_active_file(self) -> None:
-        if self._code_path and self._active_view in (
-            VIEW_CODE, VIEW_WORKSPACE
+        # Do not clobber live Ollama stream with a stale disk read
+        if (
+            self._code_path
+            and not self._code_streaming
+            and self._active_view in (VIEW_CODE, VIEW_WORKSPACE)
         ):
             self._load_code_file(self._code_path, force=False)
         self.win.after(1200, self._poll_active_file)
@@ -758,6 +807,16 @@ class JarvisGUI:
         self.ws_summary.insert(tk.END, text.rstrip() + "\n", tag)
         self.ws_summary.see(tk.END)
         self.ws_summary.configure(state=tk.DISABLED)
+
+    def _append_action(self, text: str, tag: str = "hi") -> None:
+        """Short live action line in CHAT (same pipeline events as WORKSPACE)."""
+        chat_tag = {
+            "ok": "ok",
+            "err": "error",
+            "hi": "system",
+            "dim": "system",
+        }.get(tag, "system")
+        self._append(chat_tag, text)
 
     def _research_set(self, text: str, tag: str = "dim") -> None:
         self.research_view.configure(state=tk.NORMAL)
@@ -860,10 +919,12 @@ class JarvisGUI:
             f"[SYSTEM] FAST:{fast}  REASONING:{reason}  CODING:{coding}\n"
             + (f"[SYSTEM] {catalog}\n" if catalog else "")
             + "[SYSTEM] Views: CHAT WORKSPACE CODE TERMINAL RESEARCH FILES\n"
+            + "[SYSTEM] CODE=generated source · TERMINAL=real commands · "
+            "WORKSPACE=pipeline actions\n"
             + "[SYSTEM] Type a goal below · F11 fullscreen · Esc exit FS"
         )
         self._append("system", banner)
-        self._term_write("[terminal ready — live subprocess output]\n", "dim")
+        self._term_write("[terminal — real JARVIS subprocess output]\n", "dim")
         self._ui_status("IDLE")
         online_col = FG_OK if status == "ONLINE" else FG_ERR
         self.brain_lbl.configure(fg=online_col)
@@ -883,8 +944,23 @@ class JarvisGUI:
             self.win.after(0, _do)
 
     def _ui_log(self, msg: str) -> None:
-        tag = "system"
+        # CHAT shows short action events; only surface important log noise here
         upper = msg.upper()
+        if not any(
+            k in upper
+            for k in (
+                "FAIL",
+                "ERROR",
+                "EXCEPTION",
+                "WARN",
+                "BROKEN",
+                "DONE",
+                "RECOVERY STOP",
+                "OFFLINE",
+            )
+        ):
+            return
+        tag = "system"
         if "FAIL" in upper or "ERROR" in upper or "EXCEPTION" in upper:
             tag = "error"
         elif "WARN" in upper or "BROKEN" in upper:

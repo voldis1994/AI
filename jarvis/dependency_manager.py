@@ -10,7 +10,7 @@ import importlib
 import logging
 import subprocess
 import sys
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger("jarvis.deps")
 
@@ -33,9 +33,11 @@ class DependencyManager:
     def __init__(
         self,
         on_log: Optional[Callable[[str], None]] = None,
+        on_event: Optional[Callable[[str, dict], None]] = None,
         timeout: float = 180.0,
     ) -> None:
         self.on_log = on_log or (lambda _m: None)
+        self.on_event = on_event or (lambda _k, _p: None)
         self.timeout = timeout
         self._installed: set[str] = set()
 
@@ -60,8 +62,9 @@ class DependencyManager:
                 continue
 
             self.on_log(f"DEPS: installing {pip_name} (--user, current user)")
-            ok, msg = self._pip_install_user(pip_name)
+            ok, msg, proc_info = self._pip_install_user(pip_name)
             details.append(msg)
+            self._emit_pip(proc_info)
             if not ok:
                 failed.append(pip_name)
                 continue
@@ -77,10 +80,14 @@ class DependencyManager:
                 if self._subprocess_import_check(import_name):
                     installed.append(pip_name)
                     self._installed.add(pip_name)
-                    details.append(f"{pip_name}: re-import OK via subprocess ({import_name})")
+                    details.append(
+                        f"{pip_name}: re-import OK via subprocess ({import_name})"
+                    )
                 else:
                     failed.append(pip_name)
-                    details.append(f"{pip_name}: install reported OK but import FAILED")
+                    details.append(
+                        f"{pip_name}: install reported OK but import FAILED"
+                    )
 
         return {
             "ok": len(failed) == 0,
@@ -88,6 +95,28 @@ class DependencyManager:
             "failed": failed,
             "details": "\n".join(details),
         }
+
+    def _emit_pip(self, info: dict[str, Any]) -> None:
+        if not info:
+            return
+        try:
+            self.on_event(
+                "subprocess",
+                {
+                    "mode": "install_deps",
+                    "command": str(info.get("command") or ""),
+                    "stdout": str(info.get("stdout") or "")[:8000],
+                    "stderr": str(info.get("stderr") or "")[:8000],
+                    "traceback": "",
+                    "returncode": info.get("returncode"),
+                    "timed_out": bool(info.get("timed_out")),
+                    "ok": bool(info.get("ok")),
+                    "error": str(info.get("error") or "")[:500],
+                    "skill_path": "",
+                },
+            )
+        except Exception:
+            pass
 
     def _import_name_for(self, dep: str, pip_name: str) -> str:
         if dep in IMPORT_TO_PIP:
@@ -110,7 +139,7 @@ class DependencyManager:
                 continue
         return False
 
-    def _pip_install_user(self, package: str) -> tuple[bool, str]:
+    def _pip_install_user(self, package: str) -> tuple[bool, str, dict[str, Any]]:
         """Install with current-user rights only. No sudo / UAC bypass."""
         cmd = [sys.executable, "-m", "pip", "install", "--user", package]
         try:
@@ -120,32 +149,85 @@ class DependencyManager:
                 text=True,
                 timeout=self.timeout,
             )
+            info: dict[str, Any] = {
+                "command": " ".join(cmd),
+                "stdout": proc.stdout or "",
+                "stderr": proc.stderr or "",
+                "returncode": proc.returncode,
+                "timed_out": False,
+                "ok": proc.returncode == 0,
+                "error": "",
+            }
             if proc.returncode == 0:
-                return True, f"{package}: pip install --user OK"
+                return True, f"{package}: pip install --user OK", info
             err = (proc.stderr or proc.stdout or "")[-500:]
             # Fallback without --user if environment forbids it (e.g. venv)
-            if "not on PATH" in err or "Can not perform a '--user'" in err or proc.returncode != 0:
+            if (
+                "not on PATH" in err
+                or "Can not perform a '--user'" in err
+                or proc.returncode != 0
+            ):
+                cmd2 = [sys.executable, "-m", "pip", "install", package]
                 proc2 = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", package],
+                    cmd2,
                     capture_output=True,
                     text=True,
                     timeout=self.timeout,
                 )
+                info2: dict[str, Any] = {
+                    "command": " ".join(cmd2),
+                    "stdout": proc2.stdout or "",
+                    "stderr": proc2.stderr or "",
+                    "returncode": proc2.returncode,
+                    "timed_out": False,
+                    "ok": proc2.returncode == 0,
+                    "error": "",
+                }
                 if proc2.returncode == 0:
-                    return True, f"{package}: pip install OK (env user site)"
+                    return True, f"{package}: pip install OK (env user site)", info2
                 err2 = (proc2.stderr or proc2.stdout or "")[-500:]
-                return False, f"{package}: FAILED — {err2}"
-            return False, f"{package}: FAILED — {err}"
+                info2["error"] = err2
+                return False, f"{package}: FAILED — {err2}", info2
+            info["error"] = err
+            return False, f"{package}: FAILED — {err}", info
         except subprocess.TimeoutExpired:
-            return False, f"{package}: FAILED — timeout"
+            return (
+                False,
+                f"{package}: FAILED — timeout",
+                {
+                    "command": " ".join(cmd),
+                    "stdout": "",
+                    "stderr": "",
+                    "returncode": None,
+                    "timed_out": True,
+                    "ok": False,
+                    "error": "timeout",
+                },
+            )
         except Exception as exc:
-            return False, f"{package}: FAILED — {exc}"
+            return (
+                False,
+                f"{package}: FAILED — {exc}",
+                {
+                    "command": " ".join(cmd),
+                    "stdout": "",
+                    "stderr": "",
+                    "returncode": None,
+                    "timed_out": False,
+                    "ok": False,
+                    "error": str(exc),
+                },
+            )
 
     def _subprocess_import_check(self, name: str) -> bool:
         mod = name.replace("-", "_").split("[")[0]
         try:
             proc = subprocess.run(
-                [sys.executable, "-c", f"import importlib; importlib.import_module({mod!r})"],
+                [
+                    sys.executable,
+                    "-c",
+                    f"import importlib; importlib.import_module({mod!r})",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=30,

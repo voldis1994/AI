@@ -4,6 +4,7 @@ JARVIS skill loader — executes ACTIVE skills in an isolated subprocess.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -44,11 +45,12 @@ class SkillLoader:
             timeout=float(timeout if timeout is not None else self.timeout),
         )
         try:
+            cmd = str(skill_result.get("command") or f"{sys.executable} {path}")
             self.on_event(
                 "subprocess",
                 {
                     "mode": "execute",
-                    "command": f"python -c skill:{path.name}",
+                    "command": cmd,
                     "stdout": str(skill_result.get("stdout") or "")[:8000],
                     "stderr": str(skill_result.get("stderr") or "")[:8000],
                     "traceback": str(skill_result.get("traceback") or "")[:8000],
