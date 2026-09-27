@@ -15,11 +15,13 @@ python JARVIS.py --check       # self-check
 
 ## Cycle
 
-REQUEST → PLAN → check capabilities → research → learn → build skill →
-install deps → **test in subprocess** → repair → **independent verify** →
-save ACTIVE skill → execute → verify → save experience → **DONE**
+REQUEST → PLAN → check capabilities → research → learn →
+**BUILD → TEST → OBSERVE → DIAGNOSE → RESEARCH? → REPAIR → RETEST → VERIFY → ACTIVE**
+→ execute → verify → save experience → **DONE**
 
 DONE only after verifier PASS. Skill self-evidence is never enough.
+Failures, diagnoses, and successful solutions are stored in SQLite.
+Repeated failures force a new approach (not the same code again).
 
 ## Safety rules
 
