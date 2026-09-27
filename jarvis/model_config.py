@@ -49,20 +49,21 @@ TIER_MODELS: dict[str, dict[str, Any]] = {
 
 # Work kind → tier. Routing is by work type / complexity, never by user task text.
 WORK_KIND_TIER: dict[str, str] = {
-    # FAST — cheap / structured / simple
+    # FAST — cheap / structured / simple decisions (incl. plan skeleton)
     "intent": TIER_FAST,
     "converse": TIER_FAST,
     "extract_args": TIER_FAST,
     "query_generation": TIER_FAST,
     "structure": TIER_FAST,
-    # REASONING — planning, learning, diagnosis, semantics
-    "plan": TIER_REASONING,
+    "plan": TIER_FAST,
+    "chat": TIER_FAST,
+    # REASONING — hard diagnosis, research synthesis, semantics
     "learning": TIER_REASONING,
     "research": TIER_REASONING,
     "diagnose": TIER_REASONING,
     "semantic": TIER_REASONING,
     "verify_claim": TIER_REASONING,
-    # CODING — skill / Python generation & repair
+    # CODING — skill / Python generation & repair only
     "skill_code": TIER_CODING,
     "code_repair": TIER_CODING,
     "code_analysis": TIER_CODING,
@@ -105,6 +106,6 @@ def models_for_tier(tier: str) -> list[str]:
 
 
 def tier_for_work(work: str) -> str:
-    """Map a work kind to a tier; unknown work defaults to REASONING."""
+    """Map a work kind to a tier; unknown work defaults to FAST (not 30B)."""
     key = (work or "").strip().lower()
-    return WORK_KIND_TIER.get(key, TIER_REASONING)
+    return WORK_KIND_TIER.get(key, TIER_FAST)

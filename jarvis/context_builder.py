@@ -25,8 +25,21 @@ _STOP = {
     "containing", "contains", "named", "called", "please", "jarvis",
     "text", "content", "contents", "data", "value", "values",
     "izveido", "uzraksti", "failu", "faila", "ar", "saturu", "satur",
-    "nosaukumu", "tekstu", "teksts", "lūdzu", "ludzu",
+    "nosaukumu", "tekstu", "teksts", "lūdzu", "ludzu", "ka", "kā",
+    "par", "un", "vai", "bet", "jo", "ja", "ko", "kas", "ti", "tai",
+    "python", "code", "script", "example", "examples", "demo", "show",
 }
+
+# Verifier / content messages must NEVER be parsed as missing skill arg names.
+_CONTENT_FAIL_MARKERS = (
+    "missing from expected",
+    "content_constraint",
+    "not found in workspace",
+    "no user-derived constraints",
+    "user constraints",
+    "claim_aligns",
+    "reject_defaults",
+)
 
 
 class ContextBuilder:
@@ -72,23 +85,67 @@ class ContextBuilder:
         if isinstance(prior_args, dict):
             args.update(prior_args)
 
-        # Drop invented defaults from prior before extraction
-        args = TaskGoal.ground_args(args, request)
+        # Drop invented defaults + polluted word-keys from prior
+        args = TaskGoal.sanitize_args(args, request, skill_meta=skill_meta)
 
-        extracted = self.extract_args(
-            source_goal if source_goal == request else request,
+        # Prefer deterministic offline fill when schema keys are known —
+        # avoid an extra FAST LLM call on every repair attempt.
+        needed_preview = self._needed_keys(diagnosis, skill_meta)
+        offline_first = self._offline_extract(
+            request,
+            diagnosis={
+                **(diagnosis or {}),
+                "missing_args": [
+                    k for k in needed_preview
+                    if k not in args or args.get(k) in (None, "")
+                ],
+                "required_args": list(
+                    (diagnosis or {}).get("required_args") or needed_preview
+                ),
+            },
             skill_meta=skill_meta,
-            prior_args=args,
-            diagnosis=diagnosis,
-            user_request=request,
         )
-        if isinstance(extracted, dict):
-            for k, v in extracted.items():
-                if v is None:
-                    continue
-                if TaskGoal.is_invented_default(v, request):
-                    continue
+        for k, v in offline_first.items():
+            if v is None:
+                continue
+            if TaskGoal.is_invented_default(v, request):
+                continue
+            if not TaskGoal.is_grounded(v, request) and not isinstance(
+                v, (int, float, bool)
+            ):
+                continue
+            if TaskGoal.is_polluted_arg_key(
+                k, request, schema_keys=self._schema_keys(skill_meta)
+            ):
+                continue
+            if k not in args or args.get(k) in (None, ""):
                 args[k] = v
+
+        still_need_llm = any(
+            k not in args or args.get(k) in (None, "")
+            for k in needed_preview
+        ) if needed_preview else (not args)
+
+        if still_need_llm:
+            extracted = self.extract_args(
+                source_goal if source_goal == request else request,
+                skill_meta=skill_meta,
+                prior_args=args,
+                diagnosis=diagnosis,
+                user_request=request,
+            )
+            if isinstance(extracted, dict):
+                for k, v in extracted.items():
+                    if v is None:
+                        continue
+                    if TaskGoal.is_invented_default(v, request):
+                        continue
+                    if TaskGoal.is_polluted_arg_key(
+                        k, request, schema_keys=self._schema_keys(skill_meta)
+                    ):
+                        self.on_log(f"CONTEXT: reject polluted extract key={k!r}")
+                        continue
+                    args[k] = v
 
         if diagnosis and isinstance(diagnosis.get("suggested_args"), dict):
             for k, v in diagnosis["suggested_args"].items():
@@ -97,6 +154,13 @@ class ContextBuilder:
                 if TaskGoal.is_invented_default(v, request):
                     self.on_log(
                         f"CONTEXT: reject invented suggested_args[{k}]={v!r}"
+                    )
+                    continue
+                if TaskGoal.is_polluted_arg_key(
+                    k, request, schema_keys=self._schema_keys(skill_meta)
+                ):
+                    self.on_log(
+                        f"CONTEXT: reject polluted suggested_args key={k!r}"
                     )
                     continue
                 # Prefer grounded values already present in the request
@@ -109,45 +173,44 @@ class ContextBuilder:
                     continue
                 args[k] = v
 
-        # Offline fill for keys still missing (brain may have returned {})
-        needed = self._needed_keys(diagnosis, skill_meta)
-        still_missing = [
-            k for k in needed
-            if k not in args or args.get(k) in (None, "")
-        ]
-        if still_missing or (diagnosis and not args):
-            offline = self._offline_extract(
-                request,
-                diagnosis={
-                    **(diagnosis or {}),
-                    "missing_args": still_missing or list(
-                        (diagnosis or {}).get("missing_args") or []
-                    ),
-                    "required_args": list(
-                        (diagnosis or {}).get("required_args") or needed
-                    ),
-                },
-            )
-            for k, v in offline.items():
-                if k not in args or args.get(k) in (None, ""):
-                    if TaskGoal.is_invented_default(v, request):
-                        continue
-                    if not TaskGoal.is_grounded(v, request) and not isinstance(
-                        v, (int, float, bool)
-                    ):
-                        continue
-                    args[k] = v
-
         if isinstance(extra_args, dict):
             for k, v in extra_args.items():
                 if v is None:
                     continue
                 if TaskGoal.is_invented_default(v, request):
                     continue
+                if TaskGoal.is_polluted_arg_key(
+                    k, request, schema_keys=self._schema_keys(skill_meta)
+                ):
+                    continue
                 args[k] = v
 
-        # Final grounding pass — never pass invented defaults to the skill
-        args = TaskGoal.ground_args(args, request)
+        # Final grounding + pollution filter — never pass word-args to the skill
+        args = TaskGoal.sanitize_args(args, request, skill_meta=skill_meta)
+        # Soft cap — dozens of keys are always a mapping bug, not a real schema
+        if len(args) > 12:
+            schema = self._schema_keys(skill_meta)
+            kept = {k: v for k, v in args.items() if k in schema} if schema else {}
+            if not kept:
+                # Keep path/url-shaped values first, then content-shaped
+                items = list(args.items())
+                pathish = [
+                    (k, v) for k, v in items
+                    if TaskGoal.looks_like_path(str(v)) or TaskGoal.looks_like_url(str(v))
+                ]
+                contentish = [
+                    (k, v) for k, v in items
+                    if TaskGoal.looks_like_content(str(v))
+                ]
+                ordered = pathish + contentish + [
+                    (k, v) for k, v in items
+                    if (k, v) not in pathish and (k, v) not in contentish
+                ]
+                kept = dict(ordered[:8])
+            self.on_log(
+                f"CONTEXT: capped args {len(args)} → {len(kept)} keys"
+            )
+            args = kept
 
         context = {
             "goal": source_goal,
@@ -181,35 +244,63 @@ class ContextBuilder:
                     diagnosis=diagnosis,
                 )
                 if isinstance(result, dict) and result:
-                    return TaskGoal.ground_args(result, request)
+                    return TaskGoal.sanitize_args(
+                        result, request, skill_meta=skill_meta
+                    )
             except Exception as exc:
                 self.on_log(f"CONTEXT: brain extract failed ({exc}); offline fallback")
-        return TaskGoal.ground_args(
-            self._offline_extract(request, diagnosis=diagnosis),
+        return TaskGoal.sanitize_args(
+            self._offline_extract(
+                request, diagnosis=diagnosis, skill_meta=skill_meta
+            ),
             request,
+            skill_meta=skill_meta,
         )
 
     @staticmethod
+    def _schema_keys(skill_meta: Optional[dict]) -> set[str]:
+        keys: set[str] = set()
+        if not isinstance(skill_meta, dict):
+            return keys
+        req = skill_meta.get("required_args")
+        if isinstance(req, list):
+            keys.update(str(x) for x in req if x)
+        for field in ("input_schema", "args_schema"):
+            sch = skill_meta.get(field)
+            if isinstance(sch, dict):
+                keys.update(str(x) for x in sch.keys())
+            elif isinstance(sch, list):
+                keys.update(str(x) for x in sch if x)
+        return keys
+
+    @classmethod
     def _needed_keys(
-        diagnosis: Optional[dict], skill_meta: Optional[dict]
+        cls, diagnosis: Optional[dict], skill_meta: Optional[dict]
     ) -> list[str]:
         needed: list[str] = []
+        schema = cls._schema_keys(skill_meta)
         if diagnosis:
             for key in ("required_args", "missing_args"):
                 val = diagnosis.get(key)
                 if isinstance(val, list):
-                    needed.extend(str(x) for x in val)
+                    for x in val:
+                        sx = str(x)
+                        # Never treat content-needles as required arg names
+                        if schema and sx not in schema:
+                            # Allow non-schema keys only if they look like identifiers
+                            # and were not harvested from verifier content errors
+                            if not re.match(r"^[A-Za-z_][\w]*$", sx):
+                                continue
+                        needed.append(sx)
             suggested = diagnosis.get("suggested_args")
             if isinstance(suggested, dict):
                 for k in suggested:
                     if k not in needed:
                         needed.append(str(k))
         if skill_meta:
-            req = skill_meta.get("required_args")
-            if isinstance(req, list):
-                for k in req:
-                    if str(k) not in needed:
-                        needed.append(str(k))
+            for k in cls._schema_keys(skill_meta):
+                if k not in needed:
+                    needed.append(k)
         # preserve order, drop empties
         out: list[str] = []
         for k in needed:
@@ -227,9 +318,32 @@ class ContextBuilder:
           missing required arguments: ['target', 'payload']
           KeyError: 'url'
           required arg foo not provided
+
+        NEVER parses verifier content_constraint / "missing from expected files"
+        messages — those quote content needles, not arg names.
         """
         if not error:
             return []
+        low = error.lower()
+        if any(m in low for m in _CONTENT_FAIL_MARKERS):
+            return []
+        # Require a true argument-missing signal (not bare "missing" from content)
+        arg_signal = any(
+            tok in low
+            for tok in (
+                "required argument",
+                "required arguments",
+                "missing required",
+                "missing arg",
+                "keyerror",
+                "key error",
+                "not provided",
+                "when invoked",
+            )
+        )
+        if not arg_signal and "argument" not in low and "args" not in low:
+            return []
+
         names: list[str] = []
 
         # list / tuple literals in the message
@@ -238,12 +352,7 @@ class ContextBuilder:
             for part in re.findall(r"['\"]([A-Za-z_][\w]*)['\"]", inner):
                 names.append(part)
 
-        # quoted names near missing/required/argument/key
-        low = error.lower()
-        if any(
-            tok in low
-            for tok in ("missing", "required", "argument", "args", "keyerror", "key error")
-        ):
+        if arg_signal or "argument" in low or "args" in low or "keyerror" in low:
             for part in re.findall(r"['\"]([A-Za-z_][\w]*)['\"]", error):
                 names.append(part)
 
@@ -253,7 +362,7 @@ class ContextBuilder:
 
         out: list[str] = []
         for n in names:
-            if n not in out:
+            if n and n not in out and n.lower() not in _STOP:
                 out.append(n)
         return out
 
@@ -301,11 +410,30 @@ class ContextBuilder:
         for val in quoted:
             if val not in values:
                 values.append(val)
-        # 4) other significant tokens
-        for tok in re.findall(r"[A-Za-z0-9_./\\-]{2,}", goal):
+        # 4) Content after cue words (single payload — not every sentence word)
+        for m in re.finditer(
+            r"(?i)(?:containing|contains|with\s+text|text|content|"
+            r"tekstu|saturu|ar\s+tekstu)\s+[\"']?"
+            r"([A-Za-z0-9_./\\-]{2,})",
+            goal,
+        ):
+            tok = m.group(1)
             if tok.lower() in _STOP or tok in values:
                 continue
+            if path_like.match(tok):
+                continue
             values.append(tok)
+        # 5) At most one leftover significant token (≥3) when a path exists
+        if any(path_like.match(v) for v in values):
+            leftovers = []
+            for tok in re.findall(r"[A-Za-z0-9_./\\-]{3,}", goal):
+                if tok.lower() in _STOP or tok in values:
+                    continue
+                if path_like.match(tok):
+                    continue
+                leftovers.append(tok)
+            if len(leftovers) == 1:
+                values.append(leftovers[0])
 
         return values
 
@@ -314,6 +442,7 @@ class ContextBuilder:
         cls,
         goal: str,
         diagnosis: Optional[dict] = None,
+        skill_meta: Optional[dict] = None,
     ) -> dict[str, Any]:
         """
         Generic offline extractor — no task-specific hardcoding.
@@ -322,9 +451,10 @@ class ContextBuilder:
           - JSON object embedded in the goal
           - key=value / key: value pairs (any keys)
           - diagnosis.suggested_args / required_args / missing_args
-            filled from ordered goal value candidates
+            filled from ordered goal value candidates (path/quoted only)
         """
         args: dict[str, Any] = {}
+        schema = cls._schema_keys(skill_meta)
 
         # Embedded JSON object
         m = re.search(r"\{[^{}]+\}", goal)
@@ -349,14 +479,17 @@ class ContextBuilder:
                 raw = raw[1:-1]
             args[key] = raw
 
-        needed = cls._needed_keys(diagnosis, None)
+        needed = [
+            k for k in cls._needed_keys(diagnosis, skill_meta)
+            if not TaskGoal.is_polluted_arg_key(k, goal, schema_keys=schema)
+        ]
         if needed:
             candidates = cls.goal_value_candidates(goal)
             for key, val in zip(needed, candidates):
                 if key not in args or args.get(key) in (None, ""):
                     args[key] = val
 
-        return args
+        return TaskGoal.sanitize_args(args, goal, skill_meta=skill_meta)
 
     @staticmethod
     def merge_args(*parts: Optional[dict]) -> dict[str, Any]:
@@ -398,18 +531,56 @@ class ContextBuilder:
         if not isinstance(ctx_args, dict):
             ctx_args = {}
 
-        parsed = cls.parse_missing_arg_names(err)
-        missing = list(diagnosis.get("missing_args") or [])
+        err_l = err.lower()
+        content_fail = any(m in err_l for m in _CONTENT_FAIL_MARKERS)
+        parsed = [] if content_fail else cls.parse_missing_arg_names(err)
+        # Drop polluted keys already present on the diagnosis (content needles)
+        schema = cls._schema_keys(
+            (observation.get("context") or {}).get("skill_meta")
+            if isinstance(observation.get("context"), dict)
+            else None
+        )
+        missing = [
+            str(n)
+            for n in (diagnosis.get("missing_args") or [])
+            if n
+            and not TaskGoal.is_polluted_arg_key(
+                str(n), request, schema_keys=schema
+            )
+        ]
         for name in parsed:
-            if name not in missing:
+            if name not in missing and not TaskGoal.is_polluted_arg_key(
+                name, request, schema_keys=schema
+            ):
                 missing.append(name)
-        if missing:
+        if content_fail:
+            # Content/constraint failures are NOT missing-arg problems
+            missing = []
+            diagnosis["missing_args"] = []
+            # Keep required_args only if they look like schema keys
+            req_keep = [
+                str(n)
+                for n in (diagnosis.get("required_args") or [])
+                if n
+                and not TaskGoal.is_polluted_arg_key(
+                    str(n), request, schema_keys=schema
+                )
+            ]
+            diagnosis["required_args"] = req_keep
+        elif missing:
             diagnosis["missing_args"] = missing
             req = list(diagnosis.get("required_args") or [])
             for name in missing:
                 if name not in req:
                     req.append(name)
-            diagnosis["required_args"] = req
+            diagnosis["required_args"] = [
+                str(n)
+                for n in req
+                if n
+                and not TaskGoal.is_polluted_arg_key(
+                    str(n), request, schema_keys=schema
+                )
+            ]
 
         invented_in_args = [
             f"{k}={v!r}"
@@ -422,11 +593,14 @@ class ContextBuilder:
                 and not isinstance(v, (int, float, bool))
             )
         ]
+        polluted_keys = [
+            k for k in ctx_args.keys()
+            if TaskGoal.is_polluted_arg_key(str(k), request, schema_keys=schema)
+        ]
         # Ungrounded string args are mapping faults — drop them from suggestions
         empty_or_partial = (not ctx_args) or bool(missing and any(
             m not in ctx_args or ctx_args.get(m) in (None, "") for m in missing
-        )) or bool(invented_in_args)
-        err_l = err.lower()
+        )) or bool(invented_in_args) or bool(polluted_keys)
         phase = str(observation.get("phase") or "").upper()
 
         # Skill used defaults / wrong artifacts while args were grounded → skill_code
@@ -434,7 +608,7 @@ class ContextBuilder:
             tok in err_l
             for tok in (
                 "default", "placeholder", "untrusted", "reject_defaults",
-                "claim_aligns",
+                "claim_aligns", "missing from expected", "content_constraint",
             )
         ) and not invented_in_args
 
@@ -444,15 +618,15 @@ class ContextBuilder:
             or "user constraints" in err_l and "refusing" in err_l
         )
 
-        args_signal = bool(parsed) or bool(invented_in_args) or (
-            any(
-                tok in err_l
-                for tok in ("argument", "args", "required", "keyerror")
-            )
-            or (
-                "missing" in err_l
-                and "missing from expected" not in err_l
-                and "user constraints" not in err_l
+        args_signal = (not content_fail) and (
+            bool(parsed) or bool(invented_in_args) or bool(polluted_keys) or (
+                any(
+                    tok in err_l
+                    for tok in (
+                        "required argument", "missing required", "keyerror",
+                        "when invoked",
+                    )
+                )
             )
         )
 
@@ -511,22 +685,31 @@ class ContextBuilder:
             diagnosis["rewrite_skill"] = False
 
         suggested = dict(diagnosis.get("suggested_args") or {})
-        # Strip invented / ungrounded suggestions
+        # Strip invented / ungrounded / polluted suggestions
         suggested = {
             k: v for k, v in suggested.items()
             if v not in (None, "")
             and not TaskGoal.is_invented_default(v, request)
+            and not TaskGoal.is_polluted_arg_key(str(k), request, schema_keys=schema)
             and (
                 TaskGoal.is_grounded(v, request)
                 or isinstance(v, (int, float, bool))
             )
         }
-        if diagnosis.get("fault_layer") in (
-            "context_mapping", "goal_parsing", "context_args"
-        ) or missing:
+        # Only rebuild suggestions for true context/goal mapping faults —
+        # never when VERIFY content_constraint failed (that is skill_code).
+        if (
+            diagnosis.get("fault_layer") in (
+                "context_mapping", "goal_parsing", "context_args"
+            )
+            and missing
+            and not content_fail
+        ):
             filled = cls._offline_extract(request, diagnosis=diagnosis)
             for k, v in filled.items():
                 if TaskGoal.is_invented_default(v, request):
+                    continue
+                if TaskGoal.is_polluted_arg_key(str(k), request, schema_keys=schema):
                     continue
                 if not TaskGoal.is_grounded(v, request) and not isinstance(
                     v, (int, float, bool)
@@ -534,17 +717,21 @@ class ContextBuilder:
                     continue
                 if k not in suggested or suggested.get(k) in (None, ""):
                     suggested[k] = v
-            # Prefer grounded values already present in context
+            # Prefer grounded non-polluted values already present in context
             for k, v in ctx_args.items():
                 if v in (None, ""):
                     continue
                 if TaskGoal.is_invented_default(v, request):
                     continue
+                if TaskGoal.is_polluted_arg_key(str(k), request, schema_keys=schema):
+                    continue
                 if not TaskGoal.is_grounded(v, request) and not isinstance(
                     v, (int, float, bool)
                 ):
                     continue
                 if k not in suggested or suggested.get(k) in (None, ""):
                     suggested[k] = v
-        diagnosis["suggested_args"] = TaskGoal.ground_args(suggested, request)
+        diagnosis["suggested_args"] = TaskGoal.sanitize_args(
+            suggested, request
+        )
         return diagnosis

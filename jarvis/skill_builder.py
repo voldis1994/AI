@@ -8,6 +8,7 @@ to produce code, synthesize a universal skill from research/diagnosis/args.
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import re
 from pathlib import Path
@@ -49,11 +50,20 @@ class SkillBuilder:
         diagnosis: Optional[dict[str, Any]] = None,
         failed_approaches: Optional[list] = None,
         test_plan: Optional[str] = None,
+        *,
+        user_request: Optional[str] = None,
+        task_goal: Optional[dict[str, Any]] = None,
+        grounded_args: Optional[dict[str, Any]] = None,
+        artifacts: Optional[list] = None,
+        missing_requirements: Optional[list] = None,
+        constraints: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
         Build a skill from research + optional diagnosis.
 
         Universal — no task-specific hardcoding. Never accepts an unimplemented stub.
+        On repair, CODING always receives USER REQUEST / TaskGoal / args / artifacts /
+        verifier errors / failed approaches (never an identical blind rewrite).
         """
         name = self._safe_name(skill_name)
         self.on_log(f"BUILD: generating skill '{name}' v{version}")
@@ -71,16 +81,25 @@ class SkillBuilder:
 
         code = ""
         source = "none"
+        write_kwargs = dict(
+            skill_name=name,
+            description=description,
+            research=research_for_brain,
+            previous_code=previous_code,
+            error_log=error_log,
+            diagnosis=diagnosis,
+            failed_approaches=failed_approaches,
+            test_plan=test_plan or (diagnosis or {}).get("test_plan"),
+            user_request=user_request,
+            task_goal=task_goal,
+            grounded_args=grounded_args,
+            artifacts=artifacts,
+            missing_requirements=missing_requirements,
+            constraints=constraints,
+        )
         if self.brain is not None:
             code = self.brain.write_skill_code(
-                skill_name=name,
-                description=description,
-                research=research_for_brain,
-                previous_code=previous_code,
-                error_log=error_log,
-                diagnosis=diagnosis,
-                failed_approaches=failed_approaches,
-                test_plan=test_plan or (diagnosis or {}).get("test_plan"),
+                **self._filter_write_kwargs(self.brain.write_skill_code, write_kwargs)
             )
             source = "brain"
 
@@ -121,15 +140,11 @@ class SkillBuilder:
             self.on_log("BUILD: syntax error — attempting repair / resynthesis")
             code2 = ""
             if self.brain is not None:
+                retry_kw = dict(write_kwargs)
+                retry_kw["previous_code"] = code
+                retry_kw["error_log"] = f"SyntaxError: {err}"
                 code2 = self.brain.write_skill_code(
-                    skill_name=name,
-                    description=description,
-                    research=research_for_brain,
-                    previous_code=code,
-                    error_log=f"SyntaxError: {err}",
-                    diagnosis=diagnosis,
-                    failed_approaches=failed_approaches,
-                    test_plan=test_plan,
+                    **self._filter_write_kwargs(self.brain.write_skill_code, retry_kw)
                 )
                 code2 = self._ensure_meta(code2, name, description, research, version)
             if self.is_unimplemented_stub(code2) or "def run" not in (code2 or ""):
@@ -185,6 +200,21 @@ class SkillBuilder:
         }
 
     # ── Stub detection / knowledge synthesis ────────────────────────────
+
+    @staticmethod
+    def _filter_write_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Pass only parameters accepted by write_skill_code (test doubles vary)."""
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return dict(kwargs)
+        if any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        ):
+            return dict(kwargs)
+        allowed = set(sig.parameters.keys())
+        return {k: v for k, v in kwargs.items() if k in allowed}
 
     @staticmethod
     def is_unimplemented_stub(code: Optional[str]) -> bool:

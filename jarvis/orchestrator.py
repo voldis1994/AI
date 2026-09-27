@@ -40,6 +40,7 @@ from jarvis.knowledge_artifact import (
 )
 from jarvis.recovery import ProgressAwareRecovery
 from jarvis.calibration import AutoCalibration
+from jarvis.perf import PerfTracker, set_active_tracker
 
 logger = logging.getLogger("jarvis.orchestrator")
 
@@ -122,6 +123,9 @@ class Orchestrator:
         self.contexts = ContextBuilder(brain=self.brain, on_log=self._log)
         # Ephemeral: last repair VERIFY PASS proof (skip duplicate execute+verify)
         self._activation_proof: Optional[dict[str, Any]] = None
+        # Per-request reuse cache + performance telemetry
+        self._request_cache: dict[str, Any] = {}
+        self.perf = PerfTracker()
         self._log(
             f"CALIBRATE: loaded params success_rate="
             f"{self.calibration.window_success_rate():.2f} "
@@ -150,6 +154,9 @@ class Orchestrator:
 
         # Per-request state — do not read/write cross-request result caches
         self._active_request_id = request_id
+        self._request_cache = {}
+        self.perf = PerfTracker(request_id)
+        set_active_tracker(self.perf)
         self.memory.add_message(
             "user", text, meta={"request_id": request_id, "phase": "received"}
         )
@@ -384,6 +391,21 @@ class Orchestrator:
         }
         if extra and extra.get("task_id") is not None:
             meta["task_id"] = extra.get("task_id")
+        # Emit performance telemetry for this request
+        try:
+            for line in self.perf.summary_lines():
+                self._log(line)
+        except Exception:
+            pass
+        perf_data = {}
+        try:
+            perf_data = self.perf.as_dict()
+        except Exception:
+            perf_data = {}
+        meta["perf"] = {
+            "total_ms": perf_data.get("total_ms"),
+            "model_call_count": perf_data.get("model_call_count"),
+        }
         self.memory.add_message("assistant", reply, meta=meta)
         if success is False:
             self._status("ERROR")
@@ -397,6 +419,7 @@ class Orchestrator:
             "reply": reply,
             "request_id": request_id,
             "intent": intent or {"intent": intent_name, "goal": user_text},
+            "perf": perf_data,
         }
         if success is not None:
             out["success"] = success
@@ -405,6 +428,8 @@ class Orchestrator:
         # Clear active id only if we still own the turn
         if getattr(self, "_active_request_id", None) == request_id:
             self._active_request_id = None
+            set_active_tracker(None)
+            self._request_cache = {}
         return out
 
     def run_learning_cycle(
@@ -1469,28 +1494,97 @@ class Orchestrator:
         )
 
         try:
-            # PLAN
+            # MEMORY first — reuse verified knowledge before PLAN/RESEARCH
+            self.perf.begin("MEMORY")
+            self._status("MEMORY")
+            mem_pack = (
+                self.memory.retrieve_relevant_knowledge(
+                    task_goal.user_request, limit=6
+                )
+                if hasattr(self.memory, "retrieve_relevant_knowledge")
+                else {"entries": [], "verified": []}
+            )
+            mem_hits = list(
+                (mem_pack or {}).get("entries")
+                or (mem_pack or {}).get("verified")
+                or []
+            )
+            self._request_cache["memory_hits"] = mem_pack
+            if mem_hits:
+                self._log(
+                    f"[{task_id}] MEMORY: {len(mem_hits)} relevant knowledge hit(s) "
+                    f"— prefer reuse before research"
+                )
+            self.perf.end("MEMORY", hits=len(mem_hits))
+
+            # PLAN (FAST / offline — never burn REASONING for skeleton)
+            self.perf.begin("PLAN")
             self._status("PLAN")
             caps = self.registry.active_capabilities()
-            if self.brain.is_available():
-                plan = self.brain.plan(goal, caps)
+            cache_key = f"plan:{task_goal.user_request}"
+            if cache_key in self._request_cache:
+                plan = dict(self._request_cache[cache_key])
+                self._log(f"[{task_id}] PLAN: cache hit (reuse within request)")
             else:
+                # Deterministic baseline first; optionally refine with FAST
                 plan = self._offline_plan(goal, caps)
+                if self.brain.is_available() and not plan.get("can_reuse"):
+                    try:
+                        llm_plan = self.brain.plan(goal, caps)
+                        if isinstance(llm_plan, dict) and llm_plan.get("steps"):
+                            # Merge — keep offline grounded args if LLM invented word-keys
+                            offline_args = TaskGoal.sanitize_args(
+                                dict(plan.get("args") or {}),
+                                task_goal.user_request,
+                            )
+                            llm_args = TaskGoal.sanitize_args(
+                                dict(llm_plan.get("args") or {}),
+                                task_goal.user_request,
+                            )
+                            merged = dict(plan)
+                            merged.update({
+                                k: v for k, v in llm_plan.items()
+                                if k not in ("args", "required_args")
+                            })
+                            merged["args"] = {**offline_args, **llm_args}
+                            merged["required_args"] = list(
+                                dict.fromkeys(
+                                    list(merged["args"].keys())
+                                    + list(llm_plan.get("required_args") or [])
+                                    + list(plan.get("required_args") or [])
+                                )
+                            )
+                            # Drop polluted required_args that are request tokens
+                            merged["required_args"] = [
+                                k for k in merged["required_args"]
+                                if not TaskGoal.is_polluted_arg_key(
+                                    k, task_goal.user_request
+                                )
+                            ]
+                            plan = merged
+                    except Exception as exc:
+                        self._log(f"[{task_id}] PLAN: FAST refine failed ({exc})")
+                self._request_cache[cache_key] = dict(plan)
             self.ledger.log(task_id, "PLAN", "Plan created", plan)
             self._log(f"[{task_id}] PLAN: {plan.get('steps')}")
+            self.perf.end("PLAN")
 
             # CONTEXT: map TaskGoal → skill input schema (no invented defaults)
+            self.perf.begin("CONTEXT")
             task_args = {}
             if isinstance(plan.get("args"), dict):
                 task_args.update(plan["args"])
+            # Filter polluted required_args before diagnosis fill
+            req_args = [
+                k for k in (plan.get("required_args") or [])
+                if not TaskGoal.is_polluted_arg_key(str(k), task_goal.user_request)
+            ]
             ctx0 = self.contexts.build(
                 goal,
                 str(self.workspace),
                 mode="plan",
                 prior_args=task_args,
-                diagnosis={
-                    "required_args": plan.get("required_args") or [],
-                },
+                diagnosis={"required_args": req_args},
                 user_request=task_goal.user_request,
                 task_goal=task_goal,
             )
@@ -1500,8 +1594,16 @@ class Orchestrator:
                 task_id,
                 "CONTEXT",
                 f"Mapped TaskGoal → args keys={list(task_args.keys())}",
-                {"args": task_args, "constraints": task_goal.constraints},
+                {
+                    "args": task_args,
+                    "constraints": task_goal.constraints,
+                    "actions": list(task_goal.actions),
+                    "artifacts": list(task_goal.artifacts),
+                    "content_requirements": list(task_goal.content_requirements),
+                    "success_criteria": list(task_goal.success_criteria),
+                },
             )
+            self.perf.end("CONTEXT", arg_count=len(task_args))
 
             # CHECK CAPABILITIES — only skills that fit THIS request
             self._status("CHECK_CAPABILITIES")
@@ -1868,9 +1970,11 @@ class Orchestrator:
         )
         description = plan.get("skill_description") or goal
         version = self.registry.next_version(skill_name)
-        args: dict = TaskGoal.ground_args(dict(task_args or {}), task_goal.user_request)
+        args: dict = TaskGoal.sanitize_args(
+            dict(task_args or {}), task_goal.user_request
+        )
         if isinstance(plan.get("args"), dict):
-            args = TaskGoal.ground_args(
+            args = TaskGoal.sanitize_args(
                 ContextBuilder.merge_args(plan.get("args"), args),
                 task_goal.user_request,
             )
@@ -2032,24 +2136,56 @@ class Orchestrator:
             phase_test = "RETEST" if is_retest else "TEST"
 
             # Refresh args each attempt — always grounded to original TaskGoal
+            skill_meta_ctx = {
+                "name": skill_name,
+                "description": description,
+                **(meta or {}),
+            }
             args = self.contexts.build(
                 goal,
                 str(self.workspace),
                 mode="test",
-                skill_meta={"name": skill_name, "description": description, **meta},
+                skill_meta=skill_meta_ctx,
                 prior_args=args,
                 diagnosis=diagnosis,
                 user_request=task_goal.user_request,
                 task_goal=task_goal,
             ).get("args") or args
-            task_goal = task_goal.with_args(args)
+            task_goal = task_goal.with_args(args, skill_meta=skill_meta_ctx)
 
             # ── BUILD / REPAIR (skip unless fault_layer == skill_code) ───
             if not skip_rebuild or built is None or not built.get("ok"):
                 self._status(phase_build)
+                self.perf.begin(phase_build)
+                missing_reqs = self._missing_requirements_from_diagnosis(
+                    diagnosis, task_goal
+                )
+                artifacts_now = self._list_workspace_artifacts()
+                # Avoid identical CODING approach when calibration says avoid
+                if diagnosis and self.calibration.should_avoid_approach(
+                    Observer.fingerprint_approach(
+                        str(diagnosis.get("approach") or current_approach)
+                    )
+                ):
+                    alt = self.calibration.pick_best_approach(
+                        [
+                            f"honor_user_request::v{attempt_version}",
+                            f"offline_alt_v{attempt_version}",
+                            f"constraint_focus::v{attempt_version}",
+                        ],
+                        domain="repair",
+                    )
+                    diagnosis = dict(diagnosis)
+                    diagnosis["approach"] = alt
+                    diagnosis["approach_changed"] = True
+                    current_approach = alt
+                    self._log(
+                        f"[{task_id}] CALIBRATE: avoid prior approach — "
+                        f"switch to {alt!r}"
+                    )
                 built = self.builder.build(
                     skill_name=skill_name,
-                    description=description,
+                    description=description or task_goal.user_request,
                     research=research,
                     version=attempt_version,
                     previous_code=last_code,
@@ -2058,7 +2194,14 @@ class Orchestrator:
                     diagnosis=diagnosis if (diagnosis or {}).get("rewrite_skill", True) else None,
                     failed_approaches=failed_approaches,
                     test_plan=(diagnosis or {}).get("test_plan") if diagnosis else None,
+                    user_request=task_goal.user_request,
+                    task_goal=task_goal.to_dict(),
+                    grounded_args=args,
+                    artifacts=artifacts_now,
+                    missing_requirements=missing_reqs,
+                    constraints=task_goal.with_args(args).constraints,
                 )
+                self.perf.end(phase_build)
                 self.ledger.log(
                     task_id,
                     phase_build,
@@ -2529,11 +2672,14 @@ class Orchestrator:
             )
             diagnosis["approach_changed"] = True
 
-        # Rebuild args when fault is context_mapping / goal_parsing (or suggestions)
-        new_args = TaskGoal.ground_args(dict(task_args or {}), task_goal.user_request)
+        # Rebuild args ONLY for true context/goal mapping faults — never for
+        # VERIFY content_constraint failures (those must go to CODING repair).
+        new_args = TaskGoal.sanitize_args(
+            dict(task_args or {}), task_goal.user_request
+        )
         if diagnosis.get("fault_layer") in (
             "context_mapping", "goal_parsing", "context_args"
-        ) or diagnosis.get("suggested_args"):
+        ):
             new_args = self.contexts.build(
                 goal,
                 str(self.workspace),
@@ -2547,6 +2693,9 @@ class Orchestrator:
                 f"[{task_id}] CONTEXT repair: args_keys={list(new_args.keys())} "
                 f"suggested={list((diagnosis.get('suggested_args') or {}).keys())}"
             )
+        else:
+            # Still drop any polluted word-keys that leaked in
+            new_args = TaskGoal.sanitize_args(new_args, task_goal.user_request)
 
         # Similarity vs prior failures (current observation already persisted)
         prior_obs = [
@@ -2801,7 +2950,11 @@ class Orchestrator:
         research["adaptive_research"] = diagnosis.get("adaptive_research")
         research["failure_signature"] = fail_sig
 
+        missing_reqs = self._missing_requirements_from_diagnosis(
+            diagnosis, task_goal
+        )
         last_error = (
+            f"USER REQUEST: {task_goal.user_request}\n"
             f"ROOT CAUSE: {diagnosis.get('root_cause')}\n"
             f"FAULT_LAYER: {diagnosis.get('fault_layer')}\n"
             f"FAILURE_SIGNATURE: {fail_sig}\n"
@@ -2810,12 +2963,15 @@ class Orchestrator:
             f"MODEL_USED: {model_used}\n"
             f"RESEARCHED: {did_research}\n"
             f"RESEARCH_INSIGHT: {research.get('repair_insight') or ''}\n"
-            f"ARGS: {json.dumps(new_args, default=str)[:500]}\n"
+            f"TASK_GOAL: {json.dumps(task_goal.to_dict(), default=str)[:1200]}\n"
+            f"GROUNDED_ARGS: {json.dumps(new_args, default=str)[:500]}\n"
+            f"MISSING_REQUIREMENTS: {json.dumps(missing_reqs, default=str)[:500]}\n"
+            f"ARTIFACTS: {json.dumps(observation.get('artifacts') or [], default=str)[:500]}\n"
             f"EXCEPTION: {observation.get('exception')}\n"
             f"STDERR: {(observation.get('stderr') or '')[:800]}\n"
             f"STDOUT: {(observation.get('stdout') or '')[:400]}\n"
             f"TRACEBACK: {(observation.get('traceback') or '')[:800]}\n"
-            f"VERIFIER: {json.dumps(observation.get('verifier_result'), default=str)[:600]}"
+            f"VERIFIER: {json.dumps(observation.get('verifier_result'), default=str)[:800]}"
         )
         self._status("REPAIR")
         self.ledger.log(
@@ -3040,14 +3196,34 @@ class Orchestrator:
         err = str(observation.get("exception") or "")
         err_l = err.lower()
         phase = str(observation.get("phase") or "").upper()
-        parsed_missing = ContextBuilder.parse_missing_arg_names(err)
-        args_fault = (
-            empty_args or bool(parsed_missing) or invented
-        ) and any(
+        content_fail = any(
             t in err_l
             for t in (
-                "argument", "args", "missing", "required", "keyerror",
-                "default", "untrusted", "claim_aligns", "user_provided",
+                "missing from expected",
+                "content_constraint",
+                "not found in workspace",
+                "no user-derived constraints",
+                "claim_aligns",
+                "reject_defaults",
+            )
+        )
+        parsed_missing = (
+            [] if content_fail else ContextBuilder.parse_missing_arg_names(err)
+        )
+        # Never promote request tokens / content needles to missing_args
+        parsed_missing = [
+            n for n in parsed_missing
+            if not TaskGoal.is_polluted_arg_key(n, task_goal.user_request)
+        ]
+        args_fault = (
+            (empty_args or bool(parsed_missing) or invented)
+            and not content_fail
+            and any(
+                t in err_l
+                for t in (
+                    "required argument", "missing required", "keyerror",
+                    "when invoked", "argument",
+                )
             )
         )
         goal_mismatch = phase == "VERIFY" and any(
@@ -3056,8 +3232,9 @@ class Orchestrator:
                 "default", "placeholder", "untrusted", "claim_aligns",
                 "not in user", "user constraints", "user request",
                 "reject_defaults", "missing from expected",
+                "content_constraint",
             )
-        ) and not invented and not empty_args
+        ) and not invented
         no_constraints = phase == "VERIFY" and "no user-derived constraints" in err_l
         env_fault = any(
             t in err_l for t in ("modulenotfound", "no module named", "importerror")
@@ -3077,12 +3254,12 @@ class Orchestrator:
             layer = "environment"
             approach = "fix_environment"
             change = "Install / fix missing dependencies"
-        elif goal_mismatch:
+        elif goal_mismatch or content_fail:
             layer = "skill_code"
             approach = "honor_user_request"
             change = (
                 "Rewrite skill to satisfy original TaskGoal "
-                "(no default/placeholder artifacts)"
+                "(no default/placeholder artifacts; honor content requirements)"
             )
         else:
             layer = "skill_code"
@@ -3108,7 +3285,7 @@ class Orchestrator:
                 "subprocess retest with grounded args; "
                 "VERIFY against original TaskGoal (reject defaults)"
             ),
-            "expected_artifacts": [],
+            "expected_artifacts": list(task_goal.artifacts),
             "is_unfixable": False,
             "diagnosis": str(observation.get("exception") or "failure")[:500],
         }
@@ -3253,7 +3430,9 @@ class Orchestrator:
             if self._skill_fits_goal(m, goal)
         ]
         # Universal offline arg draft — no task-specific key hardcoding
-        draft_args = ContextBuilder._offline_extract(goal)
+        draft_args = TaskGoal.sanitize_args(
+            ContextBuilder._offline_extract(goal), goal
+        )
         return {
             "steps": [f"Handle: {goal}"],
             "can_reuse": [m["name"] for m in matched[:3]],
@@ -3266,6 +3445,56 @@ class Orchestrator:
             "args": draft_args,
             "required_args": list(draft_args.keys()),
         }
+
+    def _list_workspace_artifacts(self, limit: int = 40) -> list[dict[str, Any]]:
+        """Snapshot existing workspace files for CODING repair context."""
+        out: list[dict[str, Any]] = []
+        try:
+            root = self.workspace
+            if not root.exists():
+                return out
+            for p in sorted(root.rglob("*")):
+                if not p.is_file():
+                    continue
+                try:
+                    rel = str(p.relative_to(root))
+                except Exception:
+                    rel = str(p)
+                try:
+                    size = p.stat().st_size
+                except Exception:
+                    size = -1
+                out.append({"path": rel, "bytes": size})
+                if len(out) >= limit:
+                    break
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _missing_requirements_from_diagnosis(
+        diagnosis: Optional[dict],
+        task_goal: TaskGoal,
+    ) -> list[str]:
+        """Human-readable missing requirements for CODING (not word-arg keys)."""
+        out: list[str] = []
+        for a in task_goal.artifacts:
+            out.append(f"artifact:{a}")
+        for c in task_goal.content_requirements:
+            out.append(f"content:{c}")
+        for s in task_goal.success_criteria:
+            if s not in out:
+                out.append(s)
+        if diagnosis:
+            for key in ("expected_artifacts", "missing_knowledge"):
+                for item in diagnosis.get(key) or []:
+                    s = str(item)
+                    if s and s not in out:
+                        out.append(s)
+            root = str(diagnosis.get("root_cause") or "")
+            if root and "missing from expected" in root.lower():
+                out.append(root[:240])
+        return out[:24]
 
     def _format_status(self) -> str:
         mem = self.memory.stats()
@@ -3346,6 +3575,7 @@ class Orchestrator:
             pass
 
     def close(self) -> None:
+        set_active_tracker(None)
         self.memory.close()
         self.ledger.close()
         self.registry.close()

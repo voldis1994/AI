@@ -523,6 +523,7 @@ def run_cli(root: Path) -> int:
 
 
 def run_check(root: Path) -> int:
+    import time
     """Verify syntax, imports, subprocess isolation, and e2e learn→reuse."""
     import ast
     import importlib
@@ -947,11 +948,63 @@ def run(context: dict) -> dict:
         paths = [f.get("path") for f in tg.constraints.get("files") or []]
         assert paths == ["test.txt"], paths
         assert (tg.constraints.get("files") or [{}])[0].get("contains") == "DARBOJAS"
+        # Structured TaskGoal views (not word-split args)
+        assert "test.txt" in tg.artifacts
+        assert "DARBOJAS" in tg.content_requirements
+        assert tg.actions
+        assert tg.success_criteria
         grounded = TaskGoal.ground_args(
             {"path": "user_provided_path", "content": "DARBOJAS"},
             tg.user_request,
         )
         assert "path" not in grounded and grounded.get("content") == "DARBOJAS", grounded
+        # Polluted word-keys from the request sentence must be stripped
+        long_req = (
+            "Paradi ka Python darbojas dekoratori ar piemeri faila "
+            "decorators_example.py"
+        )
+        polluted = TaskGoal.sanitize_args(
+            {
+                "Python": "darbojas",
+                "darbojas": "dekoratori",
+                "dekoratori": "piemeri",
+                "path": "decorators_example.py",
+            },
+            long_req,
+            skill_meta={"required_args": ["path"]},
+        )
+        assert list(polluted.keys()) == ["path"], polluted
+        assert polluted.get("path") == "decorators_example.py"
+        # Natural-language request must NOT explode into dozens of must_contain needles
+        tg_long = TaskGoal.from_request(long_req)
+        must = list(tg_long.constraints.get("must_contain") or [])
+        assert len(must) <= 3, must
+        assert "ti" not in must and "ka" not in must
+        assert "Python" not in must  # stopword / not cue-captured
+        assert any(
+            (f.get("path") or "").endswith("decorators_example.py")
+            for f in (tg_long.constraints.get("files") or [])
+        ), tg_long.constraints
+        # enrich_diagnosis must not turn content_constraint into word args
+        diag = ContextBuilder.enrich_diagnosis_args(
+            {
+                "fault_layer": "skill_code",
+                "missing_args": ["ti", "Python"],
+                "required_args": ["ti", "Python"],
+                "suggested_args": {},
+            },
+            {
+                "phase": "VERIFY",
+                "exception": "content_constraint: 'ti' missing from expected files",
+                "context": {"args": {"path": "decorators_example.py"}, "user_request": long_req},
+            },
+            long_req,
+            user_request=long_req,
+        )
+        assert diag.get("fault_layer") == "skill_code"
+        assert diag.get("rewrite_skill") is True
+        assert not diag.get("missing_args"), diag
+        assert "ti" not in (diag.get("suggested_args") or {})
         noisy_v = Verifier(root / "data" / "_tg_verify_ws")
         (root / "data" / "_tg_verify_ws").mkdir(parents=True, exist_ok=True)
         built = noisy_v.extract_constraints(
@@ -974,6 +1027,11 @@ def run(context: dict) -> dict:
             "The skill is missing required arguments 'alpha' and 'beta' when invoked."
         )
         assert parsed == ["alpha", "beta"], parsed
+        # Verifier content_constraint must NEVER become missing arg names
+        assert ContextBuilder.parse_missing_arg_names(
+            "content_constraint: 'ti' missing from expected files "
+            "['C:\\\\JARVIS\\\\workspace_runtime\\\\decorators_example.py']"
+        ) == []
         filled = ContextBuilder._offline_extract(
             'Do work alpha_file.dat with "PAYLOAD_Z"',
             diagnosis={"missing_args": ["alpha", "beta"], "required_args": ["alpha", "beta"]},
@@ -3202,13 +3260,14 @@ def run(context: dict) -> dict:
         assert tier_for_work("extract_args") == TIER_FAST
         assert tier_for_work("query_generation") == TIER_FAST
         assert tier_for_work("converse") == TIER_FAST
-        assert tier_for_work("plan") == TIER_REASONING
+        assert tier_for_work("plan") == TIER_FAST  # plan is structured/simple → FAST
         assert tier_for_work("learning") == TIER_REASONING
         assert tier_for_work("research") == TIER_REASONING
         assert tier_for_work("diagnose") == TIER_REASONING
         assert tier_for_work("semantic") == TIER_REASONING
         assert tier_for_work("skill_code") == TIER_CODING
         assert tier_for_work("code_repair") == TIER_CODING
+        assert tier_for_work("unknown_work_xyz") == TIER_FAST  # never default to 30B
 
         assert TIER_MODELS[TIER_FAST]["primary"] == "qwen3:4b"
         assert TIER_MODELS[TIER_REASONING]["primary"] == "qwen3:30b"
@@ -3244,10 +3303,14 @@ def run(context: dict) -> dict:
         router.invalidate_cache()
         route_logs.clear()
         d_r = router.route(work="plan")
-        assert d_r.tier == TIER_REASONING
-        assert d_r.model == "qwen3:30b"
+        assert d_r.tier == TIER_FAST
+        assert d_r.model == "qwen3:4b"
         assert d_r.used_fallback is False
-        assert any(m == "MODEL ROUTE: REASONING → qwen3:30b" for m in route_logs), route_logs
+        assert any(m == "MODEL ROUTE: FAST → qwen3:4b" for m in route_logs), route_logs
+        route_logs.clear()
+        d_diag = router.route(work="diagnose")
+        assert d_diag.tier == TIER_REASONING
+        assert d_diag.model == "qwen3:30b"
 
         route_logs.clear()
         esc = router.escalate(TIER_FAST, work="intent")
@@ -3297,6 +3360,164 @@ def run(context: dict) -> dict:
         print("  OK multi-model router — route/fallback/escalate + work→tier map")
     except Exception as exc:
         msg = f"E2E_MULTI_MODEL_ROUTER: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 4n) E2E: stabilize — conversation + perf telemetry + forced repair PASS
+    print("  — e2e stabilize / speed / repair context / perf —")
+    try:
+        from jarvis.perf import PerfTracker, set_active_tracker
+        from jarvis.task_goal import TaskGoal as TGStab
+
+        # Perf tracker records stages + model calls
+        pt = PerfTracker("perf_test")
+        set_active_tracker(pt)
+        with pt.stage("PLAN"):
+            time.sleep(0.01)
+        pt.record_model(work="plan", tier="FAST", model="qwen3:4b", ms=12.5)
+        lines = pt.summary_lines()
+        assert any("PERF total=" in ln for ln in lines), lines
+        assert pt.as_dict()["model_call_count"] == 1
+        set_active_tracker(None)
+
+        stab_root = root / "data" / "_e2e_stabilize"
+        if stab_root.exists():
+            shutil.rmtree(stab_root)
+        stab_root.mkdir(parents=True)
+
+        class StabBrain(Brain):
+            def __init__(self) -> None:
+                super().__init__()
+                self.builds = 0
+                self.saw_repair_context = False
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                low = (user_text or "").lower()
+                if low.startswith("hello") or low.startswith("sveiki"):
+                    return {
+                        "intent": "conversation",
+                        "goal": user_text,
+                        "needs_capability": False,
+                    }
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                }
+
+            def converse(self, user_text: str, history=None) -> str:
+                return f"Conversational reply to: {user_text}"
+
+            def plan(self, goal: str, known_capabilities: list) -> dict:
+                return {
+                    "steps": ["build skill", "test", "verify"],
+                    "can_reuse": [],
+                    "missing": [goal],
+                    "needs_research": False,
+                    "needs_new_skill": True,
+                    "skill_name": "stab_create_file",
+                    "skill_description": goal,
+                    "research_queries": [],
+                    "args": {},
+                    "required_args": ["path", "content"],
+                }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                from jarvis.context_builder import ContextBuilder as CB
+                return CB._offline_extract(
+                    goal, diagnosis=diagnosis, skill_meta=skill_meta
+                )
+
+            def write_skill_code(
+                self,
+                skill_name,
+                description,
+                research,
+                previous_code=None,
+                error_log=None,
+                diagnosis=None,
+                failed_approaches=None,
+                test_plan=None,
+                **kwargs,
+            ):
+                self.builds += 1
+                # Repair / build must receive original request + TaskGoal + args
+                assert kwargs.get("user_request"), kwargs
+                assert kwargs.get("task_goal"), kwargs
+                assert isinstance(kwargs.get("grounded_args"), dict), kwargs
+                if self.builds >= 2 or diagnosis or error_log:
+                    self.saw_repair_context = True
+                    assert error_log or diagnosis
+                    assert "USER REQUEST" in str(error_log or "") or kwargs.get(
+                        "user_request"
+                    )
+                wrong_first = self.builds == 1
+                return (
+                    "from pathlib import Path\n"
+                    f"SKILL_META = {{'name': {skill_name!r}, "
+                    f"'description': {description!r}, "
+                    "'capabilities': ['create_file'], 'dependencies': [], "
+                    "'version': 1, 'required_args': ['path', 'content']}\n"
+                    "def run(context):\n"
+                    "    args = dict(context.get('args') or {})\n"
+                    "    ws = Path(context.get('workspace') or '.')\n"
+                    "    rel = args.get('path') or 'stab_out.txt'\n"
+                    "    body = args.get('content') or ''\n"
+                    f"    if {wrong_first!r}:\n"
+                    "        body = 'WRONG'\n"
+                    "    p = ws / rel if not Path(str(rel)).is_absolute() else Path(rel)\n"
+                    "    p.parent.mkdir(parents=True, exist_ok=True)\n"
+                    "    p.write_text(str(body), encoding='utf-8')\n"
+                    "    return {'ok': True, 'result': {'path': str(p), 'contains': body},\n"
+                    "            'error': None, 'evidence': f'wrote {p}'}\n"
+                )
+
+        logs_s: list[str] = []
+        brain_s = StabBrain()
+        orch_s = Orchestrator(
+            root=stab_root,
+            brain=brain_s,
+            on_log=lambda m: logs_s.append(m),
+        )
+        # 1) simple conversation
+        r_conv = orch_s.handle_user_message("Hello JARVIS")
+        assert r_conv.get("type") == "conversation", r_conv
+        assert isinstance(r_conv.get("perf"), dict), r_conv
+        assert any("PERF total=" in m for m in logs_s), logs_s[-20:]
+
+        # 2) capability build + forced failure → repair → PASS
+        logs_s.clear()
+        goal_s = "Create file stab_marker.txt containing STAB_OK"
+        r_task = orch_s.handle_user_message(goal_s)
+        assert r_task.get("success") is True, r_task
+        marker = stab_root / "workspace_runtime" / "stab_marker.txt"
+        assert marker.exists(), list((stab_root / "workspace_runtime").iterdir()) if (
+            stab_root / "workspace_runtime"
+        ).exists() else "no workspace"
+        assert "STAB_OK" in marker.read_text(encoding="utf-8")
+        # CONTEXT must not explode into word-args
+        assert not any(
+            "args_keys=['ti'" in m or "args_keys=['Python'" in m for m in logs_s
+        ), [m for m in logs_s if "args_keys=" in m][:8]
+        tg_s = TGStab.from_request(goal_s)
+        assert "stab_marker.txt" in tg_s.artifacts
+        assert "STAB_OK" in tg_s.content_requirements
+        assert brain_s.builds >= 2, brain_s.builds
+        assert brain_s.saw_repair_context
+        assert any("PERF" in m for m in logs_s)
+        orch_s.close()
+        print("  OK stabilize — conversation/perf/TaskGoal/repair→PASS")
+    except Exception as exc:
+        msg = f"E2E_STABILIZE: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)
