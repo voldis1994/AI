@@ -8,6 +8,7 @@ to produce code, synthesize a universal skill from research/diagnosis/args.
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import re
 from pathlib import Path
@@ -97,7 +98,9 @@ class SkillBuilder:
             constraints=constraints,
         )
         if self.brain is not None:
-            code = self.brain.write_skill_code(**write_kwargs)
+            code = self.brain.write_skill_code(
+                **self._filter_write_kwargs(self.brain.write_skill_code, write_kwargs)
+            )
             source = "brain"
 
         if self.is_unimplemented_stub(code) or not code or "def run" not in (code or ""):
@@ -140,7 +143,9 @@ class SkillBuilder:
                 retry_kw = dict(write_kwargs)
                 retry_kw["previous_code"] = code
                 retry_kw["error_log"] = f"SyntaxError: {err}"
-                code2 = self.brain.write_skill_code(**retry_kw)
+                code2 = self.brain.write_skill_code(
+                    **self._filter_write_kwargs(self.brain.write_skill_code, retry_kw)
+                )
                 code2 = self._ensure_meta(code2, name, description, research, version)
             if self.is_unimplemented_stub(code2) or "def run" not in (code2 or ""):
                 code2 = self.synthesize_from_knowledge(
@@ -195,6 +200,21 @@ class SkillBuilder:
         }
 
     # ── Stub detection / knowledge synthesis ────────────────────────────
+
+    @staticmethod
+    def _filter_write_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Pass only parameters accepted by write_skill_code (test doubles vary)."""
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return dict(kwargs)
+        if any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        ):
+            return dict(kwargs)
+        allowed = set(sig.parameters.keys())
+        return {k: v for k, v in kwargs.items() if k in allowed}
 
     @staticmethod
     def is_unimplemented_stub(code: Optional[str]) -> bool:
