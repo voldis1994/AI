@@ -65,9 +65,58 @@ class Memory:
                     created_at REAL NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS learning_failures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    skill_name TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    version INTEGER,
+                    phase TEXT,
+                    observation TEXT NOT NULL,
+                    code_fingerprint TEXT,
+                    created_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS learning_diagnoses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    skill_name TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    failure_id INTEGER,
+                    diagnosis TEXT NOT NULL,
+                    approach TEXT,
+                    approach_fingerprint TEXT,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY(failure_id) REFERENCES learning_failures(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS learning_solutions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    skill_name TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    version INTEGER,
+                    approach TEXT,
+                    approach_fingerprint TEXT,
+                    diagnosis_summary TEXT,
+                    code_fingerprint TEXT,
+                    details TEXT,
+                    created_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS failed_approaches (
+                    skill_name TEXT NOT NULL,
+                    approach_fingerprint TEXT NOT NULL,
+                    approach TEXT NOT NULL,
+                    fail_count INTEGER NOT NULL DEFAULT 1,
+                    last_error TEXT,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (skill_name, approach_fingerprint)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_conv_created ON conversations(created_at);
                 CREATE INDEX IF NOT EXISTS idx_exp_created ON experiences(created_at);
                 CREATE INDEX IF NOT EXISTS idx_skill_events ON skill_events(skill_name);
+                CREATE INDEX IF NOT EXISTS idx_learn_fail_skill ON learning_failures(skill_name);
+                CREATE INDEX IF NOT EXISTS idx_learn_diag_skill ON learning_diagnoses(skill_name);
+                CREATE INDEX IF NOT EXISTS idx_learn_sol_skill ON learning_solutions(skill_name);
                 """
             )
             self._conn.commit()
@@ -182,6 +231,189 @@ class Memory:
             )
             self._conn.commit()
 
+    # ── Universal learning memory ───────────────────────────────────────
+
+    def save_failure(
+        self,
+        skill_name: str,
+        goal: str,
+        observation: dict[str, Any],
+        version: Optional[int] = None,
+        phase: Optional[str] = None,
+    ) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO learning_failures "
+                "(skill_name, goal, version, phase, observation, code_fingerprint, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    skill_name,
+                    goal,
+                    version,
+                    phase or observation.get("phase"),
+                    json.dumps(observation, default=str),
+                    observation.get("code_fingerprint"),
+                    time.time(),
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def save_diagnosis(
+        self,
+        skill_name: str,
+        goal: str,
+        diagnosis: dict[str, Any],
+        failure_id: Optional[int] = None,
+    ) -> int:
+        approach = str(diagnosis.get("approach") or diagnosis.get("fix_plan") or "")
+        fp = str(diagnosis.get("approach_fingerprint") or "")
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO learning_diagnoses "
+                "(skill_name, goal, failure_id, diagnosis, approach, approach_fingerprint, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    skill_name,
+                    goal,
+                    failure_id,
+                    json.dumps(diagnosis, default=str),
+                    approach,
+                    fp,
+                    time.time(),
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def save_solution(
+        self,
+        skill_name: str,
+        goal: str,
+        version: int,
+        approach: str,
+        approach_fingerprint: str,
+        diagnosis_summary: str,
+        code_fingerprint: str,
+        details: Optional[dict] = None,
+    ) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO learning_solutions "
+                "(skill_name, goal, version, approach, approach_fingerprint, "
+                "diagnosis_summary, code_fingerprint, details, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    skill_name,
+                    goal,
+                    version,
+                    approach,
+                    approach_fingerprint,
+                    diagnosis_summary,
+                    code_fingerprint,
+                    json.dumps(details or {}, default=str),
+                    time.time(),
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def record_failed_approach(
+        self,
+        skill_name: str,
+        approach: str,
+        approach_fingerprint: str,
+        last_error: str = "",
+    ) -> None:
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fail_count FROM failed_approaches "
+                "WHERE skill_name=? AND approach_fingerprint=?",
+                (skill_name, approach_fingerprint),
+            ).fetchone()
+            if row:
+                self._conn.execute(
+                    "UPDATE failed_approaches SET fail_count=fail_count+1, "
+                    "approach=?, last_error=?, updated_at=? "
+                    "WHERE skill_name=? AND approach_fingerprint=?",
+                    (approach, last_error[:2000], now, skill_name, approach_fingerprint),
+                )
+            else:
+                self._conn.execute(
+                    "INSERT INTO failed_approaches "
+                    "(skill_name, approach_fingerprint, approach, fail_count, last_error, updated_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (skill_name, approach_fingerprint, approach, 1, last_error[:2000], now),
+                )
+            self._conn.commit()
+
+    def get_failed_approaches(self, skill_name: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM failed_approaches WHERE skill_name=? "
+                "ORDER BY fail_count DESC, updated_at DESC",
+                (skill_name,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def recent_failures(self, skill_name: str, limit: int = 5) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM learning_failures WHERE skill_name=? "
+                "ORDER BY id DESC LIMIT ?",
+                (skill_name, limit),
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["observation"] = json.loads(d["observation"])
+            except Exception:
+                pass
+            out.append(d)
+        return out
+
+    def recent_diagnoses(self, skill_name: str, limit: int = 5) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM learning_diagnoses WHERE skill_name=? "
+                "ORDER BY id DESC LIMIT ?",
+                (skill_name, limit),
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["diagnosis"] = json.loads(d["diagnosis"])
+            except Exception:
+                pass
+            out.append(d)
+        return out
+
+    def recent_solutions(
+        self, skill_name: Optional[str] = None, goal: Optional[str] = None, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            if skill_name:
+                rows = self._conn.execute(
+                    "SELECT * FROM learning_solutions WHERE skill_name=? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (skill_name, limit),
+                ).fetchall()
+            elif goal:
+                rows = self._conn.execute(
+                    "SELECT * FROM learning_solutions WHERE goal LIKE ? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (f"%{goal[:80]}%", limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM learning_solutions ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
     def stats(self) -> dict[str, int]:
         with self._lock:
             conversations = self._conn.execute(
@@ -199,12 +431,24 @@ class Memory:
             skill_events = self._conn.execute(
                 "SELECT COUNT(*) AS c FROM skill_events"
             ).fetchone()["c"]
+            failures = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM learning_failures"
+            ).fetchone()["c"]
+            diagnoses = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM learning_diagnoses"
+            ).fetchone()["c"]
+            solutions = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM learning_solutions"
+            ).fetchone()["c"]
         return {
             "conversations": conversations,
             "experiences": experiences,
             "successes": successes,
             "facts": facts,
             "skill_events": skill_events,
+            "learning_failures": failures,
+            "learning_diagnoses": diagnoses,
+            "learning_solutions": solutions,
         }
 
     def close(self) -> None:

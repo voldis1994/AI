@@ -84,17 +84,19 @@ class SkillBuilder:
         previous_code: Optional[str] = None,
         error_log: Optional[str] = None,
         protect_active_path: Optional[str | Path] = None,
+        diagnosis: Optional[dict[str, Any]] = None,
+        failed_approaches: Optional[list] = None,
+        test_plan: Optional[str] = None,
     ) -> dict[str, Any]:
         """
-        Build a skill file.
+        Build a skill file from research + optional diagnosis.
 
-        If protect_active_path is set (existing ACTIVE file), the new version is
-        written to a candidate path and the ACTIVE file is left untouched.
+        Core stays universal — no task-specific code paths here.
+        If protect_active_path is set, write a candidate file only.
         """
         name = self._safe_name(skill_name)
         self.on_log(f"BUILD: generating skill '{name}' v{version}")
 
-        # Include research sources in prompt context for the brain
         research_for_brain = dict(research)
         if research.get("results"):
             research_for_brain["research_results"] = research["results"][:10]
@@ -107,6 +109,9 @@ class SkillBuilder:
                 research=research_for_brain,
                 previous_code=previous_code,
                 error_log=error_log,
+                diagnosis=diagnosis,
+                failed_approaches=failed_approaches,
+                test_plan=test_plan or (diagnosis or {}).get("test_plan"),
             )
 
         if not code or "def run" not in code:
@@ -131,6 +136,9 @@ class SkillBuilder:
                     research=research_for_brain,
                     previous_code=code,
                     error_log=f"SyntaxError: {err}",
+                    diagnosis=diagnosis,
+                    failed_approaches=failed_approaches,
+                    test_plan=test_plan,
                 )
                 code2 = self._ensure_meta(code2, name, description, research, version)
                 ok2, err2 = self._validate_syntax(code2)

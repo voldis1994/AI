@@ -239,8 +239,11 @@ class Brain:
         research: dict[str, Any],
         previous_code: Optional[str] = None,
         error_log: Optional[str] = None,
+        diagnosis: Optional[dict[str, Any]] = None,
+        failed_approaches: Optional[list] = None,
+        test_plan: Optional[str] = None,
     ) -> str:
-        """Generate a complete Python skill module."""
+        """Generate or repair a complete Python skill module from diagnosis/research."""
         system = (
             "You write JARVIS skill modules. Output ONLY valid Python code, no markdown fences.\n"
             "Every skill MUST define:\n"
@@ -248,37 +251,156 @@ class Brain:
             "'dependencies': [str], 'version': int}\n"
             "  def run(context: dict) -> dict:\n"
             "      '''Execute the skill. context has 'goal', 'args', 'workspace'. "
-            "Return {'ok': bool, 'result': Any, 'error': str|None, 'evidence': str}'''\n"
+            "Return {'ok': bool, 'result': Any, 'error': str|None, 'evidence': str}. "
+            "Put independently checkable fields in result "
+            "(path/file/directory/url/imports/expect_status/contains).'''\n"
             "Use only stdlib + declared dependencies. Be concrete and correct. "
-            "Do not pretend success — set ok=False on failure."
+            "Do not pretend success — set ok=False on failure.\n"
+            "If a DIAGNOSIS is provided, implement THAT approach — do not repeat "
+            "failed approaches listed below."
         )
         parts = [
             f"Skill name: {skill_name}",
             f"Description: {description}",
-            f"Research: {json.dumps(research, ensure_ascii=False)}",
+            f"Research: {json.dumps(research, ensure_ascii=False)[:6000]}",
         ]
+        if diagnosis:
+            parts.append(
+                "DIAGNOSIS (follow this):\n"
+                + json.dumps(diagnosis, ensure_ascii=False, default=str)[:4000]
+            )
+        if failed_approaches:
+            parts.append(
+                "FAILED APPROACHES — do NOT repeat these:\n"
+                + json.dumps(failed_approaches, ensure_ascii=False, default=str)[:3000]
+            )
+        if test_plan:
+            parts.append(f"TEST PLAN for next version:\n{test_plan}")
         if previous_code:
-            parts.append(f"PREVIOUS CODE:\n{previous_code}")
+            parts.append(f"PREVIOUS CODE:\n{previous_code[:8000]}")
         if error_log:
-            parts.append(f"ERRORS TO FIX:\n{error_log}")
-            parts.append("Repair the skill so tests pass.")
-        raw = self.generate("\n\n".join(parts), system=system, temperature=0.15)
+            parts.append(f"LAST ERROR / OBSERVATION SUMMARY:\n{error_log[:4000]}")
+        # Slightly higher temperature on repair to encourage approach change
+        temperature = 0.35 if (diagnosis or error_log) else 0.15
+        raw = self.generate("\n\n".join(parts), system=system, temperature=temperature)
         return self._extract_python(raw)
 
-    def analyze_failure(self, skill_code: str, error_log: str, evidence: str) -> dict[str, Any]:
+    def diagnose(
+        self,
+        observation: dict[str, Any],
+        failed_approaches: Optional[list] = None,
+        prior_solutions: Optional[list] = None,
+    ) -> dict[str, Any]:
+        """
+        Universal diagnosis from a full observation package.
+
+        Ollama decides root cause, what to change, research/deps needs,
+        next test plan, and a NEW approach if previous ones failed.
+        """
         system = (
-            "Analyze why a skill failed. Reply ONLY with JSON:\n"
-            '{"diagnosis":"...","fix_plan":"...","needs_new_deps":["..."],'
-            '"is_unfixable":false}'
+            "You are JARVIS diagnostician for a self-learning agent. "
+            "You receive a full OBSERVATION of a failed skill attempt. "
+            "Reply ONLY with JSON:\n"
+            "{\n"
+            '  "root_cause": "...",\n'
+            '  "what_to_change": "...",\n'
+            '  "approach": "short label of the NEW strategy to try",\n'
+            '  "approach_changed": true|false,\n'
+            '  "needs_research": true|false,\n'
+            '  "research_queries": ["..."],\n'
+            '  "needs_new_deps": ["pip-or-import-name"],\n'
+            '  "test_plan": "how to validate the next version",\n'
+            '  "expected_artifacts": ["what verifier should find"],\n'
+            '  "is_unfixable": false,\n'
+            '  "diagnosis": "one-paragraph summary"\n'
+            "}\n"
+            "Rules:\n"
+            "- Use exception, traceback, stdout, stderr, returncode, code, "
+            "context, dependencies, artifacts.\n"
+            "- If the same approach already failed, you MUST set approach_changed=true "
+            "and propose a meaningfully different approach.\n"
+            "- Do not claim the task is done; only diagnose.\n"
+            "- Prefer concrete, testable next steps."
         )
-        prompt = f"CODE:\n{skill_code[:6000]}\n\nERROR:\n{error_log}\n\nEVIDENCE:\n{evidence}"
-        raw = self.generate(prompt, system=system, temperature=0.2)
-        return self._parse_json(raw, {
-            "diagnosis": error_log[:500],
-            "fix_plan": "Inspect and repair the failing logic",
+        payload = {
+            "observation": {
+                k: observation.get(k)
+                for k in (
+                    "goal", "skill_name", "version", "phase",
+                    "exception", "traceback", "stdout", "stderr",
+                    "returncode", "timed_out", "crash", "killed",
+                    "context", "dependencies", "artifacts",
+                    "skill_result", "verifier_result", "code_fingerprint",
+                )
+            },
+            "skill_code": (observation.get("skill_code") or "")[:8000],
+            "failed_approaches": failed_approaches or observation.get("prior_approaches") or [],
+            "prior_solutions": prior_solutions or [],
+        }
+        raw = self.generate(
+            json.dumps(payload, ensure_ascii=False, default=str)[:14000],
+            system=system,
+            temperature=0.25,
+        )
+        fallback = {
+            "root_cause": str(observation.get("exception") or "unknown")[:500],
+            "what_to_change": "Revise skill logic based on stderr/traceback",
+            "approach": f"alt_approach_v{(observation.get('version') or 0) + 1}",
+            "approach_changed": True,
+            "needs_research": True,
+            "research_queries": [
+                f"python {observation.get('goal', '')}",
+                str(observation.get("exception") or "")[:120],
+            ],
             "needs_new_deps": [],
+            "test_plan": "Re-run skill in subprocess and independently verify artifacts",
+            "expected_artifacts": [],
             "is_unfixable": False,
-        })
+            "diagnosis": str(observation.get("exception") or "failure")[:500],
+        }
+        result = self._parse_json(raw, fallback)
+        # Enforce approach change when fingerprint collided with failed list
+        failed_fps = {
+            str(a.get("approach_fingerprint") or a.get("fingerprint") or "")
+            for a in (failed_approaches or [])
+        }
+        approach = str(result.get("approach") or fallback["approach"])
+        from jarvis.observer import Observer
+
+        fp = Observer.fingerprint_approach(approach)
+        result["approach"] = approach
+        result["approach_fingerprint"] = fp
+        if fp in failed_fps and failed_fps:
+            result["approach_changed"] = True
+            result["approach"] = f"{approach} | divergent-{observation.get('version')}"
+            result["approach_fingerprint"] = Observer.fingerprint_approach(result["approach"])
+            result["what_to_change"] = (
+                str(result.get("what_to_change") or "")
+                + " | prior approach fingerprint collided — force new strategy"
+            )
+        if "diagnosis" not in result:
+            result["diagnosis"] = result.get("root_cause") or fallback["diagnosis"]
+        return result
+
+    def analyze_failure(self, skill_code: str, error_log: str, evidence: str) -> dict[str, Any]:
+        """Backward-compatible thin wrapper around diagnose()."""
+        observation = {
+            "goal": "",
+            "skill_name": "",
+            "version": 0,
+            "phase": "TEST",
+            "exception": error_log,
+            "traceback": error_log,
+            "stdout": "",
+            "stderr": evidence or "",
+            "returncode": None,
+            "skill_code": skill_code,
+            "context": {},
+            "dependencies": [],
+            "artifacts": [],
+            "skill_result": {"error": error_log, "evidence": evidence},
+        }
+        return self.diagnose(observation)
 
     def verify_claim(self, goal: str, result: dict[str, Any], evidence: str) -> dict[str, Any]:
         """Ask the model to judge verification — but orchestrator still requires evidence."""
