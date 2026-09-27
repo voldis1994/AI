@@ -75,6 +75,8 @@ class SkillBuilder:
             research_for_brain["research_results"] = research["results"][:10]
         if research.get("knowledge_history"):
             research_for_brain["knowledge_history"] = research["knowledge_history"][:5]
+        if user_request:
+            research_for_brain["user_request"] = user_request
 
         # Do not feed the unimplemented stub back as "previous code"
         if previous_code and self.is_unimplemented_stub(previous_code):
@@ -112,9 +114,10 @@ class SkillBuilder:
             code = self.synthesize_from_knowledge(
                 name=name,
                 description=description,
-                research=research,
+                research=research_for_brain,
                 version=version,
                 diagnosis=diagnosis,
+                user_request=user_request,
             )
             source = "knowledge_synthesis"
 
@@ -153,9 +156,10 @@ class SkillBuilder:
                 code2 = self.synthesize_from_knowledge(
                     name=name,
                     description=description,
-                    research=research,
+                    research=research_for_brain,
                     version=version,
                     diagnosis=diagnosis,
+                    user_request=user_request,
                 )
                 code2 = self._ensure_meta(code2, name, description, research, version)
                 source = "knowledge_synthesis"
@@ -184,7 +188,14 @@ class SkillBuilder:
             protected = False
 
         path.write_text(code, encoding="utf-8")
-        meta = self._extract_meta(code, name, description, research, version)
+        meta = self._extract_meta(
+            code,
+            name,
+            description,
+            research,
+            version,
+            user_request=user_request,
+        )
         self.on_log(
             f"BUILD: wrote {path} via {source}"
             + (" (ACTIVE protected)" if protected else "")
@@ -252,6 +263,7 @@ class SkillBuilder:
         research: dict[str, Any],
         version: int,
         diagnosis: Optional[dict[str, Any]] = None,
+        user_request: Optional[str] = None,
     ) -> str:
         """
         Universal fallback: turn research/diagnosis into a working skill.
@@ -261,7 +273,15 @@ class SkillBuilder:
         """
         diagnosis = diagnosis or {}
         caps = list(research.get("key_apis") or [description])[:8]
-        deps = list(research.get("libraries") or [])[:8]
+        from jarvis.request_items import sanitize_libraries
+
+        user_req = str(
+            user_request or research.get("user_request") or description or ""
+        )
+        deps = sanitize_libraries(
+            list(research.get("libraries") or [])[:8],
+            user_req,
+        )
         required = []
         for src in (
             diagnosis.get("required_args"),
@@ -272,6 +292,16 @@ class SkillBuilder:
                 for x in src:
                     if str(x) and str(x) not in required:
                         required.append(str(x))
+        # Drop path-stem polluted required_args
+        try:
+            from jarvis.task_goal import TaskGoal as _TG
+
+            required = [
+                x for x in required
+                if not _TG.is_polluted_arg_key(x, user_req)
+            ]
+        except Exception:
+            pass
         approach = str(
             research.get("approach")
             or diagnosis.get("approach")
@@ -474,8 +504,13 @@ def run(context: dict) -> dict:
         version: int,
     ) -> str:
         if "SKILL_META" not in code:
+            from jarvis.request_items import sanitize_libraries
+
             caps = research.get("key_apis") or [description]
-            deps = research.get("libraries") or []
+            deps = sanitize_libraries(
+                list(research.get("libraries") or []),
+                str(research.get("user_request") or description or ""),
+            )
             meta_block = (
                 f"\nSKILL_META = {{\n"
                 f'    "name": "{name}",\n'
@@ -493,6 +528,7 @@ def run(context: dict) -> dict:
                 description=description,
                 research=research,
                 version=version,
+                user_request=str(research.get("user_request") or "") or None,
             )
         return code
 
@@ -503,7 +539,11 @@ def run(context: dict) -> dict:
         description: str,
         research: dict,
         version: int,
+        *,
+        user_request: Optional[str] = None,
     ) -> dict[str, Any]:
+        from jarvis.request_items import extract_external_imports, sanitize_libraries
+
         meta = {
             "name": name,
             "description": description,
@@ -522,6 +562,13 @@ def run(context: dict) -> dict:
             pass
         meta["name"] = name
         meta["version"] = version
+        # Dependencies = external imports in code (authority), never path tokens
+        req = user_request or description or ""
+        code_deps = extract_external_imports(code)
+        declared = sanitize_libraries(
+            list(meta.get("dependencies") or []), req, skill_code=code
+        )
+        meta["dependencies"] = code_deps or declared
         return meta
 
     @staticmethod

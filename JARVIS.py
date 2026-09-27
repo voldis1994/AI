@@ -643,6 +643,53 @@ def run(context: dict) -> dict:
         assert TaskGoal.rewrite_skill_for_layer("context_mapping") is False
         assert TaskGoal.rewrite_skill_for_layer("skill_code") is True
 
+        # Universal request-item classification: path stems ≠ libraries / deps
+        from jarvis.request_items import (
+            ItemKind,
+            classify_request_items,
+            library_tokens_for_pypi,
+            path_segment_tokens,
+            sanitize_libraries,
+        )
+        from jarvis.research import ResearchSystem
+
+        path_req = 'Create workspace/out_tool.py containing "READY"'
+        segs = path_segment_tokens(path_req)
+        assert "out_tool" in segs, segs
+        assert any("out_tool.py" in s or s.endswith("out_tool.py") for s in segs) or \
+            "out_tool.py" in segs or any("out_tool" == s for s in segs)
+        # Directory + stem from relative path
+        assert "workspace" in segs or any("workspace" in s for s in segs)
+        assert TaskGoal.is_polluted_arg_key("out_tool", path_req)
+        assert TaskGoal.is_polluted_arg_key("workspace", path_req)
+        items = classify_request_items(path_req)
+        kinds = {i.kind for i in items}
+        assert ItemKind.PATH in kinds or ItemKind.FILE in kinds, items
+        assert not any(i.kind == ItemKind.LIBRARY for i in items), items
+        assert library_tokens_for_pypi(path_req) == []
+        assert sanitize_libraries(
+            ["out_tool", "workspace", "requests"], path_req
+        ) == ["requests"]
+        # Code with only stdlib → install nothing (even if research lied)
+        stdlib_skill = (
+            "from pathlib import Path\n"
+            "def run(context):\n"
+            "    Path('x').write_text('y')\n"
+            "    return {'ok': True}\n"
+        )
+        assert sanitize_libraries(
+            ["out_tool", "workspace", "pathlib"],
+            path_req,
+            skill_code=stdlib_skill,
+        ) == []
+        rs_unit = ResearchSystem(brain=None)
+        notes, hits = rs_unit._pypi_lookup(path_req)
+        assert notes == "" and hits == [], (notes, hits)
+        tg_path = TaskGoal.from_request(path_req)
+        assert any(
+            "out_tool.py" in a for a in tg_path.artifacts
+        ), tg_path.artifacts
+
         args_root = root / "data" / "_e2e_args"
         if args_root.exists():
             shutil.rmtree(args_root)
@@ -3514,6 +3561,184 @@ def run(context):
         print("  OK capability match — bait rejected, BUILD_NEW, compatible REUSE")
     except Exception as exc:
         msg = f"E2E_CAPABILITY_MATCH: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # Path in request = OUTPUT PATH, never PyPI / install target
+    print("  — e2e path artifact ≠ dependency (BUILD→TEST→EXECUTE→VERIFY) —")
+    try:
+        path_root = root / "data" / "_e2e_path_not_dep"
+        if path_root.exists():
+            shutil.rmtree(path_root)
+        path_root.mkdir(parents=True)
+        ensured: list[list[str]] = []
+
+        class PathNotDepBrain(Brain):
+            def __init__(self) -> None:
+                super().__init__()
+                self.builds = 0
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": ["create", "file"],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                return {
+                    "steps": ["build"],
+                    "can_reuse": [],
+                    "missing": [goal],
+                    # No entry research required — path stems still must not install
+                    "needs_research": False,
+                    "needs_new_skill": True,
+                    "skill_name": "path_out_skill",
+                    "skill_description": goal,
+                    "research_queries": [],
+                    "args": {"dest": "workspace/out_tool.py", "body": "PATH_OK"},
+                    "required_args": ["dest", "body"],
+                }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                return {"dest": "workspace/out_tool.py", "body": "PATH_OK"}
+
+            def research_notes(self, query: str, gathered: str) -> dict:
+                # Deliberately polluted libraries — orchestrator must scrub
+                return {
+                    "approach": "write_output_path",
+                    "libraries": ["workspace", "out_tool", "calculator"],
+                    "key_apis": ["pathlib"],
+                    "pitfalls": [],
+                    "test_idea": "",
+                    "repair_insight": "",
+                }
+
+            def write_skill_code(
+                self,
+                skill_name,
+                description,
+                research,
+                previous_code=None,
+                error_log=None,
+                diagnosis=None,
+                failed_approaches=None,
+                test_plan=None,
+                **kwargs,
+            ) -> str:
+                self.builds += 1
+                # Stdlib only — no third-party installs required
+                return f'''
+from pathlib import Path
+SKILL_META = {{
+    "name": "{skill_name}",
+    "description": {description!r},
+    "capabilities": ["write_file"],
+    "dependencies": ["workspace", "out_tool"],
+    "version": {self.builds},
+    "required_args": ["dest", "body"],
+}}
+def run(context: dict) -> dict:
+    args = context.get("args") or {{}}
+    workspace = Path(context.get("workspace") or ".")
+    dest = str(args.get("dest") or "out.txt")
+    path = workspace / dest
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(args.get("body") or "") + "\\n", encoding="utf-8")
+    return {{
+        "ok": True,
+        "result": {{"path": str(path), "contains": str(args.get("body") or "")}},
+        "error": None,
+        "evidence": f"wrote {{path}}",
+    }}
+'''
+
+            def diagnose(self, observation, failed_approaches=None, prior_solutions=None):
+                return {
+                    "root_cause": "n/a",
+                    "fault_layer": "skill_code",
+                    "rewrite_skill": True,
+                    "what_to_change": "honor dest path",
+                    "approach": "path_output",
+                    "approach_changed": True,
+                    "needs_research": False,
+                    "missing_knowledge": [],
+                    "research_queries": [],
+                    "needs_new_deps": ["workspace", "out_tool"],
+                    "missing_args": [],
+                    "required_args": ["dest", "body"],
+                    "suggested_args": {
+                        "dest": "workspace/out_tool.py",
+                        "body": "PATH_OK",
+                    },
+                    "test_plan": "VERIFY path",
+                    "expected_artifacts": ["workspace/out_tool.py"],
+                    "is_unfixable": False,
+                    "diagnosis": "ok",
+                }
+
+            def verify_claim(self, goal, result, evidence) -> dict:
+                return {"achieved": True, "confidence": 0.9, "reason": "advisory"}
+
+            def converse(self, user_text, history=None) -> str:
+                return "ok"
+
+        logs_p: list[str] = []
+        events_p: list[tuple[str, dict]] = []
+        brain_p = PathNotDepBrain()
+        orch_p = Orchestrator(
+            root=path_root,
+            brain=brain_p,
+            on_log=lambda m: logs_p.append(m),
+            on_event=lambda k, p: events_p.append((k, dict(p or {}))),
+        )
+        # Intercept ensure to prove path stems are never installed
+        _orig_ensure = orch_p.deps.ensure
+
+        def _track_ensure(deps):
+            ensured.append(list(deps or []))
+            return _orig_ensure(deps)
+
+        orch_p.deps.ensure = _track_ensure  # type: ignore[method-assign]
+        goal_p = 'Create workspace/out_tool.py containing "PATH_OK"'
+        result_p = orch_p.run_cycle(goal_p)
+        assert result_p.get("success"), result_p
+        out_p = path_root / "workspace_runtime" / "workspace" / "out_tool.py"
+        assert out_p.exists(), list(
+            (path_root / "workspace_runtime").rglob("*")
+        )
+        assert "PATH_OK" in out_p.read_text(encoding="utf-8")
+        # Never install path stems
+        flat = [d.lower() for batch in ensured for d in batch]
+        assert "workspace" not in flat, ensured
+        assert "out_tool" not in flat, ensured
+        assert "calculator" not in flat, ensured
+        assert any("REQUEST ITEMS" in m for m in logs_p), logs_p[-40:]
+        assert any(
+            "PATH=" in m or "FILE=" in m for m in logs_p if "REQUEST ITEMS" in m
+        ), [m for m in logs_p if "REQUEST ITEMS" in m]
+        # Pipeline: BUILD → TEST → EXECUTE → VERIFY (TEST ≠ DONE alone)
+        assert any("SKILL TEST PASS" in m and "EXECUTE" in m for m in logs_p), logs_p[-30:]
+        assert any("VERIFIER RESULT: PASS" in m or "VERIFY: PASS" in m for m in logs_p)
+        skill_rec = orch_p.registry.get_skill("path_out_skill")
+        assert skill_rec and skill_rec.get("status") == "ACTIVE"
+        deps_meta = list(skill_rec.get("dependencies") or [])
+        assert "workspace" not in [str(d).lower() for d in deps_meta], deps_meta
+        assert "out_tool" not in [str(d).lower() for d in deps_meta], deps_meta
+        orch_p.close()
+        print("  OK path artifact ≠ dependency — BUILD→TEST→EXECUTE→VERIFY")
+    except Exception as exc:
+        msg = f"E2E_PATH_NOT_DEP: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)

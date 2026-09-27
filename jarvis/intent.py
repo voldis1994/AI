@@ -193,9 +193,16 @@ class IntentClassifier:
             "a", "an", "the", "and", "or", "to", "for", "with", "from", "in",
             "on", "of", "please", "jarvis", "ar", "un", "ka", "kā", "par",
         }
+        try:
+            from jarvis.request_items import path_segment_tokens
+
+            path_segs = path_segment_tokens(text or "")
+        except Exception:
+            path_segs = set()
         out: list[str] = []
         for tok in re.findall(r"[A-Za-z0-9_]{3,}", text or ""):
-            if tok.lower() in stop:
+            low = tok.lower()
+            if low in stop or low in path_segs:
                 continue
             if tok not in out:
                 out.append(tok)

@@ -463,18 +463,10 @@ class ResearchSystem:
             return f"(web search unavailable: {exc})", results
 
     def _pypi_lookup(self, query: str) -> tuple[str, list[dict[str, Any]]]:
-        tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", query.lower())
-        candidates = []
-        skip = {
-            "python", "how", "the", "and", "for", "with", "from", "that",
-            "this", "create", "make", "write", "file", "using",
-        }
-        for tok in tokens:
-            if tok in skip:
-                continue
-            candidates.append(tok)
-            if len(candidates) >= 3:
-                break
+        # Only LIBRARY-classified tokens — never path/file stems from the request
+        from jarvis.request_items import library_tokens_for_pypi
+
+        candidates = library_tokens_for_pypi(query, request=query)
         if not candidates:
             return "", []
 
