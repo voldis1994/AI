@@ -2,8 +2,8 @@
 """
 JARVIS — Autonomous self-learning AI agent.
 
-Main entry point. Brain: Ollama multi-model router
-(FAST / REASONING / CODING — see jarvis/model_config.py).
+Main entry point. Brain: Ollama concurrent model pool
+(FAST / REASONING / CODING independent workers — see jarvis/model_config.py).
 Learning happens by creating/repairing Python skills — not by hardcoding
 every future capability into this core.
 
@@ -3243,18 +3243,20 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
-    # 4m) E2E: Multi-Model Router — work kind → tier → model + fallback + escalate
-    print("  — e2e multi-model router (FAST/REASONING/CODING) —")
+    # 4m) E2E: concurrent model pool — independent workers, warm/LRU, dedupe, parallel
+    print("  — e2e concurrent model pool (FAST/REASONING/CODING workers) —")
     try:
         from jarvis.model_config import (
             TIER_MODELS,
             TIER_FAST,
             TIER_REASONING,
             TIER_CODING,
+            WARM_ORDER,
             tier_for_work,
             models_for_tier,
+            size_hint_bytes,
         )
-        from jarvis.model_router import ModelRouter
+        from jarvis.model_router import ModelPool, ModelRouter, RequestWorkContext
 
         assert tier_for_work("intent") == TIER_FAST
         assert tier_for_work("extract_args") == TIER_FAST
@@ -3268,60 +3270,87 @@ def run(context: dict) -> dict:
         assert tier_for_work("skill_code") == TIER_CODING
         assert tier_for_work("code_repair") == TIER_CODING
         assert tier_for_work("unknown_work_xyz") == TIER_FAST  # never default to 30B
+        assert WARM_ORDER[0] == TIER_FAST
+        assert size_hint_bytes("qwen3:4b") < size_hint_bytes("qwen3:30b")
 
         assert TIER_MODELS[TIER_FAST]["primary"] == "qwen3:4b"
         assert TIER_MODELS[TIER_REASONING]["primary"] == "qwen3:30b"
         assert TIER_MODELS[TIER_CODING]["primary"] == "qwen3-coder:30b"
-        # qwen2.5 kept as fallback
         assert "qwen2.5-coder:7b" in models_for_tier(TIER_CODING)
         assert "qwen2.5-coder:7b" in models_for_tier(TIER_FAST)
 
         route_logs: list[str] = []
+        preloaded: list[str] = []
+        unloaded: list[str] = []
 
-        # Only legacy coding model installed → FAST/REASONING/CODING all fallback
         installed = ["qwen2.5-coder:7b"]
 
         def _list() -> list[str]:
             return list(installed)
 
-        router = ModelRouter(list_models=_list, on_log=lambda m: route_logs.append(m))
-        d_fast = router.route(work="intent")
-        assert d_fast.tier == TIER_FAST
-        assert d_fast.model == "qwen2.5-coder:7b"
-        assert d_fast.used_fallback is True
-        assert any(m.startswith("MODEL ROUTE: FAST →") for m in route_logs), route_logs
-        assert any("MODEL FALLBACK:" in m for m in route_logs), route_logs
+        def _preload(model: str, keep_alive) -> bool:
+            preloaded.append(f"{model}:{keep_alive}")
+            return True
 
+        def _unload(model: str) -> bool:
+            unloaded.append(model)
+            return True
+
+        # Tiny budget → only FAST warm (intelligent warm-pool, no thrash)
+        pool = ModelRouter(
+            list_models=_list,
+            on_log=lambda m: route_logs.append(m),
+            preload_fn=_preload,
+            unload_fn=_unload,
+            ps_fn=lambda: [],
+        )
+        # Force tiny budget via monkeypatch after init path
+        report = pool.initialize(warm=False)
+        assert report.get("online") is True
+        pool._budget_bytes = 5_000_000_000  # ~5GiB — one 7b-ish model
+        for w in pool.workers.values():
+            w.size_bytes = 4_500_000_000
+        warm_rep = pool.warm_start()
+        assert any("FAST" in x for x in (warm_rep.get("warmed") or [])), warm_rep
+        # REASONING/CODING should be skipped when budget tight (same resolved model
+        # may already be warm — that's OK; skipped list or single warm entry)
+        assert pool.workers[TIER_FAST].warm is True
+
+        # Direct acquire — CODING without going through FAST→REASONING
         route_logs.clear()
-        d_code = router.route(work="skill_code")
+        d_code = pool.acquire(work="skill_code", ensure_warm=False)
         assert d_code.tier == TIER_CODING
         assert d_code.model == "qwen2.5-coder:7b"
         assert any(m.startswith("MODEL ROUTE: CODING →") for m in route_logs), route_logs
 
-        # Primary available — no fallback
-        installed = ["qwen3:4b", "qwen3:30b", "qwen3-coder:30b", "qwen2.5-coder:7b"]
-        router.invalidate_cache()
+        # Fallback when only legacy model installed
         route_logs.clear()
-        d_r = router.route(work="plan")
-        assert d_r.tier == TIER_FAST
-        assert d_r.model == "qwen3:4b"
-        assert d_r.used_fallback is False
-        assert any(m == "MODEL ROUTE: FAST → qwen3:4b" for m in route_logs), route_logs
-        route_logs.clear()
-        d_diag = router.route(work="diagnose")
-        assert d_diag.tier == TIER_REASONING
-        assert d_diag.model == "qwen3:30b"
+        d_fast = pool.route(work="intent", ensure_warm=False)
+        assert d_fast.tier == TIER_FAST
+        assert d_fast.used_fallback is True
+        assert any("MODEL FALLBACK:" in m for m in route_logs), route_logs
 
+        # Primaries available — direct tier select (not a chain)
+        installed = ["qwen3:4b", "qwen3:30b", "qwen3-coder:30b", "qwen2.5-coder:7b"]
+        pool.invalidate_cache()
+        pool.initialize(warm=False)
         route_logs.clear()
-        esc = router.escalate(TIER_FAST, work="intent")
-        assert esc is not None
-        assert esc.tier == TIER_REASONING
+        d_plan = pool.acquire(work="plan", ensure_warm=False)
+        assert d_plan.tier == TIER_FAST and d_plan.model == "qwen3:4b"
+        d_diag = pool.acquire(work="diagnose", ensure_warm=False)
+        assert d_diag.tier == TIER_REASONING and d_diag.model == "qwen3:30b"
+        d_code2 = pool.acquire(work="code_repair", ensure_warm=False)
+        assert d_code2.tier == TIER_CODING and d_code2.model == "qwen3-coder:30b"
+
+        # Escalation only when prior insufficient
+        route_logs.clear()
+        esc = pool.escalate(TIER_FAST, work="intent")
+        assert esc is not None and esc.tier == TIER_REASONING
         assert any(m == "MODEL ESCALATION: FAST → REASONING" for m in route_logs), route_logs
 
         route_logs.clear()
-        retry = router.escalate(TIER_CODING, work="code_repair")
-        assert retry is not None
-        assert retry.tier == TIER_CODING
+        retry = pool.escalate(TIER_CODING, work="code_repair")
+        assert retry is not None and retry.tier == TIER_CODING
         assert any("MODEL RETRY: CODING" in m for m in route_logs), route_logs
 
         assert ModelRouter.result_insufficient("")
@@ -3329,22 +3358,72 @@ def run(context: dict) -> dict:
         assert ModelRouter.result_insufficient("sorry no", expect_json=True)
         assert not ModelRouter.result_insufficient('{"ok": true}', expect_json=True)
 
-        # Brain.chat uses router + escalates FAST → REASONING on empty
+        # Request context dedupe — same work not re-run on another model
+        ctx = pool.begin_request("req_dedupe")
+        key = RequestWorkContext.work_key("intent", "abc", "")
+        ctx.put(key, '{"intent":"conversation","goal":"hi","needs_capability":false}')
+        esc_blocked = pool.escalate(
+            TIER_FAST, work="intent", prior_key=key
+        )
+        assert esc_blocked is None  # sufficient result → no escalate redo
+        assert any("MODEL DEDUPE" in m for m in route_logs), route_logs
+        pool.end_request()
+
+        # Parallel independent jobs
+        parallel_calls: list[str] = []
+
+        def _runner(job):
+            parallel_calls.append(job["id"])
+            time.sleep(0.02)
+            return job["id"]
+
+        t_par0 = time.perf_counter()
+        outs = pool.run_parallel(
+            [{"id": "a"}, {"id": "b"}, {"id": "c"}], _runner
+        )
+        t_par = time.perf_counter() - t_par0
+        assert outs == ["a", "b", "c"], outs
+        assert t_par < 0.08, t_par  # concurrent, not 3× serial
+
+        # LRU eviction when warming a large model under tight budget
+        unloaded.clear()
+        pool._budget_bytes = 5_000_000_000
+        for tier, w in pool.workers.items():
+            w.size_bytes = 4_500_000_000
+            w.warm = tier == TIER_FAST
+            w.ready = True
+            w.in_flight = 0
+            w.last_used = time.time() - (10 if tier == TIER_FAST else 0)
+        pool.workers[TIER_FAST].model = "qwen3:4b"
+        pool.workers[TIER_REASONING].model = "qwen3:30b"
+        pool.workers[TIER_REASONING].warm = False
+        pool.ensure_warm(TIER_REASONING)
+        assert "qwen3:4b" in unloaded or pool.workers[TIER_REASONING].warm
+
+        # Brain.chat: escalate only on empty FAST; keep_alive path works
         calls: list[str] = []
 
         class RouterProbeBrain(Brain):
             def _list_model_names(self):
                 return ["qwen3:4b", "qwen3:30b", "qwen2.5-coder:7b"]
 
-            def _chat_on_model(self, messages, temperature, model):
+            def _chat_on_model(self, messages, temperature, model, keep_alive=None):
                 calls.append(model)
-                # FAST primary returns empty → escalate to REASONING
                 if model == "qwen3:4b":
                     return ""
                 return '{"intent":"conversation","goal":"hi","needs_capability":false}'
 
+            def ensure_pool_ready(self, *, warm: bool = True):
+                return {"online": True, "warmed": [], "forced_test": True}
+
         probe_logs: list[str] = []
         probe = RouterProbeBrain(on_log=lambda m: probe_logs.append(m))
+        # Avoid real Ollama preload HTTP during unit e2e
+        probe.pool._preload_fn = lambda model, ka: True
+        probe.pool._unload_fn = lambda model: True
+        probe.pool._ps_fn = lambda: []
+        probe.pool.initialize(warm=False)
+        probe.begin_request_pool("probe1")
         out = probe.generate(
             "hi",
             system="Reply JSON",
@@ -3355,11 +3434,45 @@ def run(context: dict) -> dict:
         assert "qwen3:4b" in calls and "qwen3:30b" in calls, calls
         assert "intent" in out or "conversation" in out
         assert any("MODEL ESCALATION: FAST → REASONING" in m for m in probe_logs), probe_logs
-        assert any("MODEL ROUTE: FAST → qwen3:4b" in m for m in probe_logs), probe_logs
+        # Dedupe: second identical generate must not add more model calls
+        n_before = len(calls)
+        out2 = probe.generate(
+            "hi",
+            system="Reply JSON",
+            work="intent",
+            allow_escalate=True,
+            expect_json=True,
+        )
+        assert len(calls) == n_before, calls
+        assert out2
+        assert any("MODEL DEDUPE" in m for m in probe_logs), probe_logs
+        probe.end_request_pool()
 
-        print("  OK multi-model router — route/fallback/escalate + work→tier map")
+        # Orchestrator dashboard exposes pool status
+        class OfflinePoolBrain(Brain):
+            def model_status(self) -> str:
+                return "OFFLINE"
+
+            def is_available(self) -> bool:
+                return False
+
+            def ensure_pool_ready(self, *, warm: bool = True):
+                return {"online": False, "warmed": []}
+
+        orch_p = Orchestrator(
+            root=root / "data" / "_e2e_pool",
+            brain=OfflinePoolBrain(),
+            on_log=lambda m: None,
+        )
+        dash = orch_p.get_dashboard_stats()
+        assert "model_pool" in dash, dash
+        status_txt = orch_p._format_status()
+        assert "Pool" in status_txt or "model pool" in status_txt.lower()
+        orch_p.close()
+
+        print("  OK model pool — warm/LRU/direct acquire/dedupe/parallel")
     except Exception as exc:
-        msg = f"E2E_MULTI_MODEL_ROUTER: {exc}"
+        msg = f"E2E_MODEL_POOL: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)

@@ -95,7 +95,7 @@ class Orchestrator:
 
         db = self.data_dir / "jarvis.db"
         self.brain = brain or Brain(on_log=self._log)
-        # Multi-model route logs (MODEL ROUTE / FALLBACK / ESCALATION) → cycle log
+        # Multi-model pool logs (ROUTE / WARM / FALLBACK / ESCALATION) → cycle log
         if hasattr(self.brain, "set_logger"):
             self.brain.set_logger(self._log)
         self.memory = Memory(db)
@@ -108,6 +108,27 @@ class Orchestrator:
             self.brain.timeout = float(self.calibration.params.chat_timeout_sec)
         except Exception:
             pass
+        # Concurrent persistent model pool — warm workers that fit GPU/RAM.
+        # Test doubles (Brain subclasses) skip warm unless they opt in via
+        # pool_warm_on_boot=True (avoids multi-minute Ollama preloads in e2e).
+        self._pool_report: dict[str, Any] = {}
+        if hasattr(self.brain, "ensure_pool_ready"):
+            try:
+                warm_boot = bool(
+                    getattr(self.brain, "pool_warm_on_boot", type(self.brain) is Brain)
+                )
+                self._pool_report = (
+                    self.brain.ensure_pool_ready(warm=warm_boot) or {}
+                )
+                warmed = self._pool_report.get("warmed") or []
+                self._log(
+                    f"MODEL POOL: boot online={self._pool_report.get('online')} "
+                    f"warm={warm_boot} warmed={len(warmed)} "
+                    f"budget_GiB="
+                    f"{(self._pool_report.get('budget_bytes') or 0) // (1024**3)}"
+                )
+            except Exception as exc:
+                self._log(f"MODEL POOL: boot warm skipped ({exc})")
         self.research = ResearchSystem(
             brain=self.brain,
             on_log=self._log,
@@ -157,6 +178,12 @@ class Orchestrator:
         self._request_cache = {}
         self.perf = PerfTracker(request_id)
         set_active_tracker(self.perf)
+        # Pool request context: collect results + dedupe same work across models
+        if hasattr(self.brain, "begin_request_pool"):
+            try:
+                self.brain.begin_request_pool(request_id)
+            except Exception:
+                pass
         self.memory.add_message(
             "user", text, meta={"request_id": request_id, "phase": "received"}
         )
@@ -430,6 +457,13 @@ class Orchestrator:
             self._active_request_id = None
             set_active_tracker(None)
             self._request_cache = {}
+            if hasattr(self.brain, "end_request_pool"):
+                try:
+                    pool_ctx = self.brain.end_request_pool()
+                    if pool_ctx and pool_ctx.get("result_keys"):
+                        out["pool_results"] = pool_ctx
+                except Exception:
+                    pass
         return out
 
     def run_learning_cycle(
@@ -3505,8 +3539,21 @@ class Orchestrator:
         if hasattr(self.brain, "model_catalog_summary"):
             catalog = f"\nModels — {self.brain.model_catalog_summary()}"
         cal = self.calibration.status()
+        pool_line = ""
+        if hasattr(self.brain, "router") and hasattr(self.brain.router, "status_detail"):
+            try:
+                detail = self.brain.router.status_detail()
+                warm = [
+                    f"{t}:{'♨' if inf.get('warm') else ('✓' if inf.get('ready') else '·')}"
+                    for t, inf in (detail.get("tiers") or {}).items()
+                ]
+                pool_line = f"\nPool — {' '.join(warm)} budget_GiB=" + str(
+                    (detail.get("budget_bytes") or 0) // (1024**3)
+                )
+            except Exception:
+                pool_line = ""
         return (
-            f"Brain (Ollama multi-model): {brain}{catalog}\n"
+            f"Brain (Ollama model pool): {brain}{catalog}{pool_line}\n"
             f"Memory — conv:{mem['conversations']} exp:{mem['experiences']} "
             f"ok:{mem['successes']} facts:{mem['facts']} "
             f"fail:{mem.get('learning_failures', 0)} "
@@ -3557,6 +3604,12 @@ class Orchestrator:
             "model": self.brain.model,
             "model_catalog": catalog,
             "model_tiers": detail.get("tiers") or {},
+            "model_pool": {
+                "initialized": detail.get("initialized"),
+                "budget_bytes": detail.get("budget_bytes"),
+                "loaded": detail.get("loaded") or [],
+                "tiers": detail.get("tiers") or {},
+            },
             "skill_list": self.registry.list_skills(),
             "calibration": self.calibration.status(),
         }
@@ -3576,6 +3629,11 @@ class Orchestrator:
 
     def close(self) -> None:
         set_active_tracker(None)
+        try:
+            if hasattr(self.brain, "pool") and hasattr(self.brain.pool, "close"):
+                self.brain.pool.close()
+        except Exception:
+            pass
         self.memory.close()
         self.ledger.close()
         self.registry.close()
