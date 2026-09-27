@@ -35,13 +35,21 @@ class ResearchSystem:
         self,
         brain: Any = None,
         on_log: Optional[Callable[[str], None]] = None,
+        on_event: Optional[Callable[[str, dict], None]] = None,
         timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
         self.brain = brain
         self.on_log = on_log or (lambda _m: None)
+        self.on_event = on_event or (lambda _k, _p: None)
         self.timeout = timeout
         # May be overwritten by AutoCalibration via orchestrator
         self.max_open_sources = MAX_QUERIES_LEARNING + 1  # default 4-ish
+
+    def _emit(self, stage: str, **payload: Any) -> None:
+        try:
+            self.on_event("research", {"stage": stage, **payload})
+        except Exception:
+            pass
 
     def research(
         self,
@@ -88,6 +96,13 @@ class ResearchSystem:
             f"RESEARCH: starting ({len(queries)} queries) mode={mode_key} "
             f"network={network} brain={brain_ok}"
         )
+        self._emit(
+            "start",
+            queries=list(queries[:limit]),
+            goal=goal or "",
+            mode=mode_key,
+            network=network,
+        )
         gathered_parts: list[str] = []
         results: list[dict[str, Any]] = []
 
@@ -128,6 +143,7 @@ class ResearchSystem:
             self.on_log(f"SEARCH: starting ({len(query_list)} queries) mode={mode_key}")
             for q in query_list:
                 self.on_log(f"SEARCH: query → {q}")
+                self._emit("search", query=q, mode=mode_key)
 
             def _search_one(q: str) -> list[dict[str, Any]]:
                 local_results: list[dict[str, Any]] = []
@@ -164,6 +180,12 @@ class ResearchSystem:
                     f"SOURCE FOUND: {(h.get('title') or '')[:80]} | "
                     f"{(h.get('url') or '')[:120]}"
                 )
+                self._emit(
+                    "source",
+                    title=str(h.get("title") or "")[:120],
+                    url=str(h.get("url") or "")[:240],
+                    query=str(h.get("query") or ""),
+                )
 
             results.extend(search_hits)
 
@@ -184,6 +206,19 @@ class ResearchSystem:
                 max_open=open_n,
             )
             opened = True
+            for ext in extracts[:8]:
+                if not isinstance(ext, dict):
+                    continue
+                self._emit(
+                    "extract",
+                    title=str(ext.get("title") or "")[:120],
+                    url=str(ext.get("url") or "")[:240],
+                    chars=ext.get("char_count"),
+                    relatedness=ext.get("relatedness"),
+                    ok=bool(ext.get("ok")),
+                    preview=str(ext.get("text_preview") or ext.get("text") or "")[:500],
+                    reading=True,
+                )
             knowledge_blob = knowledge_from_extracts(
                 extracts, comparison, goal=goal_text
             )
