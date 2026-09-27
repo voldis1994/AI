@@ -1,15 +1,21 @@
 """
-JARVIS context/args builder — universal task → structured context.
+JARVIS context/args builder — universal TaskGoal → skill input schema.
 
+Maps the immutable USER REQUEST (TaskGoal) onto skill args.
+Does not invent defaults when values are already present in the request.
 Does not hardcode task-specific argument names (path, content, etc.).
-Ollama (or a generic offline extractor) decides the arg schema from the goal.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TYPE_CHECKING
+
+from jarvis.task_goal import TaskGoal
+
+if TYPE_CHECKING:
+    pass
 
 
 _STOP = {
@@ -17,7 +23,9 @@ _STOP = {
     "in", "on", "at", "of", "by", "is", "are", "be", "as", "it", "this",
     "that", "create", "write", "make", "build", "run", "file", "files",
     "containing", "contains", "named", "called", "please", "jarvis",
-    "izveido", "uzraksti", "failu", "ar", "saturu", "satur", "nosaukumu",
+    "text", "content", "contents", "data", "value", "values",
+    "izveido", "uzraksti", "failu", "faila", "ar", "saturu", "satur",
+    "nosaukumu", "tekstu", "teksts", "lūdzu", "ludzu",
 }
 
 
@@ -42,30 +50,64 @@ class ContextBuilder:
         prior_args: Optional[dict] = None,
         diagnosis: Optional[dict] = None,
         extra_args: Optional[dict] = None,
+        user_request: Optional[str] = None,
+        task_goal: Optional[TaskGoal] = None,
     ) -> dict[str, Any]:
         """
-        Returns full context: {goal, args, workspace, mode}.
+        Returns full context: {goal, args, workspace, mode, user_request}.
 
         Args are merged: prior → extracted → diagnosis.suggested_args →
-        offline fill for still-missing keys → extra.
+        offline fill for still-missing keys → extra, then GROUNDED against
+        the immutable USER REQUEST so invented defaults never enter the skill.
         """
+        request = (
+            (task_goal.user_request if task_goal is not None else None)
+            or user_request
+            or goal
+            or ""
+        )
+        source_goal = (task_goal.goal if task_goal is not None else None) or goal or request
+
         args: dict[str, Any] = {}
         if isinstance(prior_args, dict):
             args.update(prior_args)
 
+        # Drop invented defaults from prior before extraction
+        args = TaskGoal.ground_args(args, request)
+
         extracted = self.extract_args(
-            goal,
+            source_goal if source_goal == request else request,
             skill_meta=skill_meta,
             prior_args=args,
             diagnosis=diagnosis,
+            user_request=request,
         )
         if isinstance(extracted, dict):
-            args.update({k: v for k, v in extracted.items() if v is not None})
+            for k, v in extracted.items():
+                if v is None:
+                    continue
+                if TaskGoal.is_invented_default(v, request):
+                    continue
+                args[k] = v
 
         if diagnosis and isinstance(diagnosis.get("suggested_args"), dict):
-            args.update(
-                {k: v for k, v in diagnosis["suggested_args"].items() if v is not None}
-            )
+            for k, v in diagnosis["suggested_args"].items():
+                if v is None:
+                    continue
+                if TaskGoal.is_invented_default(v, request):
+                    self.on_log(
+                        f"CONTEXT: reject invented suggested_args[{k}]={v!r}"
+                    )
+                    continue
+                # Prefer grounded values already present in the request
+                if not TaskGoal.is_grounded(v, request) and not isinstance(
+                    v, (int, float, bool)
+                ):
+                    self.on_log(
+                        f"CONTEXT: reject ungrounded suggested_args[{k}]={v!r}"
+                    )
+                    continue
+                args[k] = v
 
         # Offline fill for keys still missing (brain may have returned {})
         needed = self._needed_keys(diagnosis, skill_meta)
@@ -75,7 +117,7 @@ class ContextBuilder:
         ]
         if still_missing or (diagnosis and not args):
             offline = self._offline_extract(
-                goal,
+                request,
                 diagnosis={
                     **(diagnosis or {}),
                     "missing_args": still_missing or list(
@@ -88,20 +130,35 @@ class ContextBuilder:
             )
             for k, v in offline.items():
                 if k not in args or args.get(k) in (None, ""):
+                    if TaskGoal.is_invented_default(v, request):
+                        continue
+                    if not TaskGoal.is_grounded(v, request) and not isinstance(
+                        v, (int, float, bool)
+                    ):
+                        continue
                     args[k] = v
 
         if isinstance(extra_args, dict):
-            args.update({k: v for k, v in extra_args.items() if v is not None})
+            for k, v in extra_args.items():
+                if v is None:
+                    continue
+                if TaskGoal.is_invented_default(v, request):
+                    continue
+                args[k] = v
+
+        # Final grounding pass — never pass invented defaults to the skill
+        args = TaskGoal.ground_args(args, request)
 
         context = {
-            "goal": goal,
+            "goal": source_goal,
+            "user_request": request,
             "args": args,
             "workspace": str(workspace),
             "mode": mode,
         }
         self.on_log(
             f"CONTEXT: mode={mode} args_keys={list(args.keys())} "
-            f"arg_count={len(args)}"
+            f"arg_count={len(args)} grounded_to_request=True"
         )
         return context
 
@@ -111,21 +168,26 @@ class ContextBuilder:
         skill_meta: Optional[dict] = None,
         prior_args: Optional[dict] = None,
         diagnosis: Optional[dict] = None,
+        user_request: Optional[str] = None,
     ) -> dict[str, Any]:
         """Universal arg extraction — brain when available, else generic offline."""
+        request = user_request or goal
         if self.brain is not None and getattr(self.brain, "is_available", lambda: False)():
             try:
                 result = self.brain.extract_task_args(
-                    goal,
+                    request,
                     skill_meta=skill_meta,
                     prior_args=prior_args,
                     diagnosis=diagnosis,
                 )
                 if isinstance(result, dict) and result:
-                    return result
+                    return TaskGoal.ground_args(result, request)
             except Exception as exc:
                 self.on_log(f"CONTEXT: brain extract failed ({exc}); offline fallback")
-        return self._offline_extract(goal, diagnosis=diagnosis)
+        return TaskGoal.ground_args(
+            self._offline_extract(request, diagnosis=diagnosis),
+            request,
+        )
 
     @staticmethod
     def _needed_keys(
@@ -310,11 +372,22 @@ class ContextBuilder:
         diagnosis: dict[str, Any],
         observation: dict[str, Any],
         goal: str,
+        user_request: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Ensure diagnosis carries missing_args / suggested_args when the
-        fault is (or looks like) context/args preparation.
+        fault is (or looks like) context mapping from TaskGoal → skill args.
+
+        Layers (canonical): goal_parsing | context_mapping | skill_code |
+        execution | environment | verifier. Legacy aliases are normalized.
         """
+        request = (
+            user_request
+            or (observation.get("context") or {}).get("user_request")
+            or observation.get("user_request")
+            or goal
+            or ""
+        )
         err = str(
             observation.get("exception")
             or observation.get("error")
@@ -338,22 +411,40 @@ class ContextBuilder:
                     req.append(name)
             diagnosis["required_args"] = req
 
+        invented_in_args = [
+            f"{k}={v!r}"
+            for k, v in ctx_args.items()
+            if TaskGoal.is_invented_default(v, request)
+            or (
+                isinstance(v, str)
+                and v
+                and not TaskGoal.is_grounded(v, request)
+                and not isinstance(v, (int, float, bool))
+            )
+        ]
+        # Ungrounded string args are mapping faults — drop them from suggestions
         empty_or_partial = (not ctx_args) or bool(missing and any(
             m not in ctx_args or ctx_args.get(m) in (None, "") for m in missing
-        ))
+        )) or bool(invented_in_args)
         err_l = err.lower()
         phase = str(observation.get("phase") or "").upper()
-        # VERIFY goal-mismatch / defaults are skill faults — do not reclassify
-        # as context_args just because the reason text contains "missing".
-        verify_goal_fault = phase == "VERIFY" and any(
+
+        # Skill used defaults / wrong artifacts while args were grounded → skill_code
+        skill_default_fault = phase == "VERIFY" and any(
             tok in err_l
             for tok in (
                 "default", "placeholder", "untrusted", "reject_defaults",
-                "claim_aligns", "user request", "user constraints",
-                "not in user",
+                "claim_aligns",
             )
+        ) and not invented_in_args
+
+        # Constraints could not be derived from the request at all
+        no_constraints = phase == "VERIFY" and (
+            "no user-derived constraints" in err_l
+            or "user constraints" in err_l and "refusing" in err_l
         )
-        args_signal = bool(parsed) or (
+
+        args_signal = bool(parsed) or bool(invented_in_args) or (
             any(
                 tok in err_l
                 for tok in ("argument", "args", "required", "keyerror")
@@ -364,31 +455,96 @@ class ContextBuilder:
                 and "user constraints" not in err_l
             )
         )
-        if empty_or_partial and args_signal and not verify_goal_fault:
-            diagnosis["fault_layer"] = "context_args"
+
+        # Normalize any legacy layer the brain may have returned
+        layer_now = TaskGoal.normalize_fault_layer(
+            diagnosis.get("fault_layer") or "skill_code"
+        )
+
+        if no_constraints and not ctx_args:
+            diagnosis["fault_layer"] = "goal_parsing"
+            diagnosis["rewrite_skill"] = False
+            if not diagnosis.get("approach") or diagnosis.get("approach") in (
+                "", "initial",
+            ):
+                diagnosis["approach"] = "goal_parsing_repair"
+            if not diagnosis.get("what_to_change"):
+                diagnosis["what_to_change"] = (
+                    "Re-parse immutable TaskGoal / USER REQUEST into constraints"
+                )
+        elif empty_or_partial and args_signal and not skill_default_fault:
+            diagnosis["fault_layer"] = "context_mapping"
             diagnosis["rewrite_skill"] = False
             if not diagnosis.get("approach") or diagnosis.get("approach") in (
                 "",
                 "initial",
+                "context_args_prep",
             ):
-                diagnosis["approach"] = "context_args_prep"
+                diagnosis["approach"] = "context_mapping"
             if not diagnosis.get("what_to_change"):
                 diagnosis["what_to_change"] = (
-                    "Prepare structured context['args'] from the user goal and retest"
+                    "Map TaskGoal → skill args from USER REQUEST "
+                    "(no invented defaults) and retest"
                 )
-        elif verify_goal_fault:
+        elif skill_default_fault:
             diagnosis["fault_layer"] = "skill_code"
             diagnosis["rewrite_skill"] = True
+        else:
+            # Keep brain/offline layer but normalize aliases + rewrite gate
+            diagnosis["fault_layer"] = layer_now
+            diagnosis["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(layer_now)
+
+        # Enforce rewrite_skill ONLY for skill_code
+        diagnosis["fault_layer"] = TaskGoal.normalize_fault_layer(
+            diagnosis.get("fault_layer")
+        )
+        diagnosis["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(
+            diagnosis["fault_layer"]
+        ) and bool(
+            diagnosis.get("rewrite_skill", True)
+            if diagnosis["fault_layer"] == "skill_code"
+            else False
+        )
+        if diagnosis["fault_layer"] == "skill_code":
+            diagnosis["rewrite_skill"] = True
+        else:
+            diagnosis["rewrite_skill"] = False
 
         suggested = dict(diagnosis.get("suggested_args") or {})
-        if diagnosis.get("fault_layer") == "context_args" or missing:
-            filled = cls._offline_extract(goal, diagnosis=diagnosis)
+        # Strip invented / ungrounded suggestions
+        suggested = {
+            k: v for k, v in suggested.items()
+            if v not in (None, "")
+            and not TaskGoal.is_invented_default(v, request)
+            and (
+                TaskGoal.is_grounded(v, request)
+                or isinstance(v, (int, float, bool))
+            )
+        }
+        if diagnosis.get("fault_layer") in (
+            "context_mapping", "goal_parsing", "context_args"
+        ) or missing:
+            filled = cls._offline_extract(request, diagnosis=diagnosis)
             for k, v in filled.items():
+                if TaskGoal.is_invented_default(v, request):
+                    continue
+                if not TaskGoal.is_grounded(v, request) and not isinstance(
+                    v, (int, float, bool)
+                ):
+                    continue
                 if k not in suggested or suggested.get(k) in (None, ""):
                     suggested[k] = v
-            # Prefer values already present in context when valid
+            # Prefer grounded values already present in context
             for k, v in ctx_args.items():
-                if v not in (None, "") and (k not in suggested or suggested.get(k) in (None, "")):
+                if v in (None, ""):
+                    continue
+                if TaskGoal.is_invented_default(v, request):
+                    continue
+                if not TaskGoal.is_grounded(v, request) and not isinstance(
+                    v, (int, float, bool)
+                ):
+                    continue
+                if k not in suggested or suggested.get(k) in (None, ""):
                     suggested[k] = v
-        diagnosis["suggested_args"] = suggested
+        diagnosis["suggested_args"] = TaskGoal.ground_args(suggested, request)
         return diagnosis

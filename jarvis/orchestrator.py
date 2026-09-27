@@ -28,10 +28,24 @@ from jarvis.verifier import Verifier
 from jarvis.skill_loader import SkillLoader
 from jarvis.observer import Observer
 from jarvis.context_builder import ContextBuilder
+from jarvis.task_goal import TaskGoal
 
 logger = logging.getLogger("jarvis.orchestrator")
 
 MAX_REPAIR_ATTEMPTS = 5
+
+# Layers that must NEVER trigger a skill rewrite (rewrite only for skill_code).
+_NON_REWRITE_LAYERS = frozenset({
+    "goal_parsing",
+    "context_mapping",
+    "execution",
+    "environment",
+    "verifier",
+    # legacy aliases (normalized elsewhere, kept for safety)
+    "context_args",
+    "test_harness",
+    "dependency",
+})
 
 
 class Orchestrator:
@@ -146,9 +160,20 @@ class Orchestrator:
 
     def run_cycle(self, goal: str, original_request: Optional[str] = None) -> dict[str, Any]:
         """Execute the full REQUEST→…→DONE learning/execution cycle."""
+        # Immutable TaskGoal for the whole cycle — never overwrite user_request.
+        user_request = (original_request or goal or "").strip()
+        task_goal = TaskGoal.from_request(user_request, goal=goal)
+        goal = task_goal.goal  # planner summary; VERIFY always uses task_goal
+
         task_id = self.ledger.start_task(goal)
         self._status("REQUEST")
-        self._log(f"[{task_id}] REQUEST: {goal}")
+        self._log(f"[{task_id}] REQUEST: {task_goal.user_request}")
+        self.ledger.log(
+            task_id,
+            "REQUEST",
+            "TaskGoal frozen",
+            task_goal.to_dict(),
+        )
 
         try:
             # PLAN
@@ -161,7 +186,7 @@ class Orchestrator:
             self.ledger.log(task_id, "PLAN", "Plan created", plan)
             self._log(f"[{task_id}] PLAN: {plan.get('steps')}")
 
-            # Structured args from user goal (universal — not task-hardcoded)
+            # CONTEXT: map TaskGoal → skill input schema (no invented defaults)
             task_args = {}
             if isinstance(plan.get("args"), dict):
                 task_args.update(plan["args"])
@@ -173,13 +198,16 @@ class Orchestrator:
                 diagnosis={
                     "required_args": plan.get("required_args") or [],
                 },
+                user_request=task_goal.user_request,
+                task_goal=task_goal,
             )
             task_args = dict(ctx0.get("args") or {})
+            task_goal = task_goal.with_args(task_args)
             self.ledger.log(
                 task_id,
-                "PLAN",
-                f"Prepared args keys={list(task_args.keys())}",
-                {"args": task_args},
+                "CONTEXT",
+                f"Mapped TaskGoal → args keys={list(task_args.keys())}",
+                {"args": task_args, "constraints": task_goal.constraints},
             )
 
             # CHECK CAPABILITIES
@@ -209,16 +237,19 @@ class Orchestrator:
             if matched and not plan.get("needs_new_skill"):
                 skill_record = matched[0]
                 self._log(f"[{task_id}] Reusing ACTIVE skill: {skill_record['name']}")
-                # Refresh args with skill meta hints
+                # Refresh args with skill meta hints — still grounded to TaskGoal
                 task_args = self.contexts.build(
                     goal,
                     str(self.workspace),
                     mode="execute",
                     skill_meta=skill_record,
                     prior_args=task_args,
+                    user_request=task_goal.user_request,
+                    task_goal=task_goal,
                 ).get("args") or task_args
+                task_goal = task_goal.with_args(task_args)
                 exec_result = self._execute_trusted(
-                    task_id, skill_record, goal, args=task_args
+                    task_id, skill_record, goal, args=task_args, task_goal=task_goal
                 )
                 if not exec_result.get("ok"):
                     # Mark broken and fall through to repair/learn
@@ -232,20 +263,24 @@ class Orchestrator:
                     self._log(
                         f"[{task_id}] Skill broken — entering repair/learn path"
                     )
-                    skill_record, task_args = self._learn_or_repair(
-                        task_id, goal, plan, repair_of=skill_record, task_args=task_args
+                    skill_record, task_args, task_goal = self._learn_or_repair(
+                        task_id, goal, plan, repair_of=skill_record,
+                        task_args=task_args, task_goal=task_goal,
                     )
                     if skill_record and skill_record["status"] == "ACTIVE":
                         exec_result = self._execute_trusted(
-                            task_id, skill_record, goal, args=task_args
+                            task_id, skill_record, goal,
+                            args=task_args, task_goal=task_goal,
                         )
             else:
-                skill_record, task_args = self._learn_or_repair(
-                    task_id, goal, plan, repair_of=None, task_args=task_args
+                skill_record, task_args, task_goal = self._learn_or_repair(
+                    task_id, goal, plan, repair_of=None,
+                    task_args=task_args, task_goal=task_goal,
                 )
                 if skill_record and skill_record["status"] == "ACTIVE":
                     exec_result = self._execute_trusted(
-                        task_id, skill_record, goal, args=task_args
+                        task_id, skill_record, goal,
+                        args=task_args, task_goal=task_goal,
                     )
 
             # VERIFY final execution against USER REQUEST — not skill self-proof
@@ -277,7 +312,9 @@ class Orchestrator:
                 exec_result,
                 require_brain_confirm=False,
                 args=task_args,
-                user_request=original_request or goal,
+                user_request=task_goal.user_request,
+                constraints=task_goal.with_args(task_args).constraints,
+                task_goal=task_goal,
             )
             self.ledger.log(
                 task_id,
@@ -287,6 +324,7 @@ class Orchestrator:
                     "skill_result": verification.get("skill_result"),
                     "verifier_result": verification.get("verifier_result"),
                     "args": task_args,
+                    "task_goal": task_goal.to_dict(),
                 },
             )
             self._log(
@@ -312,20 +350,22 @@ class Orchestrator:
                         },
                     )
                 self._log(
-                    f"[{task_id}] VERIFY FAIL vs USER REQUEST — "
+                    f"[{task_id}] VERIFY FAIL vs TaskGoal — "
                     f"entering OBSERVE→DIAGNOSE→REPAIR→RETEST"
                 )
-                skill_record, task_args = self._learn_or_repair(
+                skill_record, task_args, task_goal = self._learn_or_repair(
                     task_id,
                     goal,
                     plan,
                     repair_of=skill_record,
                     task_args=task_args,
                     verify_failure=verification,
+                    task_goal=task_goal,
                 )
                 if skill_record and skill_record.get("status") == "ACTIVE":
                     exec_result = self._execute_trusted(
-                        task_id, skill_record, goal, args=task_args
+                        task_id, skill_record, goal,
+                        args=task_args, task_goal=task_goal,
                     )
                     self._status("VERIFY")
                     verification = self.verifier.verify(
@@ -333,7 +373,9 @@ class Orchestrator:
                         exec_result,
                         require_brain_confirm=False,
                         args=task_args,
-                        user_request=original_request or goal,
+                        user_request=task_goal.user_request,
+                        constraints=task_goal.with_args(task_args).constraints,
+                        task_goal=task_goal,
                     )
                     self.ledger.log(
                         task_id,
@@ -343,6 +385,7 @@ class Orchestrator:
                             "skill_result": verification.get("skill_result"),
                             "verifier_result": verification.get("verifier_result"),
                             "args": task_args,
+                            "task_goal": task_goal.to_dict(),
                             "after_repair": True,
                         },
                     )
@@ -446,14 +489,18 @@ class Orchestrator:
         repair_of: Optional[dict] = None,
         task_args: Optional[dict] = None,
         verify_failure: Optional[dict] = None,
-    ) -> tuple[Optional[dict], dict]:
+        task_goal: Optional[TaskGoal] = None,
+    ) -> tuple[Optional[dict], dict, TaskGoal]:
         """
         Universal learning loop (no task-specific hardcoding):
 
         BUILD → TEST → OBSERVE → DIAGNOSE → RESEARCH? → REPAIR → RETEST → VERIFY → ACTIVE
 
-        Returns (skill_record, task_args).
+        TaskGoal (original USER REQUEST) is immutable across the whole loop.
+        Returns (skill_record, task_args, task_goal).
         """
+        if task_goal is None:
+            task_goal = TaskGoal.from_request(goal, goal=goal)
         skill_name = (
             (repair_of or {}).get("name")
             or plan.get("skill_name")
@@ -461,9 +508,13 @@ class Orchestrator:
         )
         description = plan.get("skill_description") or goal
         version = self.registry.next_version(skill_name)
-        args: dict = dict(task_args or {})
+        args: dict = TaskGoal.ground_args(dict(task_args or {}), task_goal.user_request)
         if isinstance(plan.get("args"), dict):
-            args = ContextBuilder.merge_args(plan.get("args"), args)
+            args = TaskGoal.ground_args(
+                ContextBuilder.merge_args(plan.get("args"), args),
+                task_goal.user_request,
+            )
+        task_goal = task_goal.with_args(args)
 
         existing = self.registry.get_skill(skill_name)
         protect_active_path = None
@@ -533,6 +584,7 @@ class Orchestrator:
                 skill_code=previous_code,
                 context={
                     "goal": goal,
+                    "user_request": task_goal.user_request,
                     "args": args,
                     "workspace": str(self.workspace),
                 },
@@ -553,14 +605,18 @@ class Orchestrator:
                     approach_label=current_approach,
                     code=previous_code,
                     task_args=args,
+                    task_goal=task_goal,
                 )
             )
+            task_goal = task_goal.with_args(args)
             failed_approaches = self.memory.get_failed_approaches(skill_name)
-            layer = str(diagnosis.get("fault_layer") or "skill_code")
-            # Defaults / wrong artifact vs user request → rewrite skill
-            skip_rebuild = layer in (
-                "context_args", "test_harness", "dependency", "verifier"
-            ) and (not diagnosis.get("rewrite_skill", False))
+            layer = TaskGoal.normalize_fault_layer(
+                diagnosis.get("fault_layer") or "skill_code"
+            )
+            diagnosis["fault_layer"] = layer
+            diagnosis["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(layer)
+            # Rewrite skill ONLY when fault_layer is skill_code
+            skip_rebuild = not diagnosis.get("rewrite_skill", False)
             if existing and existing.get("status") == "ACTIVE":
                 protect_active_path = existing.get("file_path")
                 self.registry.set_status(skill_name, "REPAIRING")
@@ -571,7 +627,7 @@ class Orchestrator:
             phase_build = "REPAIR" if is_retest else "BUILD_SKILL"
             phase_test = "RETEST" if is_retest else "TEST"
 
-            # Refresh args each attempt (diagnosis may suggest new ones)
+            # Refresh args each attempt — always grounded to original TaskGoal
             args = self.contexts.build(
                 goal,
                 str(self.workspace),
@@ -579,9 +635,12 @@ class Orchestrator:
                 skill_meta={"name": skill_name, "description": description, **meta},
                 prior_args=args,
                 diagnosis=diagnosis,
+                user_request=task_goal.user_request,
+                task_goal=task_goal,
             ).get("args") or args
+            task_goal = task_goal.with_args(args)
 
-            # ── BUILD / REPAIR (skip when fault is only context_args) ───
+            # ── BUILD / REPAIR (skip unless fault_layer == skill_code) ───
             if not skip_rebuild or built is None or not built.get("ok"):
                 self._status(phase_build)
                 built = self.builder.build(
@@ -617,6 +676,7 @@ class Orchestrator:
                         skill_code=built.get("code"),
                         context={
                             "goal": goal,
+                            "user_request": task_goal.user_request,
                             "args": args,
                             "workspace": str(self.workspace),
                         },
@@ -630,10 +690,12 @@ class Orchestrator:
                             approach_label=current_approach,
                             code=built.get("code"),
                             task_args=args,
+                            task_goal=task_goal,
                         )
                     )
+                    task_goal = task_goal.with_args(args)
                     failed_approaches = self.memory.get_failed_approaches(skill_name)
-                    skip_rebuild = not diagnosis.get("rewrite_skill", True)
+                    skip_rebuild = not diagnosis.get("rewrite_skill", False)
                     continue
 
                 meta = built["meta"]
@@ -679,6 +741,7 @@ class Orchestrator:
                     skill_code=(built or {}).get("code"),
                     context={
                         "goal": goal,
+                        "user_request": task_goal.user_request,
                         "args": args,
                         "workspace": str(self.workspace),
                     },
@@ -693,10 +756,14 @@ class Orchestrator:
                         approach_label=current_approach,
                         code=(built or {}).get("code"),
                         task_args=args,
+                        task_goal=task_goal,
                     )
                 )
+                task_goal = task_goal.with_args(args)
                 failed_approaches = self.memory.get_failed_approaches(skill_name)
-                skip_rebuild = diagnosis.get("fault_layer") != "skill_code"
+                skip_rebuild = not TaskGoal.rewrite_skill_for_layer(
+                    diagnosis.get("fault_layer")
+                )
                 continue
 
             # ── TEST / RETEST (subprocess) with prepared args ───────────
@@ -707,6 +774,7 @@ class Orchestrator:
             self.memory.log_skill_event(skill_name, "testing", "TESTING")
             test_context = {
                 "goal": goal,
+                "user_request": task_goal.user_request,
                 "args": args,
                 "workspace": str(self.workspace),
                 "mode": "test",
@@ -742,13 +810,15 @@ class Orchestrator:
             )
             verification = None
             if not test_failed:
-                # ── VERIFY against USER REQUEST / args (not skill claims) ─
+                # ── VERIFY against original TaskGoal (not skill claims) ─
                 self._status("VERIFY")
                 verification = self.verifier.verify(
                     goal,
                     test_result,
                     args=args,
-                    user_request=goal,
+                    user_request=task_goal.user_request,
+                    constraints=task_goal.with_args(args).constraints,
+                    task_goal=task_goal,
                 )
                 self.ledger.log(
                     task_id,
@@ -758,6 +828,7 @@ class Orchestrator:
                         "skill_result": verification.get("skill_result"),
                         "verifier_result": verification.get("verifier_result"),
                         "args": args,
+                        "task_goal": task_goal.to_dict(),
                     },
                 )
                 if verification.get("verified"):
@@ -776,7 +847,7 @@ class Orchestrator:
                         diagnosis=diagnosis,
                         description=description,
                     )
-                    return skill, args
+                    return skill, args, task_goal
 
             # ── OBSERVE → DIAGNOSE → fix the correct layer ─────────────
             obs = self.observer.observe_failure(
@@ -813,15 +884,22 @@ class Orchestrator:
                     approach_label=current_approach,
                     code=(built or {}).get("code"),
                     task_args=args,
+                    task_goal=task_goal,
                 )
             )
+            task_goal = task_goal.with_args(args)
             failed_approaches = self.memory.get_failed_approaches(skill_name)
-            layer = str(diagnosis.get("fault_layer") or "skill_code")
-            # Only rewrite skill when the fault is in skill code (or unknown)
-            skip_rebuild = layer in ("context_args", "test_harness", "dependency", "verifier") and (
-                not diagnosis.get("rewrite_skill", False)
+            layer = TaskGoal.normalize_fault_layer(
+                diagnosis.get("fault_layer") or "skill_code"
             )
-            if layer == "dependency" and diagnosis.get("needs_new_deps"):
+            diagnosis["fault_layer"] = layer
+            diagnosis["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(layer)
+            # Only rewrite skill when the fault is skill_code
+            skip_rebuild = not diagnosis.get("rewrite_skill", False)
+            if layer == "environment" and diagnosis.get("needs_new_deps"):
+                self.deps.ensure(list(diagnosis["needs_new_deps"]))
+            # legacy alias
+            if layer in ("dependency",) and diagnosis.get("needs_new_deps"):
                 self.deps.ensure(list(diagnosis["needs_new_deps"]))
             # loop → REPAIR correct layer on next iteration
 
@@ -829,7 +907,7 @@ class Orchestrator:
             f"[{task_id}] Failed to produce ACTIVE skill after "
             f"{MAX_REPAIR_ATTEMPTS} repair attempts"
         )
-        return self.registry.get_skill(skill_name), args
+        return self.registry.get_skill(skill_name), args, task_goal
 
     def _do_research(
         self, task_id: str, skill_name: str, goal: str, queries: list
@@ -883,13 +961,18 @@ class Orchestrator:
         approach_label: str,
         code: Optional[str],
         task_args: Optional[dict] = None,
+        task_goal: Optional[TaskGoal] = None,
     ) -> tuple[dict, dict, str, str, Optional[str], dict]:
         """OBSERVE → DIAGNOSE → optional RESEARCH → return repair state + updated args."""
         self._status("OBSERVE")
-        # Ensure observation carries the args that were actually used
+        if task_goal is None:
+            task_goal = TaskGoal.from_request(goal, goal=goal)
+        # Ensure observation carries the args + immutable USER REQUEST
         if isinstance(observation.get("context"), dict) and task_args is not None:
             observation["context"] = dict(observation["context"])
             observation["context"]["args"] = dict(task_args)
+            observation["context"]["user_request"] = task_goal.user_request
+        observation["user_request"] = task_goal.user_request
 
         # Fingerprint this failure for adaptive mid-repair research
         observation["error_fingerprint"] = Observer.fingerprint_error(observation)
@@ -935,14 +1018,25 @@ class Orchestrator:
             )
         else:
             ctx_args = (observation.get("context") or {}).get("args") or {}
+            if not isinstance(ctx_args, dict):
+                ctx_args = {}
             empty_args = not ctx_args
+            invented = any(
+                TaskGoal.is_invented_default(v, task_goal.user_request)
+                for v in ctx_args.values()
+            )
             err = str(observation.get("exception") or "")
             err_l = err.lower()
             phase = str(observation.get("phase") or "").upper()
             parsed_missing = ContextBuilder.parse_missing_arg_names(err)
-            args_fault = (empty_args or bool(parsed_missing)) and any(
+            args_fault = (
+                empty_args or bool(parsed_missing) or invented
+            ) and any(
                 t in err_l
-                for t in ("argument", "args", "missing", "required", "keyerror")
+                for t in (
+                    "argument", "args", "missing", "required", "keyerror",
+                    "default", "untrusted", "claim_aligns", "user_provided",
+                )
             )
             goal_mismatch = phase == "VERIFY" and any(
                 t in err_l
@@ -951,25 +1045,44 @@ class Orchestrator:
                     "not in user", "user constraints", "user request",
                     "reject_defaults", "missing from expected",
                 )
+            ) and not invented and not empty_args
+            no_constraints = phase == "VERIFY" and "no user-derived constraints" in err_l
+            env_fault = any(
+                t in err_l for t in ("modulenotfound", "no module named", "importerror")
             )
-            if goal_mismatch:
+            if no_constraints and empty_args:
+                layer = "goal_parsing"
+                rewrite = False
+                approach = "goal_parsing_repair"
+                change = "Re-parse immutable TaskGoal / USER REQUEST into constraints"
+            elif args_fault and not goal_mismatch:
+                layer = "context_mapping"
+                rewrite = False
+                approach = "context_mapping"
+                change = (
+                    "Map TaskGoal → skill args from USER REQUEST "
+                    "(no invented defaults)"
+                )
+            elif env_fault:
+                layer = "environment"
+                rewrite = False
+                approach = "fix_environment"
+                change = "Install / fix missing dependencies"
+            elif goal_mismatch:
                 layer = "skill_code"
                 rewrite = True
                 approach = "honor_user_request"
                 change = (
-                    "Rewrite skill to satisfy USER REQUEST "
+                    "Rewrite skill to satisfy original TaskGoal "
                     "(no default/placeholder artifacts)"
                 )
-            elif args_fault:
-                layer = "context_args"
-                rewrite = False
-                approach = "context_args_prep"
-                change = "Prepare structured context args from the user goal"
             else:
                 layer = "skill_code"
                 rewrite = True
                 approach = f"offline_alt_v{int(observation.get('version') or 0) + 1}"
                 change = "Rebuild with a different strategy using observation data"
+            layer = TaskGoal.normalize_fault_layer(layer)
+            rewrite = TaskGoal.rewrite_skill_for_layer(layer)
             diagnosis = {
                 "root_cause": str(observation.get("exception") or "unknown")[:500],
                 "fault_layer": layer,
@@ -991,8 +1104,8 @@ class Orchestrator:
                 "required_args": list(parsed_missing),
                 "suggested_args": {},
                 "test_plan": (
-                    "subprocess retest with prepared args; "
-                    "VERIFY against USER REQUEST (reject defaults)"
+                    "subprocess retest with grounded args; "
+                    "VERIFY against original TaskGoal (reject defaults)"
                 ),
                 "expected_artifacts": [],
                 "is_unfixable": False,
@@ -1002,22 +1115,23 @@ class Orchestrator:
                 diagnosis["approach"]
             )
 
-        # Universal enrichment: parse missing arg names + suggest values from goal
-        diagnosis = ContextBuilder.enrich_diagnosis_args(diagnosis, observation, goal)
-        # Keep VERIFY goal-mismatch as skill_code even if args enrichment runs
-        if (
-            str(observation.get("phase") or "").upper() == "VERIFY"
-            and "default" in str(observation.get("exception") or "").lower()
-        ):
-            diagnosis["fault_layer"] = "skill_code"
-            diagnosis["rewrite_skill"] = True
+        # Universal enrichment: parse missing arg names + suggest values from TaskGoal
+        diagnosis = ContextBuilder.enrich_diagnosis_args(
+            diagnosis, observation, goal, user_request=task_goal.user_request
+        )
+        diagnosis["fault_layer"] = TaskGoal.normalize_fault_layer(
+            diagnosis.get("fault_layer")
+        )
+        diagnosis["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(
+            diagnosis["fault_layer"]
+        )
 
         # If diagnosis repeats a failed approach fingerprint — force divergence
-        # (but do not force-rewrite context_args_prep — args repair is the fix)
+        # (but never force-rewrite context_mapping / non-skill layers)
         failed_fps = {a.get("approach_fingerprint") for a in failed}
         if (
             diagnosis.get("approach_fingerprint") in failed_fps
-            and diagnosis.get("fault_layer") != "context_args"
+            and diagnosis.get("fault_layer") == "skill_code"
         ):
             diagnosis["approach"] = (
                 f"{diagnosis.get('approach')}::changed::{observation.get('version')}"
@@ -1027,15 +1141,19 @@ class Orchestrator:
             )
             diagnosis["approach_changed"] = True
 
-        # Rebuild args when fault is context_args (or suggested_args provided)
-        new_args = dict(task_args or {})
-        if diagnosis.get("fault_layer") == "context_args" or diagnosis.get("suggested_args"):
+        # Rebuild args when fault is context_mapping / goal_parsing (or suggestions)
+        new_args = TaskGoal.ground_args(dict(task_args or {}), task_goal.user_request)
+        if diagnosis.get("fault_layer") in (
+            "context_mapping", "goal_parsing", "context_args"
+        ) or diagnosis.get("suggested_args"):
             new_args = self.contexts.build(
                 goal,
                 str(self.workspace),
                 mode="test",
                 prior_args=new_args,
                 diagnosis=diagnosis,
+                user_request=task_goal.user_request,
+                task_goal=task_goal,
             ).get("args") or new_args
             self._log(
                 f"[{task_id}] CONTEXT repair: args_keys={list(new_args.keys())} "
@@ -1092,12 +1210,13 @@ class Orchestrator:
         layer_now = str(diagnosis.get("fault_layer") or "")
 
         force_research = repeated_error or (
-            diagnosis.get("needs_research") and layer_now != "context_args"
+            diagnosis.get("needs_research")
+            and layer_now not in ("context_mapping", "context_args", "goal_parsing")
         ) or (
             many_failed_approaches and layer_now == "skill_code"
         )
-        # Pure first-time context_args prep does not need web research
-        if layer_now == "context_args" and not repeated_error:
+        # Pure first-time context mapping does not need web research
+        if layer_now in ("context_mapping", "context_args", "goal_parsing") and not repeated_error:
             force_research = False
 
         if force_research:
@@ -1374,16 +1493,21 @@ class Orchestrator:
         skill: dict,
         goal: str,
         args: Optional[dict] = None,
+        task_goal: Optional[TaskGoal] = None,
     ) -> dict:
         self._status("EXECUTE")
-        exec_args = dict(args or {})
-        # Refresh from goal + skill meta so EXECUTE gets the same structured args as TEST
+        if task_goal is None:
+            task_goal = TaskGoal.from_request(goal, goal=goal)
+        exec_args = TaskGoal.ground_args(dict(args or {}), task_goal.user_request)
+        # Refresh from TaskGoal + skill meta so EXECUTE matches TEST args
         exec_args = self.contexts.build(
             goal,
             str(self.workspace),
             mode="execute",
             skill_meta=skill,
             prior_args=exec_args,
+            user_request=task_goal.user_request,
+            task_goal=task_goal,
         ).get("args") or exec_args
         self._log(
             f"[{task_id}] EXECUTE: {skill['name']} args_keys={list(exec_args.keys())}"

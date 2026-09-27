@@ -481,7 +481,7 @@ class Brain:
             "Reply ONLY with JSON:\n"
             "{\n"
             '  "root_cause": "...",\n'
-            '  "fault_layer": "skill_code"|"context_args"|"test_harness"|"dependency"|"verifier",\n'
+            '  "fault_layer": "goal_parsing"|"context_mapping"|"skill_code"|"execution"|"environment"|"verifier",\n'
             '  "rewrite_skill": true|false,\n'
             '  "what_to_change": "...",\n'
             '  "approach": "short label of the NEW strategy to try",\n'
@@ -491,24 +491,29 @@ class Brain:
             '  "needs_new_deps": ["pip-or-import-name"],\n'
             '  "missing_args": ["arg_names"],\n'
             '  "required_args": ["arg_names"],\n'
-            '  "suggested_args": {"arg": "value from goal if present"},\n'
+            '  "suggested_args": {"arg": "value from USER REQUEST if present"},\n'
             '  "test_plan": "how to validate the next version",\n'
             '  "expected_artifacts": ["what verifier should find"],\n'
             '  "is_unfixable": false,\n'
             '  "diagnosis": "one-paragraph summary"\n'
             "}\n"
             "Rules:\n"
+            "- The original USER REQUEST is an immutable TaskGoal for the whole cycle. "
+            "Never invent values that are not in the request.\n"
             "- Use exception, traceback, stdout, stderr, returncode, code, "
-            "context (especially context.args), dependencies, artifacts.\n"
-            "- If context.args is empty/missing keys the skill needs, fault_layer MUST be "
-            "context_args and rewrite_skill=false. Fill suggested_args from the goal.\n"
-            "- If VERIFY failed because the skill used default/placeholder values or created "
-            "artifacts that do not match the USER REQUEST / goal constraints, fault_layer MUST "
-            "be skill_code and rewrite_skill=true — the skill must implement the real request.\n"
-            "- Only set fault_layer=verifier when the verifier harness itself is wrong "
-            "(not when the skill output simply fails user constraints).\n"
-            "- dependency: import/install failures. "
-            "test_harness: runner did not pass context correctly.\n"
+            "context (especially context.args + context.user_request), dependencies, artifacts.\n"
+            "- goal_parsing: cannot derive constraints from the USER REQUEST.\n"
+            "- context_mapping: context.args empty/missing keys, OR args contain invented "
+            "defaults / values not grounded in the USER REQUEST. rewrite_skill=false. "
+            "Fill suggested_args ONLY from values present in the request.\n"
+            "- skill_code: skill logic wrong; used defaults; created artifacts that do not "
+            "match TaskGoal. rewrite_skill=true ONLY for this layer.\n"
+            "- execution: subprocess/runner/harness failed to pass context or crashed.\n"
+            "- environment: import/install/dependency failures.\n"
+            "- verifier: verifier harness itself is wrong (not when skill output fails "
+            "user constraints).\n"
+            "- Legacy aliases context_args→context_mapping, test_harness→execution, "
+            "dependency→environment are accepted but prefer canonical names.\n"
             "- If the same approach already failed, set approach_changed=true "
             "and propose a meaningfully different approach.\n"
             "- If the same/similar error repeats (prior_approaches or repeated VERIFY/"
@@ -538,15 +543,38 @@ class Brain:
             system=system,
             temperature=0.25,
         )
+        from jarvis.task_goal import TaskGoal
+        from jarvis.context_builder import ContextBuilder
+
         ctx = observation.get("context") or {}
         ctx_args = ctx.get("args") if isinstance(ctx, dict) else {}
-        empty_args = not isinstance(ctx_args, dict) or len(ctx_args) == 0
+        if not isinstance(ctx_args, dict):
+            ctx_args = {}
+        request = str(
+            (ctx.get("user_request") if isinstance(ctx, dict) else None)
+            or observation.get("user_request")
+            or observation.get("goal")
+            or ""
+        )
+        empty_args = len(ctx_args) == 0
+        invented_args = any(
+            TaskGoal.is_invented_default(v, request)
+            or (
+                isinstance(v, str)
+                and v
+                and not TaskGoal.is_grounded(v, request)
+            )
+            for v in ctx_args.values()
+        )
         err = str(observation.get("exception") or "").lower()
         phase = str(observation.get("phase") or "").upper()
-        args_fault = empty_args and any(
-            tok in err for tok in ("argument", "args", "missing", "required", "keyerror")
+        args_fault = (empty_args or invented_args) and any(
+            tok in err for tok in (
+                "argument", "args", "missing", "required", "keyerror",
+                "default", "untrusted", "claim_aligns", "user_provided",
+            )
         )
-        # VERIFY mismatch / defaults → skill must be rewritten to honor USER REQUEST
+        # VERIFY mismatch / defaults with grounded args → rewrite skill
         goal_mismatch = phase == "VERIFY" and any(
             tok in err
             for tok in (
@@ -554,34 +582,64 @@ class Brain:
                 "not in user", "user constraints", "user request",
                 "contains(", "missing from expected", "reject_defaults",
             )
+        ) and not invented_args and not empty_args
+        no_constraints = phase == "VERIFY" and "no user-derived constraints" in err
+        env_fault = any(
+            tok in err for tok in ("modulenotfound", "no module named", "importerror", "pip ")
         )
-        if args_fault and not goal_mismatch:
-            fb_layer = "context_args"
+        exec_fault = phase in ("TEST", "RETEST", "EXECUTE", "INSTALL_DEPS") and any(
+            tok in err for tok in ("timed_out", "timeout", "crash", "returncode")
+        )
+        if no_constraints and empty_args:
+            fb_layer = "goal_parsing"
+        elif args_fault and not goal_mismatch:
+            fb_layer = "context_mapping"
+        elif env_fault:
+            fb_layer = "environment"
+        elif exec_fault and not goal_mismatch:
+            fb_layer = "execution"
         elif goal_mismatch:
             fb_layer = "skill_code"
         else:
             fb_layer = "skill_code"
+        fb_layer = TaskGoal.normalize_fault_layer(fb_layer)
         fallback = {
             "root_cause": str(observation.get("exception") or "unknown")[:500],
             "fault_layer": fb_layer,
-            "rewrite_skill": fb_layer == "skill_code",
+            "rewrite_skill": TaskGoal.rewrite_skill_for_layer(fb_layer),
             "what_to_change": (
-                "Prepare structured context['args'] from the user goal and retest"
-                if fb_layer == "context_args"
+                "Map TaskGoal → skill args from USER REQUEST (no invented defaults)"
+                if fb_layer == "context_mapping"
                 else (
-                    "Rewrite skill to satisfy USER REQUEST constraints "
-                    "(no default/placeholder artifacts)"
-                    if goal_mismatch
-                    else "Revise skill logic based on stderr/traceback"
+                    "Re-parse immutable TaskGoal / USER REQUEST into constraints"
+                    if fb_layer == "goal_parsing"
+                    else (
+                        "Rewrite skill to satisfy original TaskGoal "
+                        "(no default/placeholder artifacts)"
+                        if goal_mismatch
+                        else (
+                            "Fix environment / install missing dependencies"
+                            if fb_layer == "environment"
+                            else (
+                                "Fix execution/harness context passing"
+                                if fb_layer == "execution"
+                                else "Revise skill logic based on stderr/traceback"
+                            )
+                        )
+                    )
                 )
             ),
             "approach": (
-                "context_args_prep"
-                if fb_layer == "context_args"
+                "context_mapping"
+                if fb_layer == "context_mapping"
                 else (
-                    "honor_user_request"
-                    if goal_mismatch
-                    else f"alt_approach_v{(observation.get('version') or 0) + 1}"
+                    "goal_parsing_repair"
+                    if fb_layer == "goal_parsing"
+                    else (
+                        "honor_user_request"
+                        if goal_mismatch
+                        else f"alt_approach_v{(observation.get('version') or 0) + 1}"
+                    )
                 )
             ),
             "approach_changed": True,
@@ -597,50 +655,43 @@ class Brain:
             "required_args": [],
             "suggested_args": {},
             "test_plan": (
-                "Retest with prepared args; VERIFY must match USER REQUEST "
-                "(reject defaults / skill self-proof)"
+                "Retest with grounded args from TaskGoal; VERIFY must match "
+                "original USER REQUEST (reject defaults / skill self-proof)"
             ),
             "expected_artifacts": [],
             "is_unfixable": False,
             "diagnosis": str(observation.get("exception") or "failure")[:500],
         }
         result = self._parse_json(raw, fallback)
-        # Normalize fault_layer
-        layer = str(result.get("fault_layer") or fallback["fault_layer"]).lower()
-        valid_layers = {
-            "skill_code", "context_args", "test_harness", "dependency", "verifier",
-        }
-        if layer not in valid_layers:
-            layer = fallback["fault_layer"]
+        # Normalize fault_layer (canonical + legacy aliases)
+        layer = TaskGoal.normalize_fault_layer(
+            result.get("fault_layer") or fallback["fault_layer"]
+        )
         # Force skill rewrite when VERIFY proves goal mismatch / defaults
+        # with already-grounded args (not a context mapping problem).
         if goal_mismatch:
             layer = "skill_code"
-            result["rewrite_skill"] = True
         result["fault_layer"] = layer
-        if "rewrite_skill" not in result:
-            result["rewrite_skill"] = layer == "skill_code"
-        if layer == "context_args":
-            result["rewrite_skill"] = False
+        result["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(layer)
         if not isinstance(result.get("suggested_args"), dict):
             result["suggested_args"] = {}
         if not isinstance(result.get("missing_args"), list):
             result["missing_args"] = list(result.get("required_args") or [])
 
-        # Enrich missing/suggested args from error + goal (universal, no hardcoding)
-        from jarvis.context_builder import ContextBuilder
-
+        # Enrich missing/suggested args from error + original request
         result = ContextBuilder.enrich_diagnosis_args(
-            result, observation, str(observation.get("goal") or "")
+            result,
+            observation,
+            str(observation.get("goal") or ""),
+            user_request=request,
         )
-        layer = str(result.get("fault_layer") or layer).lower()
-        if layer not in valid_layers:
-            layer = fallback["fault_layer"]
-        if goal_mismatch:
+        layer = TaskGoal.normalize_fault_layer(
+            result.get("fault_layer") or layer
+        )
+        if goal_mismatch and layer not in ("context_mapping", "goal_parsing"):
             layer = "skill_code"
-            result["rewrite_skill"] = True
         result["fault_layer"] = layer
-        if layer == "context_args":
-            result["rewrite_skill"] = False
+        result["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(layer)
 
         # Enforce approach change when fingerprint collided with failed list
         failed_fps = {
@@ -653,7 +704,7 @@ class Brain:
         fp = Observer.fingerprint_approach(approach)
         result["approach"] = approach
         result["approach_fingerprint"] = fp
-        if fp in failed_fps and failed_fps:
+        if fp in failed_fps and failed_fps and layer == "skill_code":
             result["approach_changed"] = True
             result["approach"] = f"{approach} | divergent-{observation.get('version')}"
             result["approach_fingerprint"] = Observer.fingerprint_approach(result["approach"])

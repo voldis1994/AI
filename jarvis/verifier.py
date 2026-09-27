@@ -17,14 +17,16 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from jarvis.context_builder import ContextBuilder
+from jarvis.task_goal import TaskGoal
 
 
 # Generic placeholder markers — not task-specific paths/content keys.
 _DEFAULT_RE = re.compile(
-    r"(?i)\b(?:default(?:[_-]?(?:path|file|name|content|value|dir|output))?|"
-    r"placeholder|changeme|your[_-]?name|todo|tbd|xxx+|dummy|sample[_-]?(?:path|file)?|"
-    r"example[_-]?(?:path|file)?|temp[_-]?file|untitled)\b"
+    r"(?i)\b(?:user[_-]?provided(?:[_-]?\w+)?|"
+    r"default(?:[_-]?(?:path|file|name|content|value|dir|output))?|"
+    r"placeholder|changeme|your[_-]?name|todo|tbd|xxx+|dummy|"
+    r"sample[_-]?(?:path|file)?|example[_-]?(?:path|file)?|"
+    r"temp[_-]?file|untitled)\b"
 )
 
 _PATH_RE = re.compile(
@@ -56,16 +58,17 @@ class Verifier:
         args: Optional[dict[str, Any]] = None,
         user_request: Optional[str] = None,
         constraints: Optional[dict[str, Any]] = None,
+        task_goal: Optional[TaskGoal] = None,
     ) -> dict[str, Any]:
         """
         Returns VERIFIER RESULT:
           verified (bool), reason, checks, skill_result (echo), verifier_result
 
-        Expectations come from USER REQUEST + structured args/constraints —
-        never from the skill's claimed result.
+        Expectations come from the immutable TaskGoal (original USER REQUEST) —
+        never from the skill's claimed result or invented defaults.
         """
         self.on_log(
-            "VERIFY: independent checks against USER REQUEST "
+            "VERIFY: independent checks against original TaskGoal / USER REQUEST "
             "(not trusting skill self-proof / defaults)"
         )
 
@@ -75,8 +78,12 @@ class Verifier:
             else skill_result
         )
         checks: list[dict[str, Any]] = []
-        request = (user_request or goal or "").strip()
-        task_args = dict(args or {})
+        if task_goal is not None:
+            request = task_goal.user_request
+        else:
+            request = (user_request or goal or "").strip()
+        # Ground args against the original request before building constraints
+        task_args = TaskGoal.ground_args(dict(args or {}), request)
 
         if sr.get("timed_out"):
             return self._fail("Skill subprocess timed out", checks, sr, [
@@ -93,9 +100,14 @@ class Verifier:
         result = sr.get("result")
         evidence = str(sr.get("evidence") or "")
 
-        # Constraints from USER side only (goal + args). Skill result is not a source.
-        built = constraints or expect or self.extract_constraints(request, task_args)
-        if expect and constraints is None and args is None:
+        # Constraints from TaskGoal / USER REQUEST only. Skill result is not a source.
+        if constraints:
+            built = constraints
+        elif task_goal is not None:
+            built = task_goal.with_args(task_args).constraints
+        else:
+            built = self.extract_constraints(request, task_args)
+        if expect and constraints is None and task_goal is None and args is None:
             # Legacy callers may pass expect — still run default/alignment guards
             built = self._normalize_expect(expect, request, task_args)
 
@@ -313,116 +325,13 @@ class Verifier:
         args: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
-        Build verification constraints from the user request + structured args.
+        Build verification constraints from the USER REQUEST + grounded args.
 
-        Does not read skill results. Does not hardcode task-specific keys —
-        values are classified by shape (path-like / url / text).
+        Delegates to TaskGoal.derive_constraints so VERIFY never invents file
+        checks from random sentence tokens. Does not read skill results.
         """
-        args = dict(args or {})
-        expect: dict[str, Any] = {
-            "files": [],
-            "directories": [],
-            "imports": [],
-            "http": [],
-            "must_contain": [],
-            "check_process": True,
-            "source": "user_request",
-        }
-
-        # Structured args → constraints (key names are whatever the planner used)
-        path_vals: list[str] = []
-        text_vals: list[str] = []
-        ambiguous: list[str] = []
-        for _key, val in args.items():
-            if val in (None, ""):
-                continue
-            sv = str(val)
-            if self._looks_like_url(sv):
-                expect["http"].append({"url": sv})
-            elif self._looks_like_path(sv):
-                path_vals.append(sv)
-            elif self._looks_like_content(sv):
-                text_vals.append(sv)
-            else:
-                ambiguous.append(sv)
-
-        # Goal/request tokens (quoted, path-like, key=value via ContextBuilder)
-        offline = ContextBuilder._offline_extract(request)
-        for _key, val in offline.items():
-            if val in (None, ""):
-                continue
-            sv = str(val)
-            if self._looks_like_url(sv):
-                expect["http"].append({"url": sv})
-            elif self._looks_like_path(sv):
-                if sv not in path_vals:
-                    path_vals.append(sv)
-            elif self._looks_like_content(sv):
-                if sv not in text_vals:
-                    text_vals.append(sv)
-            else:
-                if sv not in ambiguous and sv not in path_vals and sv not in text_vals:
-                    ambiguous.append(sv)
-
-        known_text = set(text_vals)
-        for tok in ContextBuilder.goal_value_candidates(request):
-            if self._looks_like_path(tok) and tok not in path_vals:
-                path_vals.append(tok)
-            elif self._looks_like_content(tok) and tok not in text_vals:
-                if any(tok in k for k in known_text if k != tok):
-                    continue
-                text_vals.append(tok)
-                known_text.add(tok)
-            elif (
-                not self._looks_like_path(tok)
-                and not self._looks_like_url(tok)
-                and len(tok) >= 2
-                and tok not in ambiguous
-                and tok not in path_vals
-                and tok not in text_vals
-            ):
-                if any(tok in k for k in known_text if k != tok):
-                    continue
-                ambiguous.append(tok)
-
-        # Resolve ambiguous single-token values without hardcoding key names:
-        # if clear content exists (or multiple destinations needed), treat bare
-        # identifiers as paths; otherwise as content.
-        for sv in ambiguous:
-            if self._looks_like_content(sv):
-                if sv not in text_vals:
-                    text_vals.append(sv)
-            elif text_vals and sv not in path_vals:
-                path_vals.append(sv)
-            elif not path_vals:
-                path_vals.append(sv)
-            elif sv not in text_vals:
-                text_vals.append(sv)
-
-        # Pair path + content when both present (universal: first path gets contents)
-        primary_contains = text_vals[0] if text_vals else None
-        for i, p in enumerate(path_vals):
-            entry: dict[str, Any] = {"path": p, "min_bytes": 1}
-            if i == 0 and primary_contains is not None:
-                entry["contains"] = primary_contains
-            expect["files"].append(entry)
-
-        # Extra text constraints beyond the primary paired content
-        if primary_contains is not None:
-            for extra in text_vals[1:]:
-                if len(str(extra)) >= 2:
-                    expect["must_contain"].append(str(extra))
-        elif text_vals and not path_vals:
-            expect["must_contain"].extend(str(t) for t in text_vals if len(str(t)) >= 2)
-
-        # Directory hints from request words + slash tokens without extension
-        low = request.lower()
-        if any(w in low for w in ("directory", "folder", "mapi", "katalog")):
-            for tok in re.findall(r"[A-Za-z0-9_./\\-]{2,}", request):
-                if ("/" in tok or "\\" in tok or tok.endswith("_dir")) and not Path(tok).suffix:
-                    expect["directories"].append({"path": tok})
-
-        return expect
+        grounded = TaskGoal.ground_args(dict(args or {}), request or "")
+        return TaskGoal.derive_constraints(request or "", grounded)
 
     def _normalize_expect(
         self,
