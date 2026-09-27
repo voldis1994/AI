@@ -551,6 +551,7 @@ def run_check(root: Path) -> int:
         "jarvis.model_config",
         "jarvis.model_router",
         "jarvis.recovery",
+        "jarvis.knowledge_artifact",
         "jarvis.memory",
         "jarvis.ledger",
         "jarvis.capability_registry",
@@ -2087,9 +2088,11 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
-    # 4g) E2E: learning self-correct — VERIFY fail → OBSERVE → new research → PASS
-    print("  — e2e learning self-correct (OBSERVE→research→VERIFY loop) —")
+    # 4g) E2E: learning self-correct — VERIFY fail → gap-fill → PASS (not full restart)
+    print("  — e2e learning self-correct (gap-fill KnowledgeArtifact) —")
     try:
+        from jarvis.knowledge_artifact import KnowledgeArtifact as _KA
+
         sc_root = root / "data" / "_e2e_learning_self_correct"
         if sc_root.exists():
             shutil.rmtree(sc_root)
@@ -2103,25 +2106,30 @@ def run(context: dict) -> dict:
                 return False
 
         class SelfCorrectOrch(Orchestrator):
-            """First enrich leaves thin notes so VERIFY fails once, then recovers."""
+            """First synthesis is thin so VERIFY fails once; gap-fill recovers."""
 
             def __init__(self, *a, **k):
                 super().__init__(*a, **k)
-                self._enrich_calls = 0
+                self._synth_calls = 0
+                self._synth_queries: list[list] = []
 
-            def _enrich_learning_research(self, research, **kw):
-                self._enrich_calls += 1
-                if self._enrich_calls == 1:
-                    thin = self._learning_strip_skill_defaults(dict(research))
-                    thin["approach"] = ""
-                    thin["key_apis"] = []
-                    thin["pitfalls"] = []
-                    thin["test_idea"] = (
-                        "Execute skill.run and independently verify artifacts"
+            def _synthesize_learning_artifact(self, **kw):
+                self._synth_calls += 1
+                if self._synth_calls == 1:
+                    # Empty artifact → substance fail; diagnose must name fields
+                    return _KA(
+                        request_id=kw.get("request_id") or "",
+                        topic=kw.get("topic") or "",
+                        user_request=kw.get("user_request") or "",
+                        concepts=[],
+                        explanations=[],
+                        examples=[],
+                        practice="",
+                        summary="x",
                     )
-                    return thin
-                return super()._enrich_learning_research(research, **kw)
+                return super()._synthesize_learning_artifact(**kw)
 
+        # Track research queries via wrapping ResearchSystem.research
         logs_sc: list[str] = []
         phases_sc: list[str] = []
         orch_sc = SelfCorrectOrch(
@@ -2130,29 +2138,60 @@ def run(context: dict) -> dict:
             on_log=lambda m: logs_sc.append(m),
             on_status=lambda s: phases_sc.append(s),
         )
+        _orig_research = orch_sc.research.research
+        query_batches: list[list] = []
+
+        def _spy_research(queries, goal=""):
+            query_batches.append(list(queries or []))
+            return _orig_research(queries, goal=goal)
+
+        orch_sc.research.research = _spy_research  # type: ignore[method-assign]
+
         req_sc = "Learn graph basics and create practical tests to verify knowledge"
         result_sc = orch_sc.handle_user_message(req_sc)
         assert result_sc.get("type") == "learning", result_sc
         assert result_sc.get("success"), result_sc
         assert (result_sc.get("attempts") or 0) >= 2, result_sc
-        assert orch_sc._enrich_calls >= 2
+        assert orch_sc._synth_calls >= 2
         assert "OBSERVE" in phases_sc and "DIAGNOSE" in phases_sc
         assert phases_sc.count("RESEARCH") >= 2
         assert phases_sc.count("VERIFY") >= 2
         assert any("LEARNING VERIFY: FAIL" in m for m in logs_sc), logs_sc[-40:]
         assert any("LEARNING VERIFY: PASS" in m for m in logs_sc), logs_sc[-40:]
-        assert any("LEARNING DIAGNOSE" in m for m in logs_sc), logs_sc[-40:]
+        assert any("gap-fill" in m.lower() or "GAP" in m for m in logs_sc), logs_sc[-40:]
         topic_sc = result_sc["topic"]
         failed = orch_sc.memory.get_failed_approaches(f"learning:{topic_sc}")
         assert failed, failed
-        # Failed approach must not be repeated as the success path label
         failed_labels = {str(a.get("approach") or "") for a in failed}
-        assert "initial_topic_research" in failed_labels
+        assert any("knowledge_artifact" in x for x in failed_labels), failed_labels
+        # Second research batch must be gap-fill (not identical full restart only)
+        assert len(query_batches) >= 2
+        q2_text = " ".join(str(q) for q in query_batches[1]).lower()
+        assert any(
+            tok in q2_text for tok in ("fill", "concept", "example", "explain", "practice")
+        ), query_batches
         verified_hist = [
             e for e in orch_sc.memory.get_topic_knowledge(topic_sc)
             if isinstance(e, dict) and e.get("verified")
         ]
         assert verified_hist, orch_sc.memory.get_topic_knowledge(topic_sc)
+        # Verified entry must carry clean artifact fields (no skill jargon)
+        vent = verified_hist[-1]
+        blob = " ".join(
+            [
+                str(vent.get("summary") or ""),
+                " ".join(str(x) for x in (vent.get("concepts") or [])),
+                " ".join(str(x) for x in (vent.get("explanations") or [])),
+            ]
+        )
+        assert "SKILL_META" not in blob and "rewrite_skill" not in blob
+        for bad in (
+            "Prefer Python stdlib",
+            "Never claim success",
+            "result.path",
+            "Local capability hints",
+        ):
+            assert bad.lower() not in blob.lower(), (bad, blob[:400])
 
         # Reuse verified knowledge on a fresh orchestrator (same DB root)
         logs_ru: list[str] = []
@@ -2164,10 +2203,10 @@ def run(context: dict) -> dict:
         result_ru = orch_ru.handle_user_message(req_sc)
         assert result_ru.get("success"), result_ru
         assert (result_ru.get("attempts") or 1) == 1, result_ru
-        assert any("Reusing" in m and "verified" in m for m in logs_ru), logs_ru[:30]
+        assert any("Reusing" in m and "verified" in m.lower() for m in logs_ru), logs_ru[:30]
         orch_sc.close()
         orch_ru.close()
-        print("  OK learning self-correct FAIL→OBSERVE→RESEARCH→PASS + reuse")
+        print("  OK learning self-correct FAIL→gap-fill→PASS + reuse")
     except Exception as exc:
         msg = f"E2E_LEARNING_SELF_CORRECT: {exc}"
         print(f"  FAIL {msg}")
@@ -2248,6 +2287,199 @@ def run(context: dict) -> dict:
         print("  OK learning semantic VERIFY + practical result checked")
     except Exception as exc:
         msg = f"E2E_LEARNING_SEMANTIC: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 4h2) E2E: KnowledgeArtifact — clean, one-attempt, VERIFY vs USER REQUEST, gap-fill
+    print("  — e2e learning KnowledgeArtifact (clean / 1-attempt / gap-fill) —")
+    try:
+        from jarvis.knowledge_artifact import (
+            KnowledgeArtifact,
+            synthesize_offline,
+            is_polluted,
+        )
+        from jarvis import learning_verify as lv2
+
+        # Unit: polluted research raw never enters VERIFY blob
+        polluted = {
+            "approach": "Implement Python solution for: Learn optics basics",
+            "test_idea": "Execute skill.run and independently verify artifacts",
+            "raw": (
+                "### Local hints\n"
+                "- Skill must define SKILL_META and run(context)\n"
+                "- Return concrete result.path\n"
+                "Optics studies light: reflection, refraction, and lenses.\n"
+                "For example, a lens focuses parallel rays to a point.\n"
+            ),
+            "key_apis": ["Hint: pathlib / os"],
+            "sources": [
+                {"title": "Local capability hints", "url": "", "source": "local"},
+                {"title": "Optics overview", "url": "http://ex.test/optics", "source": "web"},
+            ],
+        }
+        req_u = "Learn optics basics and create practical tests to verify knowledge"
+        art_u = synthesize_offline(
+            user_request=req_u, topic="optics", request_id="rid1", research=polluted
+        )
+        assert art_u.has_substance(), art_u.to_dict()
+        assert not art_u.is_contaminated(), art_u.to_dict()
+        assert not any(is_polluted(c) for c in art_u.concepts)
+        for c in art_u.concepts + art_u.explanations + art_u.examples:
+            assert "Prefer Python" not in c
+            assert "Never claim success" not in c
+            assert "SKILL_META" not in c
+        blob_u = lv2.knowledge_blob(
+            {**art_u.research_compat(), "artifact": art_u.to_dict(), "raw": polluted["raw"]}
+        )
+        assert "SKILL_META" not in blob_u
+        assert "rewrite_skill" not in blob_u
+        assert "result.path" not in blob_u
+        assert "Prefer Python stdlib" not in blob_u
+        assert "Never claim success" not in blob_u
+        assert "pathlib" not in blob_u.lower() or "optics" in blob_u.lower()
+        # High relatedness with substance → covers in one offline judge
+        judge_u = lv2.offline_semantic_judgment(
+            req_u, {**art_u.research_compat(), "artifact": art_u.to_dict(), "raw": ""}
+        )
+        assert judge_u["covers_goal"], judge_u
+        assert judge_u.get("relatedness", 0) >= 0.45
+
+        # Simple knowledge request completes in ONE attempt (offline brain)
+        class OfflineBrainKA(Brain):
+            def model_status(self) -> str:
+                return "OFFLINE"
+
+            def is_available(self) -> bool:
+                return False
+
+        ka_root = root / "data" / "_e2e_knowledge_artifact"
+        if ka_root.exists():
+            shutil.rmtree(ka_root)
+        ka_root.mkdir(parents=True)
+        logs_ka: list[str] = []
+        orch_ka = Orchestrator(
+            root=ka_root,
+            brain=OfflineBrainKA(),
+            on_log=lambda m: logs_ka.append(m),
+        )
+        # Inject research content via spy so we don't depend on network
+        _real = orch_ka.research.research
+
+        def _rich_research(queries, goal=""):
+            base = _real(queries, goal=goal)
+            base["raw"] = (
+                str(base.get("raw") or "")
+                + "\nSignal processing transforms measurements into useful information. "
+                "Filtering removes noise; sampling captures discrete values. "
+                "For example, a low-pass filter attenuates high frequencies. "
+                "Practice: explain sampling and give one filtering example."
+            )
+            base["approach"] = ""
+            base["test_idea"] = "Execute skill.run and independently verify artifacts"
+            return base
+
+        orch_ka.research.research = _rich_research  # type: ignore[method-assign]
+        req_ka = (
+            "Learn signal processing basics and create practical tests "
+            "to verify knowledge"
+        )
+        result_ka = orch_ka.handle_user_message(req_ka)
+        assert result_ka.get("type") == "learning", result_ka
+        assert result_ka.get("success"), result_ka
+        assert (result_ka.get("attempts") or 99) == 1, result_ka
+        assert result_ka.get("request_id")
+        art_saved = result_ka.get("artifact") or (result_ka.get("knowledge") or {}).get("artifact")
+        assert art_saved, result_ka
+        assert art_saved.get("concepts") or art_saved.get("explanations")
+        narr = " ".join(
+            [
+                str(art_saved.get("summary") or ""),
+                " ".join(str(x) for x in (art_saved.get("concepts") or [])),
+                " ".join(str(x) for x in (art_saved.get("explanations") or [])),
+            ]
+        )
+        assert "SKILL_META" not in narr and "fault_layer" not in narr
+        for bad in (
+            "Prefer Python stdlib",
+            "Never claim success",
+            "result.path",
+            "skill.run",
+            "Local capability hints",
+            "rewrite_skill",
+        ):
+            assert bad.lower() not in narr.lower(), (bad, narr[:400])
+        # VERIFY must mention KnowledgeArtifact / USER REQUEST coverage
+        ver_ka = result_ka.get("verification") or {}
+        assert ver_ka.get("verified")
+        assert any(
+            c.get("name") == "semantic_goal_coverage" and c.get("ok")
+            for c in (ver_ka.get("checks") or [])
+        ), ver_ka
+        # No research raw in verify path logs
+        assert not any("Execute skill.run" in m for m in logs_ka if "VERIFY" in m)
+
+        # Gap-fill: thin first artifact → diagnose concrete fields → second fills only gaps
+        class GapFillOrch(Orchestrator):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.calls = 0
+                self.gap_queries: list[list] = []
+
+            def _synthesize_learning_artifact(self, **kw):
+                self.calls += 1
+                if self.calls == 1:
+                    return KnowledgeArtifact(
+                        request_id=kw.get("request_id") or "",
+                        topic=kw.get("topic") or "",
+                        user_request=kw.get("user_request") or "",
+                        summary="short",
+                        concepts=[],
+                        explanations=[],
+                        examples=[],
+                    )
+                # Gap-fill merge path
+                return super()._synthesize_learning_artifact(**kw)
+
+        gf_root = root / "data" / "_e2e_knowledge_gapfill"
+        if gf_root.exists():
+            shutil.rmtree(gf_root)
+        gf_root.mkdir(parents=True)
+        orch_gf = GapFillOrch(
+            root=gf_root,
+            brain=OfflineBrainKA(),
+            on_log=lambda m: None,
+        )
+        _real2 = orch_gf.research.research
+
+        def _spy2(queries, goal=""):
+            orch_gf.gap_queries.append(list(queries or []))
+            base = _real2(queries, goal=goal)
+            base["raw"] = (
+                "Control systems regulate behavior using feedback loops. "
+                "A setpoint is compared to measured output. "
+                "For example, a thermostat turns heating on and off. "
+                "Practice questions check understanding of feedback."
+            )
+            return base
+
+        orch_gf.research.research = _spy2  # type: ignore[method-assign]
+        req_gf = "Learn control systems basics and create practical tests to verify knowledge"
+        res_gf = orch_gf.handle_user_message(req_gf)
+        assert res_gf.get("success"), res_gf
+        assert (res_gf.get("attempts") or 0) >= 2
+        assert orch_gf.calls >= 2
+        assert len(orch_gf.gap_queries) >= 2
+        # Second batch targets missing fields — not a blind full-topic restart only
+        q2 = " ".join(orch_gf.gap_queries[1]).lower()
+        assert any(
+            tok in q2 for tok in ("concept", "explain", "example", "practice", "fill", "gap")
+        ), orch_gf.gap_queries[1]
+        orch_ka.close()
+        orch_gf.close()
+        print("  OK KnowledgeArtifact clean / 1-attempt / gap-fill")
+    except Exception as exc:
+        msg = f"E2E_KNOWLEDGE_ARTIFACT: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)

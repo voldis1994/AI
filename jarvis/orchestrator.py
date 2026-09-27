@@ -33,6 +33,11 @@ from jarvis.context_builder import ContextBuilder
 from jarvis.task_goal import TaskGoal
 from jarvis.intent import IntentClassifier
 from jarvis import learning_verify as learn_v
+from jarvis.knowledge_artifact import (
+    KnowledgeArtifact,
+    gap_fill_queries,
+    synthesize_offline,
+)
 from jarvis.recovery import ProgressAwareRecovery
 
 logger = logging.getLogger("jarvis.orchestrator")
@@ -385,65 +390,89 @@ class Orchestrator:
         """
         Self-correcting learning / knowledge path:
 
-        RESEARCH → SAVE → VERIFY
-        on FAIL: OBSERVE → diagnose missing knowledge → new research questions
-                 → RESEARCH → update knowledge → VERIFY again
+        USER REQUEST → research → KnowledgeArtifact synthesis → VERIFY
+        on FAIL: DIAGNOSE missing artifact fields → gap-fill only → VERIFY
 
-        Repeats with a changed approach until PASS or MAX_LEARNING_ATTEMPTS.
-        Reuses prior failures + verified topic knowledge. Never repeats a failed
-        approach fingerprint. Does not build/repair skills.
+        VERIFY compares USER REQUEST ↔ clean KnowledgeArtifact only
+        (never research/debug/repair logs). Reuses verified topic knowledge
+        before new research. Does not build/repair skills.
         """
         user_request = (original_request or goal or "").strip()
         task_goal = TaskGoal.from_request(user_request, goal=goal)
         goal = task_goal.goal
         topic = IntentClassifier.topic_slug(goal)
         learn_key = f"learning:{topic}"
+        request_id = uuid.uuid4().hex[:12]
         task_id = self.ledger.start_task(goal)
         self._status("REQUEST")
-        self._log(f"[{task_id}] REQUEST (learning): {task_goal.user_request}")
+        self._log(
+            f"[{task_id}] REQUEST (learning): {task_goal.user_request} "
+            f"request_id={request_id}"
+        )
         self.ledger.log(
             task_id,
             "REQUEST",
-            "Learning TaskGoal frozen (self-correcting, no skill inherit)",
-            {**task_goal.to_dict(), "topic": topic, "intent": "learning"},
+            "Learning TaskGoal frozen (KnowledgeArtifact path)",
+            {
+                **task_goal.to_dict(),
+                "topic": topic,
+                "intent": "learning",
+                "request_id": request_id,
+            },
         )
 
         try:
-            # Reuse previously verified knowledge + failed approaches for this topic
             prior_history = self.memory.get_topic_knowledge(topic, limit=8)
             verified_prior = [
                 e for e in prior_history
                 if isinstance(e, dict) and e.get("verified")
             ]
             failed_approaches = self.memory.get_failed_approaches(learn_key)
+            artifact = KnowledgeArtifact(
+                request_id=request_id,
+                topic=topic,
+                user_request=task_goal.user_request,
+            )
             research: dict[str, Any] = {}
+            # Prefer verified knowledge BEFORE any new research
             if verified_prior:
-                latest = verified_prior[-1]
-                research = {
-                    "approach": latest.get("approach") or latest.get("summary") or "",
-                    "libraries": list(latest.get("libraries") or []),
-                    "key_apis": list(latest.get("key_apis") or []),
-                    "pitfalls": list(latest.get("pitfalls") or []),
-                    "test_idea": latest.get("test_idea") or "",
-                    "practical_result": latest.get("practical_result"),
-                    "sources": list(latest.get("sources") or []),
-                    "results": [],
-                    "raw": str(latest.get("summary") or ""),
-                    "from_prior_verified": True,
-                }
-                self._log(
-                    f"[{task_id}] Reusing {len(verified_prior)} verified "
-                    f"knowledge entries for topic:{topic}"
+                artifact = KnowledgeArtifact.from_dict(verified_prior[-1])
+                artifact.request_id = request_id
+                artifact.topic = topic
+                artifact.user_request = task_goal.user_request
+                artifact.practical_result = self._produce_learning_practical(
+                    task_goal.user_request, artifact.research_compat()
                 )
+                research = self._research_from_artifact(artifact)
+                self._log(
+                    f"[{task_id}] Reusing verified KnowledgeArtifact for "
+                    f"topic:{topic} (skip full re-research)"
+                )
+                verification = self._verify_learning_knowledge(
+                    task_goal, research, verified_prior[-1]
+                )
+                if verification.get("verified"):
+                    return self._finish_learning_success(
+                        task_id=task_id,
+                        topic=topic,
+                        goal=goal,
+                        request_id=request_id,
+                        artifact=artifact,
+                        research=research,
+                        verification=verification,
+                        attempt=1,
+                        approach="reuse_verified_artifact",
+                        queries=[],
+                    )
 
             queries = self._initial_learning_queries(goal)
-            current_approach = "initial_topic_research"
+            current_approach = "knowledge_artifact_synthesis"
             verification: dict[str, Any] = {}
             saved: dict[str, Any] = {}
             diagnosis: Optional[dict] = None
+            gap_fill_only = False
 
             for attempt in range(1, MAX_LEARNING_ATTEMPTS + 1):
-                # Never reuse a failed approach fingerprint
                 ap_fp = Observer.fingerprint_approach(current_approach)
                 failed_fps = {
                     str(a.get("approach_fingerprint") or "")
@@ -455,59 +484,76 @@ class Orchestrator:
                     )
                     ap_fp = Observer.fingerprint_approach(current_approach)
 
+                missing_gaps = list(
+                    (diagnosis or {}).get("missing_knowledge") or []
+                )
+
+                # RESEARCH — full only on first gather; later = gap-fill queries
                 self._status("RESEARCH")
                 self._log(
                     f"[{task_id}] LEARNING RESEARCH attempt={attempt}/"
                     f"{MAX_LEARNING_ATTEMPTS} topic={topic!r} "
-                    f"approach={current_approach!r} queries={len(queries)}"
+                    f"approach={current_approach!r} "
+                    f"gap_fill={gap_fill_only} gaps={missing_gaps!r} "
+                    f"queries={len(queries)}"
                 )
                 fresh = self.research.research(queries, goal=goal)
-                # Strip skill-oriented defaults; enrich with learning notes
                 fresh = self._learning_strip_skill_defaults(fresh)
-                fresh = self._enrich_learning_research(
-                    fresh,
-                    goal=goal,
+
+                # Deterministic KnowledgeArtifact synthesis (minimizes 30B calls)
+                artifact = self._synthesize_learning_artifact(
                     user_request=task_goal.user_request,
-                    missing=(diagnosis or {}).get("missing_knowledge") if diagnosis else None,
-                    approach_label=current_approach,
+                    topic=topic,
+                    request_id=request_id,
+                    research=fresh,
+                    prior=artifact if (gap_fill_only or attempt > 1) else None,
+                    missing=missing_gaps,
                 )
-                research = (
-                    self._merge_research(research, fresh) if research else fresh
+                # Practical result on the clean artifact (offline first)
+                artifact.practical_result = self._produce_learning_practical(
+                    task_goal.user_request, artifact.research_compat()
                 )
+                research = self._research_from_artifact(artifact)
+                # Keep scrape metadata out of VERIFY path but retain for ledger
+                research["_research_meta"] = {
+                    "result_count": len(fresh.get("results") or []),
+                    "query_count": len(queries),
+                    "gap_fill": gap_fill_only,
+                }
                 research["approach_label"] = current_approach
                 research["attempt"] = attempt
-                # If USER REQUEST asks for a concrete answer/result, produce it
-                research["practical_result"] = self._produce_learning_practical(
-                    task_goal.user_request, research
-                )
+                research["request_id"] = request_id
 
-                # SAVE draft knowledge after every research pass
                 saved = self.memory.save_topic_knowledge(
                     topic,
                     research,
                     goal=goal,
                     queries=queries,
-                    summary=str(research.get("approach") or ""),
+                    summary=artifact.summary,
                     verified=False,
                 )
-                self.ledger.log(task_id, "RESEARCH", "Topic research saved", {
+                self.ledger.log(task_id, "RESEARCH", "KnowledgeArtifact synthesized", {
                     "topic": topic,
                     "attempt": attempt,
                     "approach": current_approach,
-                    "libraries": research.get("libraries"),
-                    "key_apis": list(research.get("key_apis") or [])[:8],
-                    "results": len(research.get("results") or []),
+                    "request_id": request_id,
+                    "concepts": artifact.concepts[:8],
+                    "explanations": len(artifact.explanations),
+                    "examples": len(artifact.examples),
+                    "gap_fill": gap_fill_only,
                     "knowledge_entries": len(saved.get("history") or []),
                     "queries": queries[:6],
                     "skill_inherit": False,
                 })
                 self._log(
-                    f"[{task_id}] KNOWLEDGE SAVED: topic:{topic} "
-                    f"attempt={attempt} entries={len(saved.get('history') or [])} "
-                    f"(draft, not bound to any skill)"
+                    f"[{task_id}] KNOWLEDGE ARTIFACT: topic:{topic} "
+                    f"attempt={attempt} concepts={len(artifact.concepts)} "
+                    f"explanations={len(artifact.explanations)} "
+                    f"examples={len(artifact.examples)} "
+                    f"(VERIFY-ready; raw/logs excluded)"
                 )
 
-                # VERIFY against original TaskGoal
+                # VERIFY: USER REQUEST ↔ KnowledgeArtifact only
                 self._status("VERIFY")
                 verification = self._verify_learning_knowledge(
                     task_goal, research, saved.get("entry") or {}
@@ -521,6 +567,13 @@ class Orchestrator:
                         "topic": topic,
                         "attempt": attempt,
                         "approach": current_approach,
+                        "request_id": request_id,
+                        "artifact_fields": {
+                            "concepts": len(artifact.concepts),
+                            "explanations": len(artifact.explanations),
+                            "examples": len(artifact.examples),
+                            "has_practical": bool(artifact.practical_result),
+                        },
                         "task_goal": task_goal.to_dict(),
                     },
                 )
@@ -531,77 +584,22 @@ class Orchestrator:
                 )
 
                 if verification.get("verified"):
-                    saved = self.memory.save_topic_knowledge(
-                        topic,
-                        research,
+                    artifact.verified = True
+                    research = self._research_from_artifact(artifact)
+                    return self._finish_learning_success(
+                        task_id=task_id,
+                        topic=topic,
                         goal=goal,
+                        request_id=request_id,
+                        artifact=artifact,
+                        research=research,
+                        verification=verification,
+                        attempt=attempt,
+                        approach=current_approach,
                         queries=queries,
-                        summary=str(
-                            verification.get("summary")
-                            or research.get("approach")
-                            or goal
-                        ),
-                        verified=True,
                     )
-                    practical = research.get("practical_result") or {}
-                    practical_line = ""
-                    if isinstance(practical, dict) and (
-                        practical.get("answer") or practical.get("result") is not None
-                    ):
-                        practical_line = (
-                            f"\nPractical result: "
-                            f"{practical.get('result', practical.get('answer'))!r}"
-                        )
-                    outcome = (
-                        f"DONE. Learning complete — knowledge verified & saved.\n"
-                        f"Topic: {topic}\n"
-                        f"Attempts: {attempt}\n"
-                        f"Approach: {current_approach}\n"
-                        f"Summary: {(saved.get('entry') or {}).get('summary', '')[:400]}\n"
-                        f"Sources: {len((research.get('sources') or []))}"
-                        f"{practical_line}"
-                    )
-                    self._status("SAVE_EXPERIENCE")
-                    self.memory.save_experience(
-                        goal, outcome, True,
-                        details={
-                            "topic": topic,
-                            "verification": verification,
-                            "knowledge": saved.get("entry"),
-                            "task_id": task_id,
-                            "intent": "learning",
-                            "attempts": attempt,
-                            "approach": current_approach,
-                        },
-                    )
-                    self.ledger.finish(
-                        task_id,
-                        True,
-                        {
-                            "topic": topic,
-                            "verified": True,
-                            "intent": "learning",
-                            "attempts": attempt,
-                        },
-                    )
-                    self._status("DONE")
-                    self._log(
-                        f"[{task_id}] DONE (learning topic={topic} "
-                        f"attempts={attempt})"
-                    )
-                    return {
-                        "type": "learning",
-                        "success": True,
-                        "task_id": task_id,
-                        "reply": outcome,
-                        "outcome": outcome,
-                        "topic": topic,
-                        "knowledge": saved.get("entry"),
-                        "verification": verification,
-                        "attempts": attempt,
-                    }
 
-                # ── VERIFY FAIL → OBSERVE → diagnose → new questions ──
+                # ── FAIL → OBSERVE → DIAGNOSE concrete artifact gaps ──
                 self._status("OBSERVE")
                 observation = self.observer.observe_failure(
                     goal=goal,
@@ -614,18 +612,20 @@ class Orchestrator:
                         "user_request": task_goal.user_request,
                         "topic": topic,
                         "approach": current_approach,
-                        "queries": queries,
-                        "key_apis": list(research.get("key_apis") or []),
+                        "request_id": request_id,
                         "mode": "learning",
+                        "artifact_gaps_hint": artifact.missing_fields(
+                            task_goal.user_request
+                        ),
                     },
                     test_result={
                         "ok": False,
                         "error": verification.get("reason"),
                         "result": {
                             "topic": topic,
-                            "key_apis": list(research.get("key_apis") or []),
+                            "concepts": list(artifact.concepts)[:8],
                         },
-                        "evidence": str(research.get("approach") or "")[:1000],
+                        "evidence": artifact.narrative()[:1000],
                         "returncode": 0,
                     },
                     verification=verification,
@@ -665,9 +665,8 @@ class Orchestrator:
                     ),
                     attempt=attempt,
                 )
-                # Enforce approach change — never repeat a failed fingerprint
                 new_approach = str(
-                    diagnosis.get("approach") or f"learning_repair_v{attempt + 1}"
+                    diagnosis.get("approach") or f"gap_fill_v{attempt + 1}"
                 )
                 new_fp = Observer.fingerprint_approach(new_approach)
                 used_fps = {
@@ -696,6 +695,7 @@ class Orchestrator:
                         "approach": diagnosis.get("approach"),
                         "approach_changed": diagnosis.get("approach_changed"),
                         "research_queries": diagnosis.get("research_queries"),
+                        "gap_fill_only": True,
                         "attempt": attempt,
                     },
                 )
@@ -703,18 +703,18 @@ class Orchestrator:
                     f"[{task_id}] LEARNING DIAGNOSE: "
                     f"{diagnosis.get('root_cause', '')[:160]} "
                     f"| missing={diagnosis.get('missing_knowledge')!r} "
-                    f"| next_approach={diagnosis.get('approach')!r}"
+                    f"| next_approach={diagnosis.get('approach')!r} "
+                    f"(gap-fill only — not full restart)"
                 )
 
-                queries = list(diagnosis.get("research_queries") or []) or [
-                    f"{goal} — fill gap: {g}"
-                    for g in (diagnosis.get("missing_knowledge") or ["coverage"])[:4]
-                ]
-                if goal not in queries:
-                    queries = [goal] + queries
+                # Next attempt fills ONLY missing fields
+                queries = list(diagnosis.get("research_queries") or []) or gap_fill_queries(
+                    task_goal.user_request,
+                    list(diagnosis.get("missing_knowledge") or ["explanations"]),
+                )
                 queries = queries[:6]
                 current_approach = str(diagnosis.get("approach") or current_approach)
-                # Refresh prior history for next merge
+                gap_fill_only = True
                 prior_history = self.memory.get_topic_knowledge(topic, limit=8)
 
             outcome = (
@@ -728,6 +728,7 @@ class Orchestrator:
                     "topic": topic,
                     "verification": verification,
                     "task_id": task_id,
+                    "request_id": request_id,
                     "intent": "learning",
                     "attempts": MAX_LEARNING_ATTEMPTS,
                     "failed_approaches": [
@@ -743,6 +744,7 @@ class Orchestrator:
                 "type": "learning",
                 "success": False,
                 "task_id": task_id,
+                "request_id": request_id,
                 "reply": outcome,
                 "outcome": outcome,
                 "topic": topic,
@@ -762,6 +764,123 @@ class Orchestrator:
                 "reply": outcome,
                 "outcome": outcome,
             }
+
+    def _synthesize_learning_artifact(
+        self,
+        *,
+        user_request: str,
+        topic: str,
+        request_id: str,
+        research: dict[str, Any],
+        prior: Optional[KnowledgeArtifact] = None,
+        missing: Optional[list] = None,
+    ) -> KnowledgeArtifact:
+        """Hookable offline synthesis — tests may override; production stays deterministic."""
+        return synthesize_offline(
+            user_request=user_request,
+            topic=topic,
+            request_id=request_id,
+            research=research,
+            prior=prior,
+            missing=missing,
+        )
+
+    def _research_from_artifact(self, artifact: KnowledgeArtifact) -> dict[str, Any]:
+        """Build VERIFY/memory payload from a clean KnowledgeArtifact (no raw)."""
+        data = artifact.research_compat()
+        data["artifact"] = artifact.to_dict()
+        data["request_id"] = artifact.request_id
+        data["raw"] = ""  # hard guarantee — never verify logs
+        data["results"] = []
+        data["pitfalls"] = []
+        return data
+
+    def _finish_learning_success(
+        self,
+        *,
+        task_id: str,
+        topic: str,
+        goal: str,
+        request_id: str,
+        artifact: KnowledgeArtifact,
+        research: dict[str, Any],
+        verification: dict[str, Any],
+        attempt: int,
+        approach: str,
+        queries: list,
+    ) -> dict[str, Any]:
+        artifact.verified = True
+        research = self._research_from_artifact(artifact)
+        saved = self.memory.save_topic_knowledge(
+            topic,
+            research,
+            goal=goal,
+            queries=queries,
+            summary=artifact.summary,
+            verified=True,
+        )
+        practical = artifact.practical_result or {}
+        practical_line = ""
+        if isinstance(practical, dict) and (
+            practical.get("answer") or practical.get("result") is not None
+        ):
+            practical_line = (
+                f"\nPractical result: "
+                f"{practical.get('result', practical.get('answer'))!r}"
+            )
+        outcome = (
+            f"DONE. Learning complete — knowledge verified & saved.\n"
+            f"Topic: {topic}\n"
+            f"Attempts: {attempt}\n"
+            f"Approach: {approach}\n"
+            f"Summary: {(saved.get('entry') or {}).get('summary', '')[:400]}\n"
+            f"Sources: {len(artifact.source_evidence)}"
+            f"{practical_line}"
+        )
+        self._status("SAVE_EXPERIENCE")
+        self.memory.save_experience(
+            goal, outcome, True,
+            details={
+                "topic": topic,
+                "verification": verification,
+                "knowledge": saved.get("entry"),
+                "artifact": artifact.to_dict(),
+                "task_id": task_id,
+                "request_id": request_id,
+                "intent": "learning",
+                "attempts": attempt,
+                "approach": approach,
+            },
+        )
+        self.ledger.finish(
+            task_id,
+            True,
+            {
+                "topic": topic,
+                "verified": True,
+                "intent": "learning",
+                "attempts": attempt,
+                "request_id": request_id,
+            },
+        )
+        self._status("DONE")
+        self._log(
+            f"[{task_id}] DONE (learning topic={topic} attempts={attempt} "
+            f"request_id={request_id})"
+        )
+        return {
+            "type": "learning",
+            "success": True,
+            "task_id": task_id,
+            "request_id": request_id,
+            "reply": outcome,
+            "outcome": outcome,
+            "topic": topic,
+            "knowledge": saved.get("entry"),
+            "artifact": artifact.to_dict(),
+            "verification": verification,
+            "attempts": attempt,
+        }
 
     def _initial_learning_queries(self, goal: str) -> list[str]:
         queries = [goal]
@@ -789,13 +908,15 @@ class Orchestrator:
 
     @classmethod
     def _learning_strip_skill_defaults(cls, research: dict[str, Any]) -> dict[str, Any]:
-        """Remove skill-repair defaults that pollute learning knowledge."""
+        """Remove skill-repair defaults before KnowledgeArtifact synthesis."""
+        from jarvis.knowledge_artifact import scrub_text, is_polluted
+
         out = dict(research or {})
         test_idea = str(out.get("test_idea") or "")
-        if _SKILL_TEST_IDEA_RE.search(test_idea):
+        if _SKILL_TEST_IDEA_RE.search(test_idea) or is_polluted(test_idea):
             out["test_idea"] = ""
-        approach = str(out.get("approach") or "")
-        if any(
+        approach = scrub_text(str(out.get("approach") or ""))
+        if is_polluted(approach) or any(
             tok in approach.lower()
             for tok in (
                 "skill must define skill_meta",
@@ -803,8 +924,32 @@ class Orchestrator:
                 "implement python solution for",
             )
         ):
-            # Keep raw; clear skill-centric approach so enrich can rebuild
-            out["approach"] = ""
+            approach = ""
+        out["approach"] = approach
+        # Scrub skill/debug lines from raw — synthesis must not ingest them
+        out["raw"] = scrub_text(str(out.get("raw") or ""))
+        out["pitfalls"] = [
+            p for p in (out.get("pitfalls") or [])
+            if p and not is_polluted(str(p)) and "previously missing" not in str(p).lower()
+        ]
+        out["key_apis"] = [
+            k for k in (out.get("key_apis") or [])
+            if k and not is_polluted(str(k))
+        ]
+        # Drop local skill-hint pseudo-results before synthesis
+        out["results"] = [
+            r for r in (out.get("results") or [])
+            if isinstance(r, dict)
+            and str(r.get("title") or "").lower() not in ("local capability hints",)
+            and not is_polluted(str(r.get("snippet") or r.get("title") or ""))
+        ]
+        out["sources"] = [
+            s for s in (out.get("sources") or [])
+            if isinstance(s, dict)
+            and str(s.get("title") or "").lower() not in ("local capability hints",)
+            and not is_polluted(str(s.get("title") or ""))
+        ]
+        out["repair_insight"] = ""
         return out
 
     def _enrich_learning_research(
@@ -816,82 +961,28 @@ class Orchestrator:
         missing: Optional[list] = None,
         approach_label: str = "",
     ) -> dict[str, Any]:
-        """Build structured learning notes that answer the USER REQUEST (no keyword stuffing)."""
-        out = dict(research or {})
-        missing = [str(m) for m in (missing or []) if m]
+        """
+        Legacy enrich hook — learning path now uses synthesize_offline.
+
+        Kept for tests that override/call it; synthesizes a clean artifact
+        offline without skill-repair brain prompts (avoids 30B + pollution).
+        """
+        from jarvis.knowledge_artifact import scrub_text
+
         request = (user_request or goal or "").strip()
-
-        if self.brain.is_available():
-            try:
-                notes = self.brain.research_notes(
-                    f"LEARNING (not a skill): {request}\n"
-                    f"Missing aspects to fill: "
-                    f"{missing or ['core concepts', 'worked examples', 'practice checks']}\n"
-                    f"Approach label: {approach_label}\n"
-                    "Produce conceptual notes that answer the user goal; "
-                    "do not optimize for keyword overlap.",
-                    str(out.get("raw") or "")[:8000],
-                )
-                if isinstance(notes, dict):
-                    if notes.get("approach"):
-                        out["approach"] = notes["approach"]
-                    for key in ("libraries", "key_apis", "pitfalls"):
-                        merged = list(out.get(key) or [])
-                        for item in notes.get(key) or []:
-                            if item not in merged:
-                                merged.append(item)
-                        out[key] = merged
-                    tip = str(notes.get("test_idea") or "")
-                    if tip and not _SKILL_TEST_IDEA_RE.search(tip):
-                        out["test_idea"] = tip
-            except Exception as exc:
-                self._log(f"LEARNING enrich brain notes failed ({exc}); offline")
-
-        key_apis = list(out.get("key_apis") or [])
-        pitfalls = list(out.get("pitfalls") or [])
-        test_idea = str(out.get("test_idea") or "")
-        approach = str(out.get("approach") or "").strip()
-        raw = str(out.get("raw") or "")
-
-        if not key_apis:
-            # Prefer research Hint lines — never stuff raw request tokens as "APIs"
-            for line in raw.splitlines():
-                s = line.strip().lstrip("-").strip()
-                if s.lower().startswith("hint:"):
-                    tip = s.split(":", 1)[-1].strip()
-                    if tip and tip not in key_apis:
-                        key_apis.append(tip)
-            if not key_apis and approach:
-                # Split approach into short conceptual bullets
-                for part in re.split(r"[.;\n]", approach):
-                    part = part.strip()
-                    if 12 <= len(part) <= 120 and part not in key_apis:
-                        key_apis.append(part)
-                    if len(key_apis) >= 6:
-                        break
-            out["key_apis"] = key_apis[:12]
-
-        if not pitfalls and missing:
-            out["pitfalls"] = [
-                f"Previously missing aspect: {m}" for m in missing[:6]
-            ]
-
-        if not test_idea or _SKILL_TEST_IDEA_RE.search(test_idea):
-            out["test_idea"] = (
-                "Self-check: explain the topic in your own words, "
-                "give one worked example, and answer practice questions "
-                "that match the USER REQUEST goal."
-            )
-
-        if not approach or len(approach) < 40:
-            focus = "; ".join(str(x) for x in (out.get("key_apis") or [])[:4])
-            out["approach"] = (
-                f"{approach_label or 'learning'}: build understanding for the "
-                f"user goal — {request}. "
-                f"Focus: {focus or 'core concepts and worked examples'}. "
-                f"Verify with: {out.get('test_idea')}"
-            )[:1200]
-
+        topic = IntentClassifier.topic_slug(goal or request)
+        cleaned = dict(research or {})
+        cleaned["raw"] = scrub_text(str(cleaned.get("raw") or ""))
+        art = synthesize_offline(
+            user_request=request,
+            topic=topic,
+            research=cleaned,
+            missing=[str(m) for m in (missing or []) if m],
+        )
+        out = dict(cleaned)
+        out.update(art.research_compat())
+        out["artifact"] = art.to_dict()
+        out["raw"] = cleaned.get("raw") or ""
         return out
 
     def _produce_learning_practical(
@@ -936,101 +1027,60 @@ class Orchestrator:
         prior_knowledge: list,
         attempt: int,
     ) -> dict[str, Any]:
-        """Identify missing knowledge and propose a NEW research approach."""
-        missing = list(verification.get("missing_knowledge") or [])
+        """
+        Identify concrete KnowledgeArtifact gaps (deterministic first).
+
+        When relatedness is high but substance fails, name missing fields
+        (concepts/explanations/examples/…) — do not restart full research.
+        """
+        # Prefer artifact-field gaps over coarse check names
+        artifact_gaps = learn_v.diagnose_artifact_gaps(
+            task_goal.user_request, research, None
+        )
+        missing = list(artifact_gaps)
+        if not missing:
+            missing = list(verification.get("missing_knowledge") or [])
         if not missing:
             missing = [
                 c.get("name")
                 for c in (verification.get("checks") or [])
                 if not c.get("ok") and c.get("name") != "brain_advisory"
             ]
-        failed_labels = [
-            str(a.get("approach") or "")
-            for a in (failed_approaches or [])
-            if a.get("approach")
-        ]
-        root = str(verification.get("reason") or observation.get("exception") or "")[:500]
-
-        if self.brain.is_available():
-            try:
-                system = (
-                    "You diagnose a failed LEARNING/knowledge verification. "
-                    "Reply ONLY with JSON:\n"
-                    "{\n"
-                    '  "root_cause": "...",\n'
-                    '  "missing_knowledge": ["gap1", "gap2"],\n'
-                    '  "approach": "NEW strategy label not in failed_approaches",\n'
-                    '  "approach_changed": true,\n'
-                    '  "research_queries": ["..."],\n'
-                    '  "diagnosis": "summary"\n'
-                    "}\n"
-                    "Rules:\n"
-                    "- Identify what knowledge is missing vs the USER REQUEST.\n"
-                    "- research_queries must target those gaps (2-6 queries).\n"
-                    "- approach MUST differ from every failed_approaches label.\n"
-                    "- This is learning — do NOT propose skill code or file creation.\n"
-                    "- No topic hardcoding; stay grounded in the request + failure."
-                )
-                payload = {
-                    "user_request": task_goal.user_request,
-                    "goal": task_goal.goal,
-                    "verification": {
-                        "reason": verification.get("reason"),
-                        "missing_knowledge": missing,
-                        "checks": verification.get("checks"),
-                    },
-                    "research_summary": {
-                        "approach": research.get("approach"),
-                        "key_apis": list(research.get("key_apis") or [])[:10],
-                        "pitfalls": list(research.get("pitfalls") or [])[:8],
-                        "test_idea": research.get("test_idea"),
-                    },
-                    "failed_approaches": failed_labels[:10],
-                    "prior_knowledge_count": len(prior_knowledge or []),
-                    "attempt": attempt,
-                }
-                raw = self.brain.generate(
-                    json.dumps(payload, ensure_ascii=False, default=str)[:10000],
-                    system=system,
-                    temperature=0.3,
-                    work="diagnose",
-                    expect_json=True,
-                )
-                parsed = self.brain._parse_json(raw, {})
-                if isinstance(parsed, dict) and parsed.get("research_queries"):
-                    parsed.setdefault("missing_knowledge", missing)
-                    parsed.setdefault("root_cause", root)
-                    parsed.setdefault(
-                        "approach",
-                        f"fill_gaps_v{attempt + 1}",
-                    )
-                    parsed["approach_changed"] = True
-                    return parsed
-            except Exception as exc:
-                self._log(f"LEARNING diagnose brain failed ({exc}); offline")
-
-        # Offline gap → query synthesis (universal)
-        queries = [
-            f"{task_goal.user_request} — deepen: {m}"
-            for m in (missing or ["core concepts"])[:4]
-        ]
-        queries.append(f"fundamentals and practice checks for: {task_goal.goal}")
-        for tok in IntentClassifier._keywords(task_goal.user_request)[:4]:
-            queries.append(f"{tok} explained with examples and self-test questions")
+        # Map coarse check names → artifact fields
+        mapped: list[str] = []
+        for m in missing:
+            if m in ("knowledge_substance", "goal_coverage"):
+                mapped.extend(artifact_gaps or ["explanations", "concepts"])
+            elif m == "practical_result" or str(m).startswith("practical_"):
+                mapped.append("practical_result")
+            elif m == "no_skill_inherit":
+                mapped.append("contamination")
+            else:
+                mapped.append(str(m))
         # Dedupe
-        out_q: list[str] = []
-        for q in queries:
-            q = " ".join(str(q).split())
-            if q and q not in out_q:
-                out_q.append(q)
-        approach = f"fill_missing_{'+'.join(str(m)[:24] for m in missing[:3]) or 'coverage'}_v{attempt + 1}"
+        missing = []
+        for m in mapped:
+            if m and m not in missing:
+                missing.append(m)
+
+        root = str(verification.get("reason") or observation.get("exception") or "")[:500]
+        queries = gap_fill_queries(task_goal.user_request, missing)
+        approach = (
+            f"gap_fill_{'+'.join(str(m)[:20] for m in missing[:3]) or 'fields'}"
+            f"_v{attempt + 1}"
+        )
+        # Deterministic diagnose — skip 30B unless gaps are empty (should not happen)
         return {
-            "root_cause": root,
-            "missing_knowledge": missing or ["goal_coverage", "knowledge_substance"],
+            "root_cause": root or f"KnowledgeArtifact missing: {missing}",
+            "missing_knowledge": missing or ["explanations"],
             "approach": approach,
             "approach_changed": True,
-            "research_queries": out_q[:6],
-            "diagnosis": f"Learning verify failed; missing={missing}",
+            "research_queries": queries[:6],
+            "diagnosis": (
+                f"Gap-fill KnowledgeArtifact fields {missing}; "
+                f"do not repeat full research. prior_entries={len(prior_knowledge or [])}"
+            ),
+            "gap_fill_only": True,
         }
 
     def _verify_learning_knowledge(
@@ -1040,73 +1090,112 @@ class Orchestrator:
         entry: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Semantically verify learning: USER REQUEST → knowledge → goal answered.
+        VERIFY: original USER REQUEST ↔ clean KnowledgeArtifact only.
 
-        Does NOT require exact keyword/token matches. If the request also asks
-        for a concrete/practical result, that result must be present and correct.
+        Never judges research raw dumps, skill-repair jargon, failed approaches,
+        or diagnostic logs. Deterministic Python checks first; brain advisory only.
         """
         checks: list[dict[str, Any]] = []
         missing: list[str] = []
         request = task_goal.user_request
-        approach = str(research.get("approach") or entry.get("summary") or "")
-        practical = research.get("practical_result") or entry.get("practical_result")
-        blob = learn_v.knowledge_blob(research, entry)
 
-        # Baseline: real knowledge present (not skill-repair template)
-        substance = learn_v.has_substance(research, entry)
+        # Normalize to artifact payload (strip raw/results if sneaked in)
+        verify_research = dict(research or {})
+        verify_research["raw"] = ""
+        verify_research["results"] = []
+        verify_research["pitfalls"] = []
+        if isinstance(verify_research.get("artifact"), dict):
+            art = KnowledgeArtifact.from_dict(verify_research["artifact"])
+            verify_research = self._research_from_artifact(art)
+        elif isinstance(entry, dict) and entry.get("artifact"):
+            art = KnowledgeArtifact.from_dict(entry["artifact"])
+            verify_research = self._research_from_artifact(art)
+
+        approach = str(
+            verify_research.get("approach")
+            or verify_research.get("summary")
+            or entry.get("summary")
+            or ""
+        )
+        practical = (
+            verify_research.get("practical_result") or entry.get("practical_result")
+        )
+        blob = learn_v.knowledge_blob(verify_research, entry)
+
+        substance = learn_v.has_substance(verify_research, entry)
         checks.append({
             "name": "knowledge_substance",
             "ok": substance,
             "detail": (
                 f"substance={substance} approach_len={len(approach)} "
-                f"blob_len={len(blob)}"
+                f"blob_len={len(blob)} (artifact-only; raw excluded)"
             ),
         })
         if not substance:
-            missing.append("knowledge_substance")
+            missing.extend(
+                learn_v.diagnose_artifact_gaps(request, verify_research, entry)
+            )
 
-        sources = list(research.get("sources") or entry.get("sources") or [])
-        results = list(research.get("results") or [])
-        has_sources = bool(sources) or bool(results) or bool(blob)
+        sources = list(
+            verify_research.get("sources")
+            or verify_research.get("source_evidence")
+            or entry.get("sources")
+            or []
+        )
+        # Narrative alone is enough evidence when clean (sources optional)
+        has_sources = bool(sources) or bool(blob)
         checks.append({
             "name": "knowledge_sources",
             "ok": has_sources,
-            "detail": f"sources={len(sources)} results={len(results)}",
+            "detail": f"sources={len(sources)} narrative_len={len(blob)}",
         })
         if not has_sources:
             missing.append("knowledge_sources")
 
         contaminated = bool(learn_v._SKILL_JARGON_RE.search(approach))
+        if isinstance(verify_research.get("artifact"), dict):
+            contaminated = contaminated or KnowledgeArtifact.from_dict(
+                verify_research["artifact"]
+            ).is_contaminated()
         checks.append({
             "name": "no_skill_inherit",
             "ok": not contaminated,
             "detail": (
-                "knowledge not bound to unrelated skill repair"
+                "KnowledgeArtifact free of skill/debug pollution"
                 if not contaminated
-                else "knowledge contaminated by prior skill repair jargon"
+                else "KnowledgeArtifact contaminated by skill/debug jargon"
             ),
         })
         if contaminated:
-            missing.append("no_skill_inherit")
+            missing.append("contamination")
 
-        # Semantic goal coverage (brain when available; fuzzy offline otherwise)
-        judgment: dict[str, Any]
-        if self.brain.is_available() and substance:
+        # Prefer deterministic offline semantic judgment (minimize 30B)
+        judgment = learn_v.offline_semantic_judgment(request, verify_research, entry)
+        # Optional brain advisory only when offline already covers + substance
+        if (
+            self.brain.is_available()
+            and substance
+            and judgment.get("covers_goal")
+            and False  # keep brain off by default for learning VERIFY
+        ):
             try:
                 knowledge_pkg = {
                     "approach": approach,
-                    "key_apis": list(research.get("key_apis") or [])[:12],
-                    "pitfalls": list(research.get("pitfalls") or [])[:8],
-                    "test_idea": research.get("test_idea"),
+                    "concepts": list(
+                        verify_research.get("concepts")
+                        or verify_research.get("key_apis")
+                        or []
+                    )[:12],
+                    "explanations": list(verify_research.get("explanations") or [])[:8],
+                    "examples": list(verify_research.get("examples") or [])[:6],
+                    "test_idea": verify_research.get("practice")
+                    or verify_research.get("test_idea"),
                     "practical_result": practical,
                     "summary": blob[:3000],
                 }
                 judgment = self.brain.judge_learning_coverage(request, knowledge_pkg)
             except Exception as exc:
                 self._log(f"LEARNING semantic judge failed ({exc}); offline")
-                judgment = learn_v.offline_semantic_judgment(request, research, entry)
-        else:
-            judgment = learn_v.offline_semantic_judgment(request, research, entry)
 
         covers = bool(judgment.get("covers_goal"))
         checks.append({
@@ -1115,30 +1204,32 @@ class Orchestrator:
             "detail": str(judgment.get("reason") or "")[:300],
         })
         if not covers:
-            missing.append("goal_coverage")
+            # High relatedness + substance fail → concrete artifact gaps
+            related = float(judgment.get("relatedness") or 0.0)
+            if related >= 0.45 or not substance:
+                for g in learn_v.diagnose_artifact_gaps(
+                    request, verify_research, entry
+                ):
+                    if g not in missing:
+                        missing.append(g)
+            else:
+                missing.append("goal_coverage")
             for aspect in judgment.get("missing_aspects") or []:
-                if aspect and aspect not in missing:
+                if aspect and aspect not in missing and aspect != "knowledge_substance":
+                    # Replace coarse substance with field gaps already added
+                    if aspect == "knowledge_substance":
+                        continue
                     missing.append(str(aspect))
 
-        # Practical result when the request asks for a concrete answer
         needs_practical = bool(
             judgment.get("requires_practical_result")
             if judgment.get("requires_practical_result") is not None
             else learn_v.requests_practical_result(request)
         )
         if needs_practical:
-            # Prefer model practical_ok when present; always cross-check offline
             offline_p = learn_v.verify_practical_offline(request, practical)
-            model_p = judgment.get("practical_ok")
-            if model_p is None:
-                practical_ok = offline_p["ok"]
-                detail = offline_p["detail"]
-            else:
-                practical_ok = bool(model_p) and offline_p["ok"]
-                detail = (
-                    f"model_practical_ok={model_p}; offline={offline_p['detail']}; "
-                    f"{judgment.get('practical_feedback') or ''}"
-                )[:300]
+            practical_ok = offline_p["ok"]
+            detail = offline_p["detail"]
             checks.append({
                 "name": "practical_result",
                 "ok": practical_ok,
@@ -1155,9 +1246,15 @@ class Orchestrator:
                 "detail": "not required by USER REQUEST",
             })
 
+        # Dedupe missing
+        miss_out: list[str] = []
+        for m in missing:
+            if m and m not in miss_out:
+                miss_out.append(m)
+
         verified = all(c["ok"] for c in checks) and bool(checks)
         reason = (
-            "LEARNING VERIFY PASS — knowledge semantically covers USER REQUEST"
+            "LEARNING VERIFY PASS — KnowledgeArtifact covers USER REQUEST"
             if verified
             else "LEARNING VERIFY FAIL — " + "; ".join(
                 f"{c['name']}:{c.get('detail')}" for c in checks if not c["ok"]
@@ -1167,7 +1264,7 @@ class Orchestrator:
             "verified": verified,
             "reason": reason,
             "checks": checks,
-            "missing_knowledge": missing,
+            "missing_knowledge": miss_out,
             "summary": (approach or blob)[:2000],
             "judgment": judgment,
             "practical_result": practical,
