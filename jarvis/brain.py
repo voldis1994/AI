@@ -44,24 +44,64 @@ class Brain:
         return self._client
 
     def is_available(self) -> bool:
-        """Return True if Ollama is reachable and the model can be listed."""
+        """True only when Ollama is up AND the exact model exists."""
+        return self.model_status() == "ONLINE"
+
+    def model_status(self) -> str:
+        """
+        Return:
+          ONLINE        — server reachable and exact model present
+          MODEL MISSING — server reachable but model not installed
+          OFFLINE       — server unreachable
+        """
+        tags = self._list_model_names()
+        if tags is None:
+            return "OFFLINE"
+        if self._model_in_tags(tags):
+            return "ONLINE"
+        return "MODEL MISSING"
+
+    def _model_in_tags(self, names: list[str]) -> bool:
+        target = self.model.strip().lower()
+        # Exact match preferred; also accept name without tag if identical base+tag listed
+        normalized = {n.strip().lower() for n in names}
+        if target in normalized:
+            return True
+        # ollama sometimes lists "qwen2.5-coder:7b" and "qwen2.5-coder:7b-..." variants
+        # Require exact model string match only (user requirement).
+        return False
+
+    def _list_model_names(self) -> Optional[list[str]]:
+        """Return model name list, or None if server unreachable."""
         try:
             client = self._get_client()
-            if client is None:
-                return self._http_ping()
-            client.list()
-            return True
-        except Exception:
-            return self._http_ping()
+            if client is not None:
+                data = client.list()
+                models = data.get("models") if isinstance(data, dict) else getattr(data, "models", None)
+                names: list[str] = []
+                for m in models or []:
+                    if isinstance(m, dict):
+                        names.append(str(m.get("name") or m.get("model") or ""))
+                    else:
+                        names.append(str(getattr(m, "name", None) or getattr(m, "model", "") or ""))
+                return [n for n in names if n]
+        except Exception as exc:
+            logger.info("ollama client list failed: %s", exc)
 
-    def _http_ping(self) -> bool:
+        # HTTP fallback
         try:
             import urllib.request
 
             with urllib.request.urlopen(f"{self.host}/api/tags", timeout=5) as resp:
-                return resp.status == 200
+                if resp.status != 200:
+                    return None
+                payload = json.loads(resp.read().decode("utf-8"))
+            names = []
+            for m in payload.get("models") or []:
+                names.append(str(m.get("name") or m.get("model") or ""))
+            return [n for n in names if n]
         except Exception:
-            return False
+            return None
 
     def chat(
         self,

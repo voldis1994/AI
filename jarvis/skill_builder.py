@@ -83,16 +83,28 @@ class SkillBuilder:
         version: int = 1,
         previous_code: Optional[str] = None,
         error_log: Optional[str] = None,
+        protect_active_path: Optional[str | Path] = None,
     ) -> dict[str, Any]:
+        """
+        Build a skill file.
+
+        If protect_active_path is set (existing ACTIVE file), the new version is
+        written to a candidate path and the ACTIVE file is left untouched.
+        """
         name = self._safe_name(skill_name)
         self.on_log(f"BUILD: generating skill '{name}' v{version}")
+
+        # Include research sources in prompt context for the brain
+        research_for_brain = dict(research)
+        if research.get("results"):
+            research_for_brain["research_results"] = research["results"][:10]
 
         code = ""
         if self.brain is not None:
             code = self.brain.write_skill_code(
                 skill_name=name,
                 description=description,
-                research=research,
+                research=research_for_brain,
                 previous_code=previous_code,
                 error_log=error_log,
             )
@@ -111,13 +123,12 @@ class SkillBuilder:
         code = self._ensure_meta(code, name, description, research, version)
         ok, err = self._validate_syntax(code)
         if not ok:
-            self.on_log(f"BUILD: syntax error — attempting repair wrap")
-            # One more attempt via brain if available
+            self.on_log("BUILD: syntax error — attempting repair wrap")
             if self.brain is not None and not error_log:
                 code2 = self.brain.write_skill_code(
                     skill_name=name,
                     description=description,
-                    research=research,
+                    research=research_for_brain,
                     previous_code=code,
                     error_log=f"SyntaxError: {err}",
                 )
@@ -134,6 +145,7 @@ class SkillBuilder:
                         "code": code2,
                         "error": err2,
                         "meta": {},
+                        "protected_active": bool(protect_active_path),
                     }
             else:
                 return {
@@ -143,20 +155,24 @@ class SkillBuilder:
                     "code": code,
                     "error": err,
                     "meta": {},
+                    "protected_active": bool(protect_active_path),
                 }
 
-        path = self.skills_dir / f"{name}.py"
-        # Backup previous version if present
-        if path.exists():
-            bak = self.skills_dir / f"{name}.v{version - 1}.bak.py"
-            try:
-                bak.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-            except Exception:
-                pass
+        active_path = Path(protect_active_path) if protect_active_path else None
+        if active_path and active_path.exists():
+            # Never overwrite ACTIVE before PASS — write candidate beside it
+            path = self.skills_dir / f"{name}.v{version}.candidate.py"
+            protected = True
+        else:
+            path = self.skills_dir / f"{name}.py"
+            protected = False
 
         path.write_text(code, encoding="utf-8")
         meta = self._extract_meta(code, name, description, research, version)
-        self.on_log(f"BUILD: wrote {path}")
+        self.on_log(
+            f"BUILD: wrote {path}"
+            + (" (ACTIVE protected)" if protected else "")
+        )
         return {
             "ok": True,
             "name": name,
@@ -164,12 +180,18 @@ class SkillBuilder:
             "code": code,
             "error": None,
             "meta": meta,
+            "protected_active": protected,
+            "active_path": str(active_path) if active_path else None,
         }
 
-    def read_skill_code(self, skill_name: str) -> Optional[str]:
-        path = self.skills_dir / f"{self._safe_name(skill_name)}.py"
-        if path.exists():
-            return path.read_text(encoding="utf-8")
+    def read_skill_code(self, skill_name: str, path: Optional[str | Path] = None) -> Optional[str]:
+        if path:
+            p = Path(path)
+            if p.exists():
+                return p.read_text(encoding="utf-8")
+        p = self.skills_dir / f"{self._safe_name(skill_name)}.py"
+        if p.exists():
+            return p.read_text(encoding="utf-8")
         return None
 
     def _ensure_meta(

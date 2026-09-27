@@ -1,5 +1,7 @@
 """
-JARVIS dependency manager — installs pip packages required by skills.
+JARVIS dependency manager — installs pip packages for the current user.
+
+After every install, re-checks import. No privilege escalation / UAC bypass.
 """
 
 from __future__ import annotations
@@ -12,7 +14,6 @@ from typing import Callable, Optional
 
 logger = logging.getLogger("jarvis.deps")
 
-# Map import names → pip package names when they differ
 IMPORT_TO_PIP = {
     "bs4": "beautifulsoup4",
     "PIL": "Pillow",
@@ -22,6 +23,8 @@ IMPORT_TO_PIP = {
     "sklearn": "scikit-learn",
     "dateutil": "python-dateutil",
 }
+
+PIP_TO_IMPORT = {v: k for k, v in IMPORT_TO_PIP.items()}
 
 
 class DependencyManager:
@@ -37,7 +40,7 @@ class DependencyManager:
         self._installed: set[str] = set()
 
     def ensure(self, dependencies: list[str]) -> dict:
-        """Install missing packages. Returns {ok, installed, failed, details}."""
+        """Install missing packages as current user, then re-verify import."""
         if not dependencies:
             return {"ok": True, "installed": [], "failed": [], "details": "no deps"}
 
@@ -50,20 +53,34 @@ class DependencyManager:
             if not dep:
                 continue
             pip_name = IMPORT_TO_PIP.get(dep, dep)
-            if self._is_importable(dep) or self._is_importable(pip_name.replace("-", "_")):
-                details.append(f"{pip_name}: already available")
-                continue
-            if pip_name in self._installed:
+            import_name = self._import_name_for(dep, pip_name)
+
+            if self._is_importable(import_name):
+                details.append(f"{pip_name}: already importable as {import_name}")
                 continue
 
-            self.on_log(f"DEPS: installing {pip_name}")
-            ok, msg = self._pip_install(pip_name)
+            self.on_log(f"DEPS: installing {pip_name} (--user, current user)")
+            ok, msg = self._pip_install_user(pip_name)
             details.append(msg)
-            if ok:
+            if not ok:
+                failed.append(pip_name)
+                continue
+
+            # Obligatory re-check after install
+            importlib.invalidate_caches()
+            if self._is_importable(import_name):
                 installed.append(pip_name)
                 self._installed.add(pip_name)
+                details.append(f"{pip_name}: re-import OK ({import_name})")
             else:
-                failed.append(pip_name)
+                # Fresh subprocess import check (avoids parent cache issues)
+                if self._subprocess_import_check(import_name):
+                    installed.append(pip_name)
+                    self._installed.add(pip_name)
+                    details.append(f"{pip_name}: re-import OK via subprocess ({import_name})")
+                else:
+                    failed.append(pip_name)
+                    details.append(f"{pip_name}: install reported OK but import FAILED")
 
         return {
             "ok": len(failed) == 0,
@@ -72,13 +89,18 @@ class DependencyManager:
             "details": "\n".join(details),
         }
 
+    def _import_name_for(self, dep: str, pip_name: str) -> str:
+        if dep in IMPORT_TO_PIP:
+            return dep
+        if pip_name in PIP_TO_IMPORT:
+            return PIP_TO_IMPORT[pip_name]
+        return pip_name.replace("-", "_").split("[")[0]
+
     def _is_importable(self, name: str) -> bool:
         mod = name.replace("-", "_").split("[")[0]
-        # Try common variants
-        candidates = [mod, IMPORT_TO_PIP.get(mod, mod)]
-        # reverse map
+        candidates = [mod]
         for imp, pip in IMPORT_TO_PIP.items():
-            if pip.lower() == name.lower() or pip.lower() == mod.lower():
+            if pip.lower() == name.lower() or pip.lower() == mod.lower() or imp == mod:
                 candidates.append(imp)
         for c in candidates:
             try:
@@ -88,19 +110,46 @@ class DependencyManager:
                 continue
         return False
 
-    def _pip_install(self, package: str) -> tuple[bool, str]:
+    def _pip_install_user(self, package: str) -> tuple[bool, str]:
+        """Install with current-user rights only. No sudo / UAC bypass."""
+        cmd = [sys.executable, "-m", "pip", "install", "--user", package]
         try:
             proc = subprocess.run(
-                [sys.executable, "-m", "pip", "install", package],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
             )
             if proc.returncode == 0:
-                return True, f"{package}: installed OK"
+                return True, f"{package}: pip install --user OK"
             err = (proc.stderr or proc.stdout or "")[-500:]
+            # Fallback without --user if environment forbids it (e.g. venv)
+            if "not on PATH" in err or "Can not perform a '--user'" in err or proc.returncode != 0:
+                proc2 = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", package],
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                )
+                if proc2.returncode == 0:
+                    return True, f"{package}: pip install OK (env user site)"
+                err2 = (proc2.stderr or proc2.stdout or "")[-500:]
+                return False, f"{package}: FAILED — {err2}"
             return False, f"{package}: FAILED — {err}"
         except subprocess.TimeoutExpired:
             return False, f"{package}: FAILED — timeout"
         except Exception as exc:
             return False, f"{package}: FAILED — {exc}"
+
+    def _subprocess_import_check(self, name: str) -> bool:
+        mod = name.replace("-", "_").split("[")[0]
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", f"import importlib; importlib.import_module({mod!r})"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False

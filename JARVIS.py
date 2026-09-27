@@ -280,20 +280,22 @@ class JarvisGUI:
     # ── Boot / display helpers ──────────────────────────────────────────
 
     def _boot_banner(self) -> None:
-        online = self.orch.brain.is_available()
+        status = self.orch.brain.model_status()
+        hint = {
+            "ONLINE": "CONNECTED",
+            "MODEL MISSING": f"MODEL MISSING — ollama pull {DEFAULT_MODEL}",
+            "OFFLINE": "OFFLINE (start ollama serve)",
+        }.get(status, status)
         self._append(
             "system",
             "═" * 56 + "\n"
             "  JARVIS online. Core stable. Skills learn themselves.\n"
-            f"  Brain: Ollama / {DEFAULT_MODEL} — "
-            f"{'CONNECTED' if online else 'OFFLINE (start ollama serve)'}\n"
+            f"  Brain: Ollama / {DEFAULT_MODEL} — {hint}\n"
             "  Type a message, a task, or /help\n"
             "═" * 56,
         )
         self._ui_status("IDLE")
-        self.brain_var.set(
-            f"BRAIN: {'ONLINE' if online else 'OFFLINE'} · {DEFAULT_MODEL}"
-        )
+        self.brain_var.set(f"BRAIN: {status} · {DEFAULT_MODEL}")
 
     def _append(self, tag: str, text: str) -> None:
         def _do() -> None:
@@ -343,7 +345,9 @@ class JarvisGUI:
         mem = dash["memory"]
         sk = dash["skills"]
         led = dash["ledger"]
-        brain = "ONLINE" if dash["brain_online"] else "OFFLINE"
+        brain = dash.get("brain_status") or (
+            "ONLINE" if dash["brain_online"] else "OFFLINE"
+        )
         stats = (
             f"Brain   {brain}\n"
             f"Model   {dash['model']}\n"
@@ -447,8 +451,7 @@ def run_cli(root: Path) -> int:
         on_log=on_log,
         on_status=on_status,
     )
-    online = orch.brain.is_available()
-    print(f"Brain: {'ONLINE' if online else 'OFFLINE'} ({DEFAULT_MODEL})")
+    print(f"Brain: {orch.brain.model_status()} ({DEFAULT_MODEL})")
     try:
         while True:
             try:
@@ -468,9 +471,11 @@ def run_cli(root: Path) -> int:
 
 
 def run_check(root: Path) -> int:
-    """Verify syntax, imports, and main execution paths without needing Ollama."""
+    """Verify syntax, imports, subprocess isolation, and e2e learn→reuse."""
     import ast
     import importlib
+    import shutil
+    import traceback
 
     errors: list[str] = []
     print("=== JARVIS self-check ===")
@@ -498,6 +503,7 @@ def run_check(root: Path) -> int:
         "jarvis.dependency_manager",
         "jarvis.skill_builder",
         "jarvis.skill_tester",
+        "jarvis.skill_runner",
         "jarvis.verifier",
         "jarvis.skill_loader",
         "jarvis.orchestrator",
@@ -511,27 +517,25 @@ def run_check(root: Path) -> int:
             print(f"  FAIL {msg}")
             errors.append(msg)
 
-    # 3) Exercise core paths with a deterministic built-in skill (no Ollama required)
-    print("  — exercising core cycle with fixture skill —")
+    # 3) Subprocess tester + independent verifier + ACTIVE protection
+    print("  — subprocess test + verifier separation + ACTIVE protect —")
     try:
         from jarvis.skill_builder import SkillBuilder
         from jarvis.capability_registry import CapabilityRegistry
         from jarvis.skill_tester import SkillTester
         from jarvis.verifier import Verifier
-        from jarvis.memory import Memory
-        from jarvis.ledger import Ledger
         from jarvis.dependency_manager import DependencyManager
+        from jarvis.brain import Brain as RealBrain
 
         tmp = root / "data" / "_selfcheck"
+        if tmp.exists():
+            shutil.rmtree(tmp)
         skills = tmp / "skills"
         ws = tmp / "ws"
-        skills.mkdir(parents=True, exist_ok=True)
-        ws.mkdir(parents=True, exist_ok=True)
+        skills.mkdir(parents=True)
+        ws.mkdir(parents=True)
         db = tmp / "check.db"
-        if db.exists():
-            db.unlink()
 
-        # Write a real minimal skill by hand (simulates successful builder output)
         skill_code = '''
 SKILL_META = {
     "name": "write_hello_file",
@@ -548,7 +552,7 @@ def run(context: dict) -> dict:
     path.write_text("Hello from JARVIS skill\\n", encoding="utf-8")
     return {
         "ok": True,
-        "result": {"path": str(path), "bytes": path.stat().st_size},
+        "result": {"path": str(path), "bytes": path.stat().st_size, "contains": "Hello"},
         "error": None,
         "evidence": f"Wrote {path} exists={path.exists()} size={path.stat().st_size}",
     }
@@ -557,78 +561,232 @@ def run(context: dict) -> dict:
         skill_path.write_text(skill_code, encoding="utf-8")
 
         reg = CapabilityRegistry(db)
-        mem = Memory(db)
-        led = Ledger(db)
         reg.register_candidate(
-            "write_hello_file",
-            "Write hello.txt",
-            str(skill_path),
-            ["write hello file"],
-            [],
-            1,
+            "write_hello_file", "Write hello.txt", str(skill_path),
+            ["write hello file"], [], 1,
         )
         reg.set_status("write_hello_file", "TESTING")
         tester = SkillTester(ws)
         test_res = tester.test(skill_path, goal="Create hello.txt in workspace")
-        assert test_res["passed"], test_res
+        assert test_res.get("returncode") is not None, test_res
+        assert "stdout" in test_res and "stderr" in test_res
+        assert test_res.get("ok"), test_res
+        assert "skill_result" in test_res
+        # Crash isolation: hang skill must timeout without killing parent
+        hang = skills / "hang_skill.py"
+        hang.write_text(
+            "SKILL_META={'name':'hang_skill','description':'hang','capabilities':[],"
+            "'dependencies':[],'version':1}\n"
+            "def run(context):\n"
+            "    import time\n"
+            "    time.sleep(999)\n"
+            "    return {'ok': True, 'result': None, 'error': None, 'evidence': 'no'}\n",
+            encoding="utf-8",
+        )
+        hang_res = tester.test(hang, goal="hang", timeout_hint=2.0)
+        assert hang_res.get("timed_out"), hang_res
+        assert hang_res.get("killed"), hang_res
+
         ver = Verifier(ws)
         vres = ver.verify("Create hello.txt", test_res)
         assert vres["verified"], vres
-        reg.set_status("write_hello_file", "ACTIVE")
-        skill = reg.get_skill("write_hello_file")
-        assert skill and skill["status"] == "ACTIVE"
+        assert "skill_result" in vres and "verifier_result" in vres
+        assert vres["verifier_result"]["pass"]
 
-        # Ledger cycle sketch
-        tid = led.start_task("Create hello.txt")
-        led.log(tid, "PLAN", "use write_hello_file")
-        led.log(tid, "EXECUTE", "ok")
-        led.log(tid, "VERIFY", "verified")
-        led.finish(tid, True, {"path": str(ws / "hello.txt")})
-        mem.save_experience("Create hello.txt", "DONE", True, "write_hello_file")
-        mem.add_message("user", "hi")
-        mem.add_message("assistant", "hello")
-
-        # Builder syntax validation path
-        builder = SkillBuilder(skills)
-        bad = builder.build(
-            "noop_placeholder",
-            "placeholder",
-            {"libraries": [], "key_apis": ["noop"], "approach": "n/a"},
-            version=1,
+        # Promote path
+        reg.promote_candidate(
+            "write_hello_file", str(skill_path), 1,
+            "Write hello.txt", ["write hello file"], [],
+            archive_dir=skills / "archive",
         )
-        assert bad["ok"] and "def run" in bad["code"]
+        assert reg.get_skill("write_hello_file")["status"] == "ACTIVE"
+        active_file = Path(reg.get_skill("write_hello_file")["file_path"])
+        active_before = active_file.read_text(encoding="utf-8")
 
-        # Deps manager no-op
+        # Build v2 while ACTIVE protected — must not overwrite ACTIVE file
+        builder = SkillBuilder(skills)
+        built = builder.build(
+            "write_hello_file",
+            "Write hello.txt v2",
+            {"libraries": [], "key_apis": ["write hello file"], "approach": "rewrite"},
+            version=2,
+            protect_active_path=str(active_file),
+        )
+        assert built["ok"] and built.get("protected_active")
+        assert Path(built["path"]).name.endswith(".candidate.py")
+        assert active_file.read_text(encoding="utf-8") == active_before
+        print("  OK subprocess timeout/kill + SKILL≠VERIFIER + ACTIVE protect")
+
+        # Brain model status API
+        b = RealBrain()
+        st = b.model_status()
+        assert st in ("ONLINE", "MODEL MISSING", "OFFLINE"), st
+        print(f"  OK brain     model_status={st}")
+
         dm = DependencyManager()
         assert dm.ensure([])["ok"]
 
-        # Status transitions BROKEN → REPAIRING → TESTING → ACTIVE
-        reg.set_status("write_hello_file", "BROKEN", "simulated")
-        reg.set_status("write_hello_file", "REPAIRING")
-        reg.set_status("write_hello_file", "TESTING")
-        reg.set_status("write_hello_file", "ACTIVE")
-        assert reg.get_skill("write_hello_file")["status"] == "ACTIVE"
-
-        print("  OK cycle    CANDIDATE→TESTING→ACTIVE + VERIFY + ledger + memory")
-        print("  OK repair   BROKEN→REPAIRING→TESTING→ACTIVE")
-        print(f"  OK evidence {(ws / 'hello.txt').read_text().strip()!r}")
-
         reg.close()
-        mem.close()
-        led.close()
     except Exception as exc:
-        import traceback
         msg = f"CYCLE: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)
 
-    # 4) Orchestrator boots
+    # 4) End-to-end: capability missing → learn → DONE → restart → reuse
+    print("  — e2e learn → ACTIVE → restart → reuse —")
+    try:
+        e2e_root = root / "data" / "_e2e"
+        if e2e_root.exists():
+            shutil.rmtree(e2e_root)
+        e2e_root.mkdir(parents=True)
+
+        class FakeBrain(Brain):
+            """Deterministic brain for e2e without Ollama — still uses real pipeline."""
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": ["marker", "file", "jarvis_e2e_marker.txt"],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                reuse = []
+                for line in known_capabilities:
+                    if "write_e2e_marker" in line or "jarvis_e2e_marker" in line:
+                        reuse.append("write_e2e_marker")
+                return {
+                    "steps": ["create marker file"],
+                    "can_reuse": reuse,
+                    "missing": [] if reuse else ["write marker file"],
+                    "needs_research": not bool(reuse),
+                    "needs_new_skill": not bool(reuse),
+                    "skill_name": "write_e2e_marker",
+                    "skill_description": "Write jarvis_e2e_marker.txt with E2E_OK",
+                    "research_queries": ["python write text file pathlib"],
+                }
+
+            def research_notes(self, query: str, gathered: str) -> dict:
+                return {
+                    "approach": "Use pathlib Path.write_text to create marker file",
+                    "libraries": [],
+                    "key_apis": ["write marker file", "jarvis_e2e_marker.txt"],
+                    "pitfalls": [],
+                    "test_idea": "file exists with E2E_OK",
+                }
+
+            def write_skill_code(self, skill_name, description, research,
+                                 previous_code=None, error_log=None) -> str:
+                return f'''
+from pathlib import Path
+
+SKILL_META = {{
+    "name": "{skill_name}",
+    "description": "{description}",
+    "capabilities": ["write marker file", "jarvis_e2e_marker.txt"],
+    "dependencies": [],
+    "version": 1,
+}}
+
+def run(context: dict) -> dict:
+    workspace = Path(context.get("workspace") or ".")
+    path = workspace / "jarvis_e2e_marker.txt"
+    path.write_text("E2E_OK\\n", encoding="utf-8")
+    return {{
+        "ok": True,
+        "result": {{"path": str(path), "contains": "E2E_OK", "min_bytes": 1}},
+        "error": None,
+        "evidence": f"created {{path}} size={{path.stat().st_size}}",
+    }}
+'''
+
+            def analyze_failure(self, skill_code, error_log, evidence) -> dict:
+                return {
+                    "diagnosis": error_log[:200],
+                    "fix_plan": "rewrite file writer",
+                    "needs_new_deps": [],
+                    "is_unfixable": False,
+                }
+
+            def verify_claim(self, goal, result, evidence) -> dict:
+                return {"achieved": True, "confidence": 0.9, "reason": "advisory"}
+
+            def converse(self, user_text, history=None) -> str:
+                return "ok"
+
+        phases: list[str] = []
+
+        def on_status(s: str) -> None:
+            phases.append(s)
+
+        orch = Orchestrator(
+            root=e2e_root,
+            brain=FakeBrain(),
+            on_status=on_status,
+            on_log=lambda m: print(f"    · {m}") if any(
+                k in m for k in ("REQUEST", "RESEARCH", "BUILD", "TEST", "VERIFY",
+                                 "ACTIVE", "DONE", "EXECUTE", "SKILL RESULT", "VERIFIER")
+            ) else None,
+        )
+        # Ensure capability does not exist
+        assert orch.registry.get_skill("write_e2e_marker") is None
+
+        goal = "Create file jarvis_e2e_marker.txt containing E2E_OK"
+        result1 = orch.run_cycle(goal)
+        assert result1.get("success"), result1
+        assert orch.registry.get_skill("write_e2e_marker")["status"] == "ACTIVE"
+        marker = e2e_root / "workspace_runtime" / "jarvis_e2e_marker.txt"
+        assert marker.exists() and "E2E_OK" in marker.read_text(encoding="utf-8")
+        assert "RESEARCH" in phases and "TEST" in phases and "VERIFY" in phases
+        assert "DONE" in phases
+        # Confirm research stored structured results
+        fact = orch.memory.get_fact("research:write_e2e_marker")
+        assert fact and "results" in fact
+        for key in ("url", "title", "source", "provider", "timestamp", "query"):
+            assert key in (fact["results"][0] if fact["results"] else {}), fact
+        orch.close()
+        print("  OK e2e      learn → subprocess TEST → VERIFY → ACTIVE → DONE")
+
+        # Restart JARVIS (new orchestrator, same root) and reuse ACTIVE skill
+        phases2: list[str] = []
+        orch2 = Orchestrator(
+            root=e2e_root,
+            brain=FakeBrain(),
+            on_status=lambda s: phases2.append(s),
+        )
+        skill = orch2.registry.get_skill("write_e2e_marker")
+        assert skill and skill["status"] == "ACTIVE"
+        # Remove marker so reuse must recreate it
+        if marker.exists():
+            marker.unlink()
+        result2 = orch2.run_cycle(goal)
+        assert result2.get("success"), result2
+        assert marker.exists()
+        # Should reuse — not need a brand-new research-heavy path exclusively,
+        # but must find ACTIVE skill
+        assert result2.get("skill") == "write_e2e_marker"
+        assert "EXECUTE" in phases2 and "VERIFY" in phases2 and "DONE" in phases2
+        orch2.close()
+        print("  OK reuse    restart → find ACTIVE → EXECUTE → VERIFY → DONE")
+    except Exception as exc:
+        msg = f"E2E: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 5) Orchestrator boots on main root
     try:
         orch = Orchestrator(root=root, brain=Brain())
         stats = orch.get_dashboard_stats()
-        assert "memory" in stats
-        # Conversation path without requiring Ollama
+        assert "brain_status" in stats
         r = orch.handle_user_message("/status")
         assert "reply" in r
         orch.close()

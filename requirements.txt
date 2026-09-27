@@ -1,2 +1,3 @@
 ollama>=0.3.0
 requests>=2.31.0
+# GUI: system package python3-tk (sudo apt-get install python3-tk)
