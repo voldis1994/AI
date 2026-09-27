@@ -332,6 +332,7 @@ class Verifier:
         # Structured args → constraints (key names are whatever the planner used)
         path_vals: list[str] = []
         text_vals: list[str] = []
+        ambiguous: list[str] = []
         for _key, val in args.items():
             if val in (None, ""):
                 continue
@@ -340,8 +341,10 @@ class Verifier:
                 expect["http"].append({"url": sv})
             elif self._looks_like_path(sv):
                 path_vals.append(sv)
-            else:
+            elif self._looks_like_content(sv):
                 text_vals.append(sv)
+            else:
+                ambiguous.append(sv)
 
         # Goal/request tokens (quoted, path-like, key=value via ContextBuilder)
         offline = ContextBuilder._offline_extract(request)
@@ -354,25 +357,47 @@ class Verifier:
             elif self._looks_like_path(sv):
                 if sv not in path_vals:
                     path_vals.append(sv)
-            else:
+            elif self._looks_like_content(sv):
                 if sv not in text_vals:
                     text_vals.append(sv)
+            else:
+                if sv not in ambiguous and sv not in path_vals and sv not in text_vals:
+                    ambiguous.append(sv)
 
         known_text = set(text_vals)
         for tok in ContextBuilder.goal_value_candidates(request):
             if self._looks_like_path(tok) and tok not in path_vals:
                 path_vals.append(tok)
-            elif (
-                not self._looks_like_path(tok)
-                and not self._looks_like_url(tok)
-                and len(tok) >= 2
-                and tok not in text_vals
-            ):
-                # Skip fragments already covered by a longer arg/quoted value
+            elif self._looks_like_content(tok) and tok not in text_vals:
                 if any(tok in k for k in known_text if k != tok):
                     continue
                 text_vals.append(tok)
                 known_text.add(tok)
+            elif (
+                not self._looks_like_path(tok)
+                and not self._looks_like_url(tok)
+                and len(tok) >= 2
+                and tok not in ambiguous
+                and tok not in path_vals
+                and tok not in text_vals
+            ):
+                if any(tok in k for k in known_text if k != tok):
+                    continue
+                ambiguous.append(tok)
+
+        # Resolve ambiguous single-token values without hardcoding key names:
+        # if clear content exists (or multiple destinations needed), treat bare
+        # identifiers as paths; otherwise as content.
+        for sv in ambiguous:
+            if self._looks_like_content(sv):
+                if sv not in text_vals:
+                    text_vals.append(sv)
+            elif text_vals and sv not in path_vals:
+                path_vals.append(sv)
+            elif not path_vals:
+                path_vals.append(sv)
+            elif sv not in text_vals:
+                text_vals.append(sv)
 
         # Pair path + content when both present (universal: first path gets contents)
         primary_contains = text_vals[0] if text_vals else None
@@ -535,6 +560,18 @@ class Verifier:
             return True
         # Windows / POSIX path with separator
         if ("/" in sv or "\\" in sv) and not sv.startswith("http"):
+            return True
+        return False
+
+    @staticmethod
+    def _looks_like_content(value: str) -> bool:
+        """Heuristic: prose / payloads are content; bare identifiers are not."""
+        sv = str(value).strip()
+        if not sv:
+            return False
+        if " " in sv or "\n" in sv or "\t" in sv:
+            return True
+        if len(sv) > 48:
             return True
         return False
 

@@ -1360,6 +1360,205 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
+    # 4d) E2E: repeated similar VERIFY failure → adaptive RESEARCH → new approach
+    print("  — e2e adaptive research on repeated repair failures —")
+    try:
+        from jarvis.observer import Observer as _Obs
+
+        ar_root = root / "data" / "_e2e_adaptive_research"
+        if ar_root.exists():
+            shutil.rmtree(ar_root)
+        ar_root.mkdir(parents=True)
+
+        class AdaptiveResearchBrain(Brain):
+            def __init__(self) -> None:
+                super().__init__()
+                self.build_count = 0
+                self.research_notes_calls = 0
+                self.gen_query_calls = 0
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": user_text.split()[:8],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                return {
+                    "steps": ["build skill that honors args"],
+                    "can_reuse": [],
+                    "missing": [goal],
+                    "needs_research": True,
+                    "needs_new_skill": True,
+                    "skill_name": "repeat_fail_skill",
+                    "skill_description": goal,
+                    "research_queries": [goal],
+                    "args": {"dest": "adapt_out.txt", "body": "ADAPT_OK"},
+                    "required_args": ["dest", "body"],
+                }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                return {"dest": "adapt_out.txt", "body": "ADAPT_OK"}
+
+            def generate_research_queries(
+                self, observation, diagnosis=None, failed_approaches=None
+            ):
+                self.gen_query_calls += 1
+                return Brain._offline_research_queries(
+                    observation, diagnosis, failed_approaches
+                )
+
+            def research_notes(self, query: str, gathered: str) -> dict:
+                self.research_notes_calls += 1
+                return {
+                    "approach": f"researched_write_v{self.research_notes_calls}",
+                    "libraries": [],
+                    "key_apis": ["pathlib"],
+                    "pitfalls": ["do not leave file empty"],
+                    "test_idea": "verifier checks dest+body",
+                    "repair_insight": "write args body bytes into dest path",
+                }
+
+            def write_skill_code(
+                self,
+                skill_name,
+                description,
+                research,
+                previous_code=None,
+                error_log=None,
+                diagnosis=None,
+                failed_approaches=None,
+                test_plan=None,
+            ) -> str:
+                self.build_count += 1
+                import json as _json
+                desc_lit = _json.dumps(description or "")
+                # First two builds: skill ok=True but empty file → same VERIFY fail
+                if self.build_count <= 2:
+                    return f'''
+from pathlib import Path
+SKILL_META = {{
+    "name": "{skill_name}",
+    "description": {desc_lit},
+    "capabilities": ["repeat_fail"],
+    "dependencies": [],
+    "version": {self.build_count},
+    "required_args": ["dest", "body"],
+}}
+def run(context: dict) -> dict:
+    args = context.get("args") or {{}}
+    workspace = Path(context.get("workspace") or ".")
+    dest = str(args.get("dest") or "adapt_out.txt")
+    path = workspace / dest
+    path.write_text("", encoding="utf-8")
+    return {{
+        "ok": True,
+        "result": {{"path": str(path), "contains": ""}},
+        "error": None,
+        "evidence": f"touched {{path}}",
+    }}
+'''
+                # After adaptive research / enough repairs: honor args
+                return f'''
+from pathlib import Path
+SKILL_META = {{
+    "name": "{skill_name}",
+    "description": {desc_lit},
+    "capabilities": ["repeat_fail"],
+    "dependencies": [],
+    "version": {self.build_count},
+    "required_args": ["dest", "body"],
+}}
+def run(context: dict) -> dict:
+    args = context.get("args") or {{}}
+    workspace = Path(context.get("workspace") or ".")
+    path = workspace / str(args["dest"])
+    path.write_text(str(args["body"]) + "\\n", encoding="utf-8")
+    return {{
+        "ok": True,
+        "result": {{"path": str(path), "contains": str(args["body"])}},
+        "error": None,
+        "evidence": f"wrote {{path}}",
+    }}
+'''
+
+            def diagnose(self, observation, failed_approaches=None, prior_solutions=None):
+                err = str(observation.get("exception") or "")
+                approach = "empty_touch_then_research"
+                fps = {
+                    a.get("approach_fingerprint")
+                    for a in (failed_approaches or [])
+                }
+                fp = _Obs.fingerprint_approach(approach)
+                if fp in fps:
+                    approach = approach + f"_v{len(fps)+1}"
+                    fp = _Obs.fingerprint_approach(approach)
+                return {
+                    "root_cause": "file created empty; content missing for VERIFY",
+                    "fault_layer": "skill_code",
+                    "rewrite_skill": True,
+                    "what_to_change": "Write body from args into dest",
+                    "approach": approach,
+                    "approach_fingerprint": fp,
+                    "approach_changed": True,
+                    "needs_research": False,  # orchestrator must force on repeat
+                    "research_queries": [],
+                    "needs_new_deps": [],
+                    "missing_args": [],
+                    "required_args": ["dest", "body"],
+                    "suggested_args": {
+                        "dest": "adapt_out.txt",
+                        "body": "ADAPT_OK",
+                    },
+                    "test_plan": "VERIFY dest contains body",
+                    "expected_artifacts": ["adapt_out.txt"],
+                    "is_unfixable": False,
+                    "diagnosis": err[:300],
+                }
+
+            def verify_claim(self, goal, result, evidence) -> dict:
+                return {"achieved": True, "confidence": 0.9, "reason": "advisory"}
+
+            def converse(self, user_text, history=None) -> str:
+                return "ok"
+
+        phases_r: list[str] = []
+        logs_r: list[str] = []
+        brain_r = AdaptiveResearchBrain()
+        orch_r = Orchestrator(
+            root=ar_root,
+            brain=brain_r,
+            on_status=lambda s: phases_r.append(s),
+            on_log=lambda m: logs_r.append(m),
+        )
+        goal_r = 'Create "adapt_out.txt" containing "ADAPT_OK"'
+        result_r = orch_r.run_cycle(goal_r)
+        assert result_r.get("success"), result_r
+        out_r = ar_root / "workspace_runtime" / "adapt_out.txt"
+        assert out_r.exists() and "ADAPT_OK" in out_r.read_text(encoding="utf-8")
+        assert brain_r.build_count >= 3, brain_r.build_count
+        # Mid-repair adaptive research must have run (not only initial RESEARCH)
+        assert any("ADAPTIVE RESEARCH" in m for m in logs_r), logs_r[-50:]
+        assert brain_r.gen_query_calls >= 1 or brain_r.research_notes_calls >= 1
+        assert phases_r.count("RESEARCH") >= 2  # initial + adaptive
+        orch_r.close()
+        print("  OK adaptive RESEARCH on repeated VERIFY failures → new approach")
+    except Exception as exc:
+        msg = f"E2E_ADAPTIVE_RESEARCH: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
     # 5) Orchestrator boots + conversation logs must not echo USER/JARVIS replies
     try:
         echoed: list[str] = []
