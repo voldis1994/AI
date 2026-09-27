@@ -2141,9 +2141,12 @@ def run(context: dict) -> dict:
         _orig_research = orch_sc.research.research
         query_batches: list[list] = []
 
-        def _spy_research(queries, goal=""):
+        research_kwargs: list[dict] = []
+
+        def _spy_research(queries, goal="", **kwargs):
             query_batches.append(list(queries or []))
-            return _orig_research(queries, goal=goal)
+            research_kwargs.append(dict(kwargs))
+            return _orig_research(queries, goal=goal, **kwargs)
 
         orch_sc.research.research = _spy_research  # type: ignore[method-assign]
 
@@ -2170,6 +2173,11 @@ def run(context: dict) -> dict:
         assert any(
             tok in q2_text for tok in ("fill", "concept", "example", "explain", "practice")
         ), query_batches
+        # Gap-fill attempt must be local (no network / no brain skill notes)
+        assert len(research_kwargs) >= 2
+        assert research_kwargs[0].get("mode") == "learning"
+        assert research_kwargs[1].get("network") is False, research_kwargs[1]
+        assert research_kwargs[1].get("use_brain") is False, research_kwargs[1]
         verified_hist = [
             e for e in orch_sc.memory.get_topic_knowledge(topic_sc)
             if isinstance(e, dict) and e.get("verified")
@@ -2366,8 +2374,8 @@ def run(context: dict) -> dict:
         # Inject research content via spy so we don't depend on network
         _real = orch_ka.research.research
 
-        def _rich_research(queries, goal=""):
-            base = _real(queries, goal=goal)
+        def _rich_research(queries, goal="", **kwargs):
+            base = _real(queries, goal=goal, **kwargs)
             base["raw"] = (
                 str(base.get("raw") or "")
                 + "\nSignal processing transforms measurements into useful information. "
@@ -2452,9 +2460,9 @@ def run(context: dict) -> dict:
         )
         _real2 = orch_gf.research.research
 
-        def _spy2(queries, goal=""):
+        def _spy2(queries, goal="", **kwargs):
             orch_gf.gap_queries.append(list(queries or []))
-            base = _real2(queries, goal=goal)
+            base = _real2(queries, goal=goal, **kwargs)
             base["raw"] = (
                 "Control systems regulate behavior using feedback loops. "
                 "A setpoint is compared to measured output. "
@@ -2484,7 +2492,188 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
-    # 4i) E2E: each USER REQUEST isolated — conversation ≠ prior learning final_result
+    # 4i) E2E: performance hardening — no offline brain hang, local gap-fill, tags cache
+    print("  — e2e performance hardening (research/brain/router) —")
+    try:
+        from jarvis.research import ResearchSystem
+        from jarvis.model_router import ModelRouter, TAGS_CACHE_TTL_SEC
+        from jarvis.brain import Brain as BrainCls, _is_connection_failure
+        from jarvis import learning_verify as lv_perf
+        from jarvis.orchestrator import Orchestrator as OrchPerf
+
+        assert _is_connection_failure("Connection refused")
+        assert _is_connection_failure(ConnectionRefusedError("boom"))
+        assert TAGS_CACHE_TTL_SEC >= 5
+
+        # Research: offline brain must NOT call research_notes
+        class _TrapBrain:
+            def is_available(self):
+                return False
+
+            def research_notes(self, *a, **k):
+                raise AssertionError("research_notes must not run when offline")
+
+        calls = {"brain": 0, "ddg": 0}
+
+        rs = ResearchSystem(brain=_TrapBrain(), on_log=lambda m: None, timeout=2.0)
+        _ddg = rs._duckduckgo_search
+
+        def _count_ddg(q, append_python=True):
+            calls["ddg"] += 1
+            return "(stub)", []
+
+        rs._duckduckgo_search = _count_ddg  # type: ignore[method-assign]
+        out_skill = rs.research(["make zip file"], goal="zip", mode="skill", network=True)
+        assert out_skill.get("brain_used") is False
+        assert "Local hints" in (out_skill.get("raw") or "")
+        assert "SKILL_META" in (out_skill.get("raw") or "")
+        titles = [str(s.get("title") or "") for s in (out_skill.get("sources") or [])]
+        assert any("Local capability hints" in t for t in titles), titles
+        assert calls["ddg"] >= 1
+
+        # Learning mode: no skill hints, no python append, no brain
+        calls["ddg"] = 0
+        seen_append: list[bool] = []
+
+        def _ddg2(q, append_python=True):
+            seen_append.append(bool(append_python))
+            calls["ddg"] += 1
+            return "optics notes", [{
+                "url": "http://ex/o", "title": "Optics", "source": "web",
+                "provider": "ddg", "timestamp": 0, "query": q, "snippet": "light",
+            }]
+
+        rs._duckduckgo_search = _ddg2  # type: ignore[method-assign]
+        out_learn = rs.research(
+            ["Learn optics basics"],
+            goal="Learn optics basics",
+            mode="learning",
+            network=True,
+            use_brain=False,
+            append_python=False,
+        )
+        assert out_learn.get("mode") == "learning"
+        assert out_learn.get("brain_used") is False
+        assert "SKILL_META" not in (out_learn.get("raw") or "")
+        assert "Learning focus" in (out_learn.get("raw") or "")
+        assert seen_append and seen_append[0] is False
+
+        # Gap-fill local: network=False → no DDG
+        calls["ddg"] = 0
+        out_gap = rs.research(
+            ["optics — core concepts"],
+            goal="Learn optics",
+            mode="learning",
+            network=False,
+            use_brain=False,
+        )
+        assert calls["ddg"] == 0
+        assert out_gap.get("network") is False
+        assert "Gap-fill focus" in (out_gap.get("raw") or "")
+
+        # Tags cache: status() must not refresh every call
+        n_list = {"n": 0}
+
+        def _list():
+            n_list["n"] += 1
+            return ["qwen3:4b", "qwen3:30b", "qwen3-coder:30b"]
+
+        router = ModelRouter(list_models=_list, on_log=lambda m: None)
+        assert router.status() == "ONLINE"
+        first = n_list["n"]
+        assert router.status() == "ONLINE"
+        assert router.status() == "ONLINE"
+        assert n_list["n"] == first  # cached
+
+        # Connection fail-fast: no HTTP double-wait
+        class FailFastBrain(BrainCls):
+            def _get_client(self):
+                class C:
+                    def chat(self, **kw):
+                        raise ConnectionRefusedError("Connection refused")
+
+                return C()
+
+            def _http_chat(self, *a, **k):
+                raise AssertionError("HTTP fallback must not run on connection refused")
+
+            def _list_model_names(self):
+                return ["qwen3:4b"]
+
+        ff = FailFastBrain()
+        text = ff._chat_on_model([{"role": "user", "content": "hi"}], 0.1, "qwen3:4b")
+        assert text.startswith("[BRAIN ERROR]")
+        assert "unreachable" in text.lower() or "refused" in text.lower()
+
+        # Practical: offline expression before any brain call
+        class SpyPracticalOrch(OrchPerf):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.brain_practical_calls = 0
+
+        class OnlineSpyBrain(Brain):
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def produce_learning_answer(self, *a, **k):
+                raise AssertionError("brain practical must not run for offline expression")
+
+        pr_root = root / "data" / "_e2e_perf_practical"
+        if pr_root.exists():
+            shutil.rmtree(pr_root)
+        pr_root.mkdir(parents=True)
+        orch_p = SpyPracticalOrch(root=pr_root, brain=OnlineSpyBrain())
+        # Monkeypatch produce on the instance brain
+        def _boom(*a, **k):
+            orch_p.brain_practical_calls += 1
+            raise AssertionError("should not call brain for arithmetic")
+
+        orch_p.brain.produce_learning_answer = _boom  # type: ignore[method-assign]
+        got = orch_p._produce_learning_practical(
+            "What is 12+8? Explain briefly.",
+            {"approach": "arithmetic", "key_apis": [], "test_idea": "check sum"},
+        )
+        assert got and got.get("source") == "offline_expression", got
+        assert orch_p.brain_practical_calls == 0
+        assert lv_perf.extract_arithmetic_tasks("What is 12+8?")
+        orch_p.close()
+
+        # Ledger start_task does not double-log REQUEST
+        from jarvis.ledger import Ledger
+        led_path = root / "data" / "_e2e_perf_ledger" / "l.db"
+        led_path.parent.mkdir(parents=True, exist_ok=True)
+        led = Ledger(led_path)
+        tid = led.start_task("goal x")
+        actions = led.task_actions(tid) if hasattr(led, "task_actions") else None
+        if actions is None:
+            # Fallback: query via get
+            with led._lock:
+                rows = led._conn.execute(
+                    "SELECT phase FROM actions WHERE task_id=? ORDER BY id", (tid,)
+                ).fetchall()
+            phases = [r[0] for r in rows]
+        else:
+            phases = [a.get("phase") for a in actions]
+        assert phases.count("REQUEST") == 0, phases  # caller logs REQUEST once
+        led.log(tid, "REQUEST", "once")
+        with led._lock:
+            rows = led._conn.execute(
+                "SELECT phase FROM actions WHERE task_id=?", (tid,)
+            ).fetchall()
+        assert [r[0] for r in rows].count("REQUEST") == 1
+        led.close() if hasattr(led, "close") else None
+
+        print("  OK performance hardening — research/brain/router/practical/ledger")
+    except Exception as exc:
+        msg = f"E2E_PERF_HARDENING: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 4j) E2E: each USER REQUEST isolated — conversation ≠ prior learning final_result
     print("  — e2e request routing isolation (conversation ≠ prior DONE) —")
     try:
         from jarvis.intent import IntentClassifier

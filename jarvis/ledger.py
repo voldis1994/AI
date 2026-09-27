@@ -43,6 +43,12 @@ class Ledger:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # Faster durable writes on the hot path (many phase logs per attempt)
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -74,6 +80,7 @@ class Ledger:
             self._conn.commit()
 
     def start_task(self, goal: str) -> str:
+        """Create task row only — callers log the detailed REQUEST phase once."""
         task_id = uuid.uuid4().hex[:12]
         now = time.time()
         with self._lock:
@@ -83,7 +90,6 @@ class Ledger:
                 (task_id, goal, "REQUEST", now, now, None),
             )
             self._conn.commit()
-        self.log(task_id, "REQUEST", f"New request: {goal}")
         return task_id
 
     def log(

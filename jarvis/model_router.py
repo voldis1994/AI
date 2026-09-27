@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from jarvis import model_config as cfg
 
 logger = logging.getLogger("jarvis.model_router")
+
+# Avoid hammering Ollama /api/tags from GUI ticks and is_available().
+TAGS_CACHE_TTL_SEC = 15.0
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,8 @@ class ModelRouter:
         self._lock = threading.RLock()
         self._cached_tags: Optional[list[str]] = None
         self._cache_ok = False
+        self._cache_ts: float = 0.0
+        self._cache_ttl = TAGS_CACHE_TTL_SEC
         self._last_route: Optional[RouteDecision] = None
 
     def set_logger(self, on_log: Callable[[str], None]) -> None:
@@ -62,15 +68,22 @@ class ModelRouter:
         with self._lock:
             self._cached_tags = None
             self._cache_ok = False
+            self._cache_ts = 0.0
 
     def available_models(self, *, refresh: bool = False) -> Optional[list[str]]:
         """Installed model names, or None if Ollama unreachable."""
         with self._lock:
-            if not refresh and self._cache_ok:
+            now = time.time()
+            fresh_enough = (
+                self._cache_ok
+                and (now - self._cache_ts) < self._cache_ttl
+            )
+            if not refresh and fresh_enough:
                 return list(self._cached_tags) if self._cached_tags is not None else None
             tags = self._list_models()
             self._cached_tags = list(tags) if tags is not None else None
             self._cache_ok = True
+            self._cache_ts = now
             return list(self._cached_tags) if self._cached_tags is not None else None
 
     def model_in_tags(self, model: str, tags: Optional[list[str]]) -> bool:
@@ -86,15 +99,18 @@ class ModelRouter:
             return False
         return any(self.model_in_tags(m, tags) for m in cfg.all_configured_models())
 
-    def status(self) -> str:
+    def status(self, *, refresh: bool = False) -> str:
         """
         Aggregate brain status across the multi-model catalog:
           ONLINE / MODEL MISSING / OFFLINE
+
+        Uses cached tags by default (TTL) — GUI ticks must not force /api/tags.
+        Pass refresh=True after connection failures or explicit /status.
         """
-        tags = self.available_models(refresh=True)
+        tags = self.available_models(refresh=refresh)
         if tags is None:
             return "OFFLINE"
-        if self.any_configured_online():
+        if any(self.model_in_tags(m, tags) for m in cfg.all_configured_models()):
             return "ONLINE"
         return "MODEL MISSING"
 
@@ -217,12 +233,16 @@ class ModelRouter:
         *,
         expect_json: bool = False,
         expect_code: bool = False,
+        error_only: bool = False,
     ) -> bool:
         """
         Deterministic checks that a model reply is unusable.
 
         Does NOT judge semantic task success — only empty/error/malformed output.
         Verifier / Python checks remain authoritative for goal achievement.
+
+        error_only=True: escalate only on empty / [BRAIN ERROR] / unreachable
+        (not on weak JSON) — use for cheap FAST micro-tasks with offline fallbacks.
         """
         raw = (text or "").strip()
         if not raw:
@@ -232,6 +252,8 @@ class ModelRouter:
         low = raw.lower()
         if "ollama unreachable" in low or "connection refused" in low:
             return True
+        if error_only:
+            return False
         if expect_json:
             if "{" not in raw and "[" not in raw:
                 return True

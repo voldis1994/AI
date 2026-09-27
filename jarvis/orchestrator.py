@@ -44,6 +44,8 @@ logger = logging.getLogger("jarvis.orchestrator")
 
 MAX_REPAIR_ATTEMPTS = 5
 MAX_LEARNING_ATTEMPTS = 5
+# Learning: at most one networked research gather; later attempts are local gap-fill.
+MAX_LEARNING_NETWORK_RESEARCH = 1
 
 # Layers that must NEVER trigger a skill rewrite (rewrite only for skill_code).
 _NON_REWRITE_LAYERS = frozenset({
@@ -104,6 +106,8 @@ class Orchestrator:
         self.loader = SkillLoader(self.skills_dir, self.workspace)
         self.observer = Observer(self.workspace, on_log=self._log)
         self.contexts = ContextBuilder(brain=self.brain, on_log=self._log)
+        # Ephemeral: last repair VERIFY PASS proof (skip duplicate execute+verify)
+        self._activation_proof: Optional[dict[str, Any]] = None
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -471,6 +475,9 @@ class Orchestrator:
             saved: dict[str, Any] = {}
             diagnosis: Optional[dict] = None
             gap_fill_only = False
+            network_research_used = 0
+            prior_gap_sig = ""
+            stagnant_gap_rounds = 0
 
             for attempt in range(1, MAX_LEARNING_ATTEMPTS + 1):
                 ap_fp = Observer.fingerprint_approach(current_approach)
@@ -488,16 +495,30 @@ class Orchestrator:
                     (diagnosis or {}).get("missing_knowledge") or []
                 )
 
-                # RESEARCH — full only on first gather; later = gap-fill queries
+                # RESEARCH — networked once; later attempts = local gap-fill only
+                use_network = (
+                    (not gap_fill_only)
+                    and network_research_used < MAX_LEARNING_NETWORK_RESEARCH
+                )
                 self._status("RESEARCH")
                 self._log(
                     f"[{task_id}] LEARNING RESEARCH attempt={attempt}/"
                     f"{MAX_LEARNING_ATTEMPTS} topic={topic!r} "
                     f"approach={current_approach!r} "
-                    f"gap_fill={gap_fill_only} gaps={missing_gaps!r} "
-                    f"queries={len(queries)}"
+                    f"gap_fill={gap_fill_only} network={use_network} "
+                    f"gaps={missing_gaps!r} queries={len(queries)}"
                 )
-                fresh = self.research.research(queries, goal=goal)
+                fresh = self.research.research(
+                    queries,
+                    goal=goal,
+                    mode="learning",
+                    network=use_network,
+                    use_brain=False,
+                    max_queries=3 if use_network else max(1, min(3, len(queries))),
+                    append_python=False,
+                )
+                if use_network:
+                    network_research_used += 1
                 fresh = self._learning_strip_skill_defaults(fresh)
 
                 # Deterministic KnowledgeArtifact synthesis (minimizes 30B calls)
@@ -707,7 +728,7 @@ class Orchestrator:
                     f"(gap-fill only — not full restart)"
                 )
 
-                # Next attempt fills ONLY missing fields
+                # Next attempt fills ONLY missing fields (local — no full restart)
                 queries = list(diagnosis.get("research_queries") or []) or gap_fill_queries(
                     task_goal.user_request,
                     list(diagnosis.get("missing_knowledge") or ["explanations"]),
@@ -715,6 +736,20 @@ class Orchestrator:
                 queries = queries[:6]
                 current_approach = str(diagnosis.get("approach") or current_approach)
                 gap_fill_only = True
+                gap_sig = "|".join(
+                    sorted(str(g) for g in (diagnosis.get("missing_knowledge") or []))
+                )
+                if gap_sig and gap_sig == prior_gap_sig:
+                    stagnant_gap_rounds += 1
+                else:
+                    stagnant_gap_rounds = 0
+                prior_gap_sig = gap_sig
+                if stagnant_gap_rounds >= 2:
+                    self._log(
+                        f"[{task_id}] LEARNING stagnation — same gaps "
+                        f"{gap_sig!r} twice; stopping early"
+                    )
+                    break
                 prior_history = self.memory.get_topic_knowledge(topic, limit=8)
 
             outcome = (
@@ -895,6 +930,7 @@ class Orchestrator:
                     temperature=0.2,
                     work="query_generation",
                     allow_escalate=True,
+                    escalate_error_only=True,
                     expect_json=True,
                 )
                 parsed = self.brain._parse_json(extra, {"queries": []})
@@ -1001,20 +1037,23 @@ class Orchestrator:
             "test_idea": research.get("test_idea"),
             "summary": str(research.get("approach") or "")[:2000],
         }
+        # Offline Python first — never burn 30B when a local result exists
+        offline = learn_v.produce_practical_offline(user_request, research)
+        if offline.get("source") == "offline_expression":
+            return offline
+        ans = str(offline.get("answer") or "").strip()
+        if ans and not ans.lower().startswith("insufficient"):
+            return offline
         if self.brain.is_available():
             try:
                 produced = self.brain.produce_learning_answer(user_request, knowledge)
                 if isinstance(produced, dict) and (
                     produced.get("answer") or produced.get("result") is not None
                 ):
-                    # Prefer offline arithmetic when expression present (deterministic)
-                    offline = learn_v.produce_practical_offline(user_request, research)
-                    if offline.get("source") == "offline_expression":
-                        return offline
                     return produced
             except Exception as exc:
                 self._log(f"LEARNING practical brain produce failed ({exc}); offline")
-        return learn_v.produce_practical_offline(user_request, research)
+        return offline
 
     def _diagnose_learning_gap(
         self,
@@ -1385,9 +1424,8 @@ class Orchestrator:
                         task_args=task_args, task_goal=task_goal,
                     )
                     if skill_record and skill_record["status"] == "ACTIVE":
-                        exec_result = self._execute_trusted(
-                            task_id, skill_record, goal,
-                            args=task_args, task_goal=task_goal,
+                        exec_result = self._exec_after_repair(
+                            task_id, skill_record, goal, task_args, task_goal
                         )
             else:
                 skill_record, task_args, task_goal = self._learn_or_repair(
@@ -1395,12 +1433,25 @@ class Orchestrator:
                     task_args=task_args, task_goal=task_goal,
                 )
                 if skill_record and skill_record["status"] == "ACTIVE":
-                    exec_result = self._execute_trusted(
-                        task_id, skill_record, goal,
-                        args=task_args, task_goal=task_goal,
+                    exec_result = self._exec_after_repair(
+                        task_id, skill_record, goal, task_args, task_goal
                     )
 
             # VERIFY final execution against USER REQUEST — not skill self-proof
+            # (skipped when repair already VERIFY'd — proof reused below)
+            proof_v = None
+            if (
+                isinstance(exec_result, dict)
+                and exec_result.get("_from_activation_proof")
+                and isinstance(exec_result.get("_verification"), dict)
+                and exec_result["_verification"].get("verified")
+            ):
+                proof_v = exec_result["_verification"]
+                self._log(
+                    f"[{task_id}] Reusing repair VERIFY PASS "
+                    f"(skip duplicate execute+VERIFY)"
+                )
+
             self._status("VERIFY")
             if not exec_result:
                 outcome = "Neizdevās izpildīt uzdevumu: nav skill / nav izpildes rezultāta."
@@ -1424,26 +1475,41 @@ class Orchestrator:
                 f"[{task_id}] SKILL RESULT: ok={exec_result.get('ok')} "
                 f"rc={exec_result.get('returncode')} error={exec_result.get('error')}"
             )
-            verification = self.verifier.verify(
-                goal,
-                exec_result,
-                require_brain_confirm=False,
-                args=task_args,
-                user_request=task_goal.user_request,
-                constraints=task_goal.with_args(task_args).constraints,
-                task_goal=task_goal,
-            )
-            self.ledger.log(
-                task_id,
-                "VERIFY",
-                verification.get("reason"),
-                {
-                    "skill_result": verification.get("skill_result"),
-                    "verifier_result": verification.get("verifier_result"),
-                    "args": task_args,
-                    "task_goal": task_goal.to_dict(),
-                },
-            )
+            if proof_v is not None:
+                verification = proof_v
+                self.ledger.log(
+                    task_id,
+                    "VERIFY",
+                    verification.get("reason"),
+                    {
+                        "skill_result": verification.get("skill_result"),
+                        "verifier_result": verification.get("verifier_result"),
+                        "args": task_args,
+                        "task_goal": task_goal.to_dict(),
+                        "reused_activation_proof": True,
+                    },
+                )
+            else:
+                verification = self.verifier.verify(
+                    goal,
+                    exec_result,
+                    require_brain_confirm=False,
+                    args=task_args,
+                    user_request=task_goal.user_request,
+                    constraints=task_goal.with_args(task_args).constraints,
+                    task_goal=task_goal,
+                )
+                self.ledger.log(
+                    task_id,
+                    "VERIFY",
+                    verification.get("reason"),
+                    {
+                        "skill_result": verification.get("skill_result"),
+                        "verifier_result": verification.get("verifier_result"),
+                        "args": task_args,
+                        "task_goal": task_goal.to_dict(),
+                    },
+                )
             self._log(
                 f"[{task_id}] VERIFIER RESULT: "
                 f"{'PASS' if verification.get('verified') else 'FAIL'} — "
@@ -1480,20 +1546,30 @@ class Orchestrator:
                     task_goal=task_goal,
                 )
                 if skill_record and skill_record.get("status") == "ACTIVE":
-                    exec_result = self._execute_trusted(
-                        task_id, skill_record, goal,
-                        args=task_args, task_goal=task_goal,
+                    exec_result = self._exec_after_repair(
+                        task_id, skill_record, goal, task_args, task_goal
                     )
                     self._status("VERIFY")
-                    verification = self.verifier.verify(
-                        goal,
-                        exec_result,
-                        require_brain_confirm=False,
-                        args=task_args,
-                        user_request=task_goal.user_request,
-                        constraints=task_goal.with_args(task_args).constraints,
-                        task_goal=task_goal,
-                    )
+                    if (
+                        isinstance(exec_result, dict)
+                        and exec_result.get("_from_activation_proof")
+                        and isinstance(exec_result.get("_verification"), dict)
+                    ):
+                        verification = exec_result["_verification"]
+                        self._log(
+                            f"[{task_id}] Reusing repair VERIFY PASS "
+                            f"(after outer VERIFY FAIL repair)"
+                        )
+                    else:
+                        verification = self.verifier.verify(
+                            goal,
+                            exec_result,
+                            require_brain_confirm=False,
+                            args=task_args,
+                            user_request=task_goal.user_request,
+                            constraints=task_goal.with_args(task_args).constraints,
+                            task_goal=task_goal,
+                        )
                     self.ledger.log(
                         task_id,
                         "VERIFY",
@@ -2024,6 +2100,14 @@ class Orchestrator:
                         diagnosis=diagnosis,
                         description=description,
                     )
+                    # Reuse this VERIFY'd exec — avoid re-execute + re-VERIFY tax
+                    self._activation_proof = {
+                        "task_id": task_id,
+                        "skill_name": skill_name,
+                        "exec_result": test_result,
+                        "verification": verification,
+                        "args": dict(args or {}),
+                    }
                     return skill, args, task_goal
 
             # ── OBSERVE → DIAGNOSE → fix the correct layer ─────────────
@@ -2108,7 +2192,15 @@ class Orchestrator:
         self._status("RESEARCH")
         if not isinstance(queries, list):
             queries = [str(queries)]
-        research = self.research.research(queries, goal=goal)
+        # Skill mode: brain notes only when Ollama is ONLINE (no offline hang)
+        research = self.research.research(
+            queries,
+            goal=goal,
+            mode="skill",
+            network=True,
+            use_brain=None,  # auto: available() only
+            append_python=True,
+        )
         # Persist knowledge (history + latest snapshot) so repairs can reuse it
         saved = self.memory.save_research_knowledge(
             skill_name, research, goal=goal, queries=queries
@@ -2210,110 +2302,40 @@ class Orchestrator:
         self._status("DIAGNOSE")
         failed = self.memory.get_failed_approaches(skill_name)
         prior_solutions = self.memory.recent_solutions(skill_name=skill_name, limit=5)
-        if self.brain.is_available():
-            diagnosis = self.brain.diagnose(
-                observation,
-                failed_approaches=failed,
-                prior_solutions=[
-                    {
-                        "approach": s.get("approach"),
-                        "summary": s.get("diagnosis_summary"),
-                    }
-                    for s in prior_solutions
-                ],
-            )
-        else:
-            ctx_args = (observation.get("context") or {}).get("args") or {}
-            if not isinstance(ctx_args, dict):
-                ctx_args = {}
-            empty_args = not ctx_args
-            invented = any(
-                TaskGoal.is_invented_default(v, task_goal.user_request)
-                for v in ctx_args.values()
-            )
-            err = str(observation.get("exception") or "")
-            err_l = err.lower()
-            phase = str(observation.get("phase") or "").upper()
-            parsed_missing = ContextBuilder.parse_missing_arg_names(err)
-            args_fault = (
-                empty_args or bool(parsed_missing) or invented
-            ) and any(
-                t in err_l
-                for t in (
-                    "argument", "args", "missing", "required", "keyerror",
-                    "default", "untrusted", "claim_aligns", "user_provided",
+        # Deterministic heuristics first — skip 30B when fault layer is obvious
+        diagnosis = self._deterministic_diagnose(observation, task_goal)
+        clear_layers = {
+            "context_mapping", "environment", "goal_parsing",
+        }
+        layer_clear = diagnosis.get("fault_layer") in clear_layers
+        ambiguous_skill = (
+            diagnosis.get("fault_layer") == "skill_code"
+            and diagnosis.get("approach") not in ("honor_user_request",)
+        )
+        if (
+            self.brain.is_available()
+            and not layer_clear
+            and ambiguous_skill
+        ):
+            try:
+                diagnosis = self.brain.diagnose(
+                    observation,
+                    failed_approaches=failed,
+                    prior_solutions=[
+                        {
+                            "approach": s.get("approach"),
+                            "summary": s.get("diagnosis_summary"),
+                        }
+                        for s in prior_solutions
+                    ],
                 )
-            )
-            goal_mismatch = phase == "VERIFY" and any(
-                t in err_l
-                for t in (
-                    "default", "placeholder", "untrusted", "claim_aligns",
-                    "not in user", "user constraints", "user request",
-                    "reject_defaults", "missing from expected",
-                )
-            ) and not invented and not empty_args
-            no_constraints = phase == "VERIFY" and "no user-derived constraints" in err_l
-            env_fault = any(
-                t in err_l for t in ("modulenotfound", "no module named", "importerror")
-            )
-            if no_constraints and empty_args:
-                layer = "goal_parsing"
-                rewrite = False
-                approach = "goal_parsing_repair"
-                change = "Re-parse immutable TaskGoal / USER REQUEST into constraints"
-            elif args_fault and not goal_mismatch:
-                layer = "context_mapping"
-                rewrite = False
-                approach = "context_mapping"
-                change = (
-                    "Map TaskGoal → skill args from USER REQUEST "
-                    "(no invented defaults)"
-                )
-            elif env_fault:
-                layer = "environment"
-                rewrite = False
-                approach = "fix_environment"
-                change = "Install / fix missing dependencies"
-            elif goal_mismatch:
-                layer = "skill_code"
-                rewrite = True
-                approach = "honor_user_request"
-                change = (
-                    "Rewrite skill to satisfy original TaskGoal "
-                    "(no default/placeholder artifacts)"
-                )
-            else:
-                layer = "skill_code"
-                rewrite = True
-                approach = f"offline_alt_v{int(observation.get('version') or 0) + 1}"
-                change = "Rebuild with a different strategy using observation data"
-            layer = TaskGoal.normalize_fault_layer(layer)
-            rewrite = TaskGoal.rewrite_skill_for_layer(layer)
-            diagnosis = {
-                "root_cause": str(observation.get("exception") or "unknown")[:500],
-                "fault_layer": layer,
-                "rewrite_skill": rewrite,
-                "what_to_change": change,
-                "approach": approach,
-                "approach_changed": True,
-                # Research only for genuine knowledge gaps — not every skill_code fail
-                "needs_research": False,
-                "missing_knowledge": [],
-                "research_queries": [],
-                "needs_new_deps": [],
-                "missing_args": list(parsed_missing),
-                "required_args": list(parsed_missing),
-                "suggested_args": {},
-                "test_plan": (
-                    "subprocess retest with grounded args; "
-                    "VERIFY against original TaskGoal (reject defaults)"
-                ),
-                "expected_artifacts": [],
-                "is_unfixable": False,
-                "diagnosis": str(observation.get("exception") or "failure")[:500],
-            }
-            diagnosis["approach_fingerprint"] = Observer.fingerprint_approach(
-                diagnosis["approach"]
+            except Exception as exc:
+                self._log(f"DIAGNOSE brain failed ({exc}); using deterministic")
+                diagnosis = self._deterministic_diagnose(observation, task_goal)
+        elif layer_clear:
+            self._log(
+                f"DIAGNOSE: deterministic layer={diagnosis.get('fault_layer')} "
+                f"(skipped 30B)"
             )
 
         # Universal enrichment: parse missing arg names + suggest values from TaskGoal
@@ -2793,6 +2815,129 @@ class Orchestrator:
             f"approach={approach!r}"
         )
         return self.registry.get_skill(skill_name)
+
+    def _exec_after_repair(
+        self,
+        task_id: str,
+        skill: dict,
+        goal: str,
+        task_args: dict,
+        task_goal: TaskGoal,
+    ) -> dict:
+        """
+        Prefer VERIFY'd repair proof over a second execute+VERIFY cycle.
+        """
+        proof = self._activation_proof
+        self._activation_proof = None
+        if (
+            isinstance(proof, dict)
+            and proof.get("task_id") == task_id
+            and proof.get("skill_name") == skill.get("name")
+            and isinstance(proof.get("verification"), dict)
+            and proof["verification"].get("verified")
+            and isinstance(proof.get("exec_result"), dict)
+        ):
+            out = dict(proof["exec_result"])
+            out["_from_activation_proof"] = True
+            out["_verification"] = proof["verification"]
+            return out
+        return self._execute_trusted(
+            task_id, skill, goal, args=task_args, task_goal=task_goal
+        )
+
+    @staticmethod
+    def _deterministic_diagnose(
+        observation: dict[str, Any],
+        task_goal: TaskGoal,
+    ) -> dict[str, Any]:
+        """Python fault-layer diagnosis — no LLM. Prefer over 30B when clear."""
+        ctx_args = (observation.get("context") or {}).get("args") or {}
+        if not isinstance(ctx_args, dict):
+            ctx_args = {}
+        empty_args = not ctx_args
+        invented = any(
+            TaskGoal.is_invented_default(v, task_goal.user_request)
+            for v in ctx_args.values()
+        )
+        err = str(observation.get("exception") or "")
+        err_l = err.lower()
+        phase = str(observation.get("phase") or "").upper()
+        parsed_missing = ContextBuilder.parse_missing_arg_names(err)
+        args_fault = (
+            empty_args or bool(parsed_missing) or invented
+        ) and any(
+            t in err_l
+            for t in (
+                "argument", "args", "missing", "required", "keyerror",
+                "default", "untrusted", "claim_aligns", "user_provided",
+            )
+        )
+        goal_mismatch = phase == "VERIFY" and any(
+            t in err_l
+            for t in (
+                "default", "placeholder", "untrusted", "claim_aligns",
+                "not in user", "user constraints", "user request",
+                "reject_defaults", "missing from expected",
+            )
+        ) and not invented and not empty_args
+        no_constraints = phase == "VERIFY" and "no user-derived constraints" in err_l
+        env_fault = any(
+            t in err_l for t in ("modulenotfound", "no module named", "importerror")
+        )
+        if no_constraints and empty_args:
+            layer = "goal_parsing"
+            approach = "goal_parsing_repair"
+            change = "Re-parse immutable TaskGoal / USER REQUEST into constraints"
+        elif args_fault and not goal_mismatch:
+            layer = "context_mapping"
+            approach = "context_mapping"
+            change = (
+                "Map TaskGoal → skill args from USER REQUEST "
+                "(no invented defaults)"
+            )
+        elif env_fault:
+            layer = "environment"
+            approach = "fix_environment"
+            change = "Install / fix missing dependencies"
+        elif goal_mismatch:
+            layer = "skill_code"
+            approach = "honor_user_request"
+            change = (
+                "Rewrite skill to satisfy original TaskGoal "
+                "(no default/placeholder artifacts)"
+            )
+        else:
+            layer = "skill_code"
+            approach = f"offline_alt_v{int(observation.get('version') or 0) + 1}"
+            change = "Rebuild with a different strategy using observation data"
+        layer = TaskGoal.normalize_fault_layer(layer)
+        rewrite = TaskGoal.rewrite_skill_for_layer(layer)
+        diagnosis = {
+            "root_cause": str(observation.get("exception") or "unknown")[:500],
+            "fault_layer": layer,
+            "rewrite_skill": rewrite,
+            "what_to_change": change,
+            "approach": approach,
+            "approach_changed": True,
+            "needs_research": False,
+            "missing_knowledge": [],
+            "research_queries": [],
+            "needs_new_deps": [],
+            "missing_args": list(parsed_missing),
+            "required_args": list(parsed_missing),
+            "suggested_args": {},
+            "test_plan": (
+                "subprocess retest with grounded args; "
+                "VERIFY against original TaskGoal (reject defaults)"
+            ),
+            "expected_artifacts": [],
+            "is_unfixable": False,
+            "diagnosis": str(observation.get("exception") or "failure")[:500],
+        }
+        diagnosis["approach_fingerprint"] = Observer.fingerprint_approach(
+            diagnosis["approach"]
+        )
+        return diagnosis
 
     def _execute_trusted(
         self,
