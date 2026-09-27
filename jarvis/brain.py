@@ -199,8 +199,13 @@ class Brain:
             '{"steps":["..."],"can_reuse":["skill_name"],'
             '"missing":["what we cannot do"],"needs_research":true|false,'
             '"needs_new_skill":true|false,"skill_name":"snake_case_name",'
-            '"skill_description":"...","research_queries":["..."]}\n'
-            "Prefer reusing existing capabilities. Only request a new skill if none fit."
+            '"skill_description":"...","research_queries":["..."],'
+            '"args":{"any_key":"value extracted from the user goal"},'
+            '"required_args":["arg_names_the_skill_will_need"]}\n'
+            "Prefer reusing existing capabilities. Only request a new skill if none fit.\n"
+            "Extract structured args from the user goal into args — do not leave them empty "
+            "when the goal clearly contains parameters (filenames, text, urls, numbers, etc.). "
+            "Arg names should match what a Python skill would read from context['args']."
         )
         prompt = f"GOAL:\n{goal}\n\nKNOWN CAPABILITIES:\n{caps}"
         raw = self.generate(prompt, system=system, temperature=0.2)
@@ -213,7 +218,59 @@ class Brain:
             "skill_name": self._slug(goal)[:40] or "new_skill",
             "skill_description": goal,
             "research_queries": [goal],
+            "args": {},
+            "required_args": [],
         })
+
+    def extract_task_args(
+        self,
+        goal: str,
+        skill_meta: Optional[dict] = None,
+        prior_args: Optional[dict] = None,
+        diagnosis: Optional[dict] = None,
+    ) -> dict[str, Any]:
+        """
+        Universally convert a user goal into structured args for context['args'].
+
+        No fixed schema — keys come from the goal / skill meta / diagnosis hints.
+        """
+        system = (
+            "Extract structured arguments for a JARVIS skill from the user goal. "
+            "Reply ONLY with JSON object of argument key→value pairs "
+            '(optionally wrap as {"args":{...}}).\n'
+            "Rules:\n"
+            "- Infer useful keys from the goal (whatever the task needs).\n"
+            "- Do NOT invent values not implied by the goal.\n"
+            "- If diagnosis lists missing/required args, prioritize filling those keys "
+            "from the goal text.\n"
+            "- Values may be strings, numbers, bools, or lists.\n"
+            "- If nothing extractable, return {}."
+        )
+        payload = {
+            "goal": goal,
+            "skill_meta": skill_meta or {},
+            "prior_args": prior_args or {},
+            "diagnosis_hints": {
+                "missing_args": (diagnosis or {}).get("missing_args"),
+                "required_args": (diagnosis or {}).get("required_args"),
+                "suggested_args": (diagnosis or {}).get("suggested_args"),
+                "root_cause": (diagnosis or {}).get("root_cause"),
+            },
+        }
+        raw = self.generate(
+            json.dumps(payload, ensure_ascii=False, default=str)[:8000],
+            system=system,
+            temperature=0.1,
+        )
+        parsed = self._parse_json(raw, {})
+        if isinstance(parsed.get("args"), dict):
+            return parsed["args"]
+        # If model returned a flat dict of args
+        banned = {
+            "diagnosis", "root_cause", "approach", "needs_research",
+            "test_plan", "fault_layer", "rewrite_skill",
+        }
+        return {k: v for k, v in parsed.items() if k not in banned and not str(k).startswith("_")}
 
     def research_notes(self, query: str, gathered: str) -> dict[str, Any]:
         """Summarize research into actionable learning notes."""
@@ -248,16 +305,21 @@ class Brain:
             "You write JARVIS skill modules. Output ONLY valid Python code, no markdown fences.\n"
             "Every skill MUST define:\n"
             "  SKILL_META = {'name': str, 'description': str, 'capabilities': [str], "
-            "'dependencies': [str], 'version': int}\n"
+            "'dependencies': [str], 'version': int, 'required_args': [str]}\n"
             "  def run(context: dict) -> dict:\n"
             "      '''Execute the skill. context has 'goal', 'args', 'workspace'. "
             "Return {'ok': bool, 'result': Any, 'error': str|None, 'evidence': str}. "
             "Put independently checkable fields in result "
             "(path/file/directory/url/imports/expect_status/contains).'''\n"
+            "CRITICAL argument rules:\n"
+            "- Read parameters ONLY from context['args'] (and goal/workspace as needed).\n"
+            "- NEVER invent/guess missing argument values.\n"
+            "- If required args are missing from context['args'], return ok=False with "
+            "error listing the missing keys — do not fabricate them.\n"
             "Use only stdlib + declared dependencies. Be concrete and correct. "
             "Do not pretend success — set ok=False on failure.\n"
-            "If a DIAGNOSIS is provided, implement THAT approach — do not repeat "
-            "failed approaches listed below."
+            "If a DIAGNOSIS is provided and fault_layer is skill_code, implement the fix. "
+            "Do not repeat failed approaches listed below."
         )
         parts = [
             f"Skill name: {skill_name}",
@@ -303,12 +365,17 @@ class Brain:
             "Reply ONLY with JSON:\n"
             "{\n"
             '  "root_cause": "...",\n'
+            '  "fault_layer": "skill_code"|"context_args"|"test_harness"|"dependency"|"verifier",\n'
+            '  "rewrite_skill": true|false,\n'
             '  "what_to_change": "...",\n'
             '  "approach": "short label of the NEW strategy to try",\n'
             '  "approach_changed": true|false,\n'
             '  "needs_research": true|false,\n'
             '  "research_queries": ["..."],\n'
             '  "needs_new_deps": ["pip-or-import-name"],\n'
+            '  "missing_args": ["arg_names"],\n'
+            '  "required_args": ["arg_names"],\n'
+            '  "suggested_args": {"arg": "value from goal if present"},\n'
             '  "test_plan": "how to validate the next version",\n'
             '  "expected_artifacts": ["what verifier should find"],\n'
             '  "is_unfixable": false,\n'
@@ -316,8 +383,14 @@ class Brain:
             "}\n"
             "Rules:\n"
             "- Use exception, traceback, stdout, stderr, returncode, code, "
-            "context, dependencies, artifacts.\n"
-            "- If the same approach already failed, you MUST set approach_changed=true "
+            "context (especially context.args), dependencies, artifacts.\n"
+            "- If context.args is empty/missing keys the skill needs, fault_layer MUST be "
+            "context_args and rewrite_skill=false. Fill suggested_args from the goal.\n"
+            "- Only set fault_layer=skill_code / rewrite_skill=true when the code itself is wrong "
+            "even with correct args.\n"
+            "- dependency: import/install failures. verifier: skill ok but evidence fails checks. "
+            "test_harness: runner did not pass context correctly.\n"
+            "- If the same approach already failed, set approach_changed=true "
             "and propose a meaningfully different approach.\n"
             "- Do not claim the task is done; only diagnose.\n"
             "- Prefer concrete, testable next steps."
@@ -342,23 +415,73 @@ class Brain:
             system=system,
             temperature=0.25,
         )
+        ctx = observation.get("context") or {}
+        ctx_args = ctx.get("args") if isinstance(ctx, dict) else {}
+        empty_args = not isinstance(ctx_args, dict) or len(ctx_args) == 0
+        err = str(observation.get("exception") or "").lower()
+        args_fault = empty_args and any(
+            tok in err for tok in ("argument", "args", "missing", "required", "keyerror")
+        )
         fallback = {
             "root_cause": str(observation.get("exception") or "unknown")[:500],
-            "what_to_change": "Revise skill logic based on stderr/traceback",
-            "approach": f"alt_approach_v{(observation.get('version') or 0) + 1}",
+            "fault_layer": "context_args" if args_fault else "skill_code",
+            "rewrite_skill": not args_fault,
+            "what_to_change": (
+                "Prepare structured context['args'] from the user goal and retest"
+                if args_fault
+                else "Revise skill logic based on stderr/traceback"
+            ),
+            "approach": (
+                "context_args_prep"
+                if args_fault
+                else f"alt_approach_v{(observation.get('version') or 0) + 1}"
+            ),
             "approach_changed": True,
-            "needs_research": True,
+            "needs_research": not args_fault,
             "research_queries": [
                 f"python {observation.get('goal', '')}",
                 str(observation.get("exception") or "")[:120],
             ],
             "needs_new_deps": [],
-            "test_plan": "Re-run skill in subprocess and independently verify artifacts",
+            "missing_args": [],
+            "required_args": [],
+            "suggested_args": {},
+            "test_plan": "Re-run skill in subprocess with prepared args; verify artifacts",
             "expected_artifacts": [],
             "is_unfixable": False,
             "diagnosis": str(observation.get("exception") or "failure")[:500],
         }
         result = self._parse_json(raw, fallback)
+        # Normalize fault_layer
+        layer = str(result.get("fault_layer") or fallback["fault_layer"]).lower()
+        valid_layers = {
+            "skill_code", "context_args", "test_harness", "dependency", "verifier",
+        }
+        if layer not in valid_layers:
+            layer = fallback["fault_layer"]
+        result["fault_layer"] = layer
+        if "rewrite_skill" not in result:
+            result["rewrite_skill"] = layer == "skill_code"
+        if layer == "context_args":
+            result["rewrite_skill"] = False
+        if not isinstance(result.get("suggested_args"), dict):
+            result["suggested_args"] = {}
+        if not isinstance(result.get("missing_args"), list):
+            result["missing_args"] = list(result.get("required_args") or [])
+
+        # Enrich missing/suggested args from error + goal (universal, no hardcoding)
+        from jarvis.context_builder import ContextBuilder
+
+        result = ContextBuilder.enrich_diagnosis_args(
+            result, observation, str(observation.get("goal") or "")
+        )
+        layer = str(result.get("fault_layer") or layer).lower()
+        if layer not in valid_layers:
+            layer = fallback["fault_layer"]
+        result["fault_layer"] = layer
+        if layer == "context_args":
+            result["rewrite_skill"] = False
+
         # Enforce approach change when fingerprint collided with failed list
         failed_fps = {
             str(a.get("approach_fingerprint") or a.get("fingerprint") or "")

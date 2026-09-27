@@ -525,6 +525,7 @@ def run_check(root: Path) -> int:
         "jarvis.observer",
         "jarvis.verifier",
         "jarvis.skill_loader",
+        "jarvis.context_builder",
         "jarvis.orchestrator",
     ]
     for name in modules:
@@ -696,7 +697,15 @@ def run(context: dict) -> dict:
                     "skill_name": "write_e2e_marker",
                     "skill_description": goal,
                     "research_queries": [goal],
+                    "args": {},
+                    "required_args": [],
                 }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                # Existing e2e skill hardcodes its artifact; no args required.
+                return {}
 
             def research_notes(self, query: str, gathered: str) -> dict:
                 return {
@@ -776,6 +785,8 @@ def run(context: dict) -> dict:
                     fp = Observer.fingerprint_approach(approach)
                 return {
                     "root_cause": str(observation.get("exception") or "test failed"),
+                    "fault_layer": "skill_code",
+                    "rewrite_skill": True,
                     "what_to_change": "Implement real artifact creation based on goal",
                     "approach": approach,
                     "approach_fingerprint": fp,
@@ -783,6 +794,9 @@ def run(context: dict) -> dict:
                     "needs_research": False,
                     "research_queries": [],
                     "needs_new_deps": [],
+                    "missing_args": [],
+                    "required_args": [],
+                    "suggested_args": {},
                     "test_plan": "subprocess run + verifier checks file exists with content",
                     "expected_artifacts": ["jarvis_e2e_marker.txt"],
                     "is_unfixable": False,
@@ -852,6 +866,254 @@ def run(context: dict) -> dict:
         print("  OK reuse    restart → ACTIVE skill reused (no re-learn)")
     except Exception as exc:
         msg = f"E2E: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 4b) E2E: empty args → DIAGNOSE context_args → RETEST with args (no skill rewrite)
+    print("  — e2e context/args fault_layer repair (no skill rewrite) —")
+    try:
+        from jarvis.context_builder import ContextBuilder
+
+        # Unit: universal missing-arg parse + offline fill (no hardcoded key names)
+        parsed = ContextBuilder.parse_missing_arg_names(
+            "The skill is missing required arguments 'alpha' and 'beta' when invoked."
+        )
+        assert parsed == ["alpha", "beta"], parsed
+        filled = ContextBuilder._offline_extract(
+            'Do work alpha_file.dat with "PAYLOAD_Z"',
+            diagnosis={"missing_args": ["alpha", "beta"], "required_args": ["alpha", "beta"]},
+        )
+        assert filled.get("alpha") == "alpha_file.dat", filled
+        assert filled.get("beta") == "PAYLOAD_Z", filled
+
+        args_root = root / "data" / "_e2e_args"
+        if args_root.exists():
+            shutil.rmtree(args_root)
+        args_root.mkdir(parents=True)
+
+        class ArgsFaultBrain(Brain):
+            """Skill is correct; PLAN/TEST start with empty args — repair must fill them."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.build_count = 0
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": user_text.split()[:8],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                reuse = []
+                for line in known_capabilities:
+                    if "args_echo_skill" in line:
+                        reuse.append("args_echo_skill")
+                return {
+                    "steps": ["run skill with structured args"],
+                    "can_reuse": reuse,
+                    "missing": [] if reuse else [goal],
+                    "needs_research": not bool(reuse),
+                    "needs_new_skill": not bool(reuse),
+                    "skill_name": "args_echo_skill",
+                    "skill_description": goal,
+                    "research_queries": [goal],
+                    # Simulate the bug: planner forgot to extract args
+                    "args": {},
+                    "required_args": [],
+                }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                # Without diagnosis, pretend brain extracted nothing (empty args bug).
+                # With diagnosis missing_args, fill universally from the goal.
+                if diagnosis and (
+                    diagnosis.get("missing_args")
+                    or diagnosis.get("required_args")
+                    or diagnosis.get("suggested_args")
+                ):
+                    return ContextBuilder._offline_extract(goal, diagnosis=diagnosis)
+                return {}
+
+            def research_notes(self, query: str, gathered: str) -> dict:
+                return {
+                    "approach": "read_context_args",
+                    "libraries": [],
+                    "key_apis": [query],
+                    "pitfalls": ["never invent missing args"],
+                    "test_idea": "pass structured args into run(context)",
+                }
+
+            def write_skill_code(
+                self,
+                skill_name,
+                description,
+                research,
+                previous_code=None,
+                error_log=None,
+                diagnosis=None,
+                failed_approaches=None,
+                test_plan=None,
+            ) -> str:
+                self.build_count += 1
+                # Correct skill from the start — fails only when context.args incomplete
+                import json as _json
+                desc_lit = _json.dumps(description or "")
+                return f'''
+from pathlib import Path
+
+SKILL_META = {{
+    "name": "{skill_name}",
+    "description": {desc_lit},
+    "capabilities": ["args_echo"],
+    "dependencies": [],
+    "version": {self.build_count},
+    "required_args": ["dest", "body"],
+}}
+
+def run(context: dict) -> dict:
+    args = context.get("args") or {{}}
+    required = list(SKILL_META.get("required_args") or [])
+    missing = [k for k in required if args.get(k) in (None, "")]
+    if missing:
+        return {{
+            "ok": False,
+            "result": None,
+            "error": (
+                "The skill is missing required arguments "
+                + " and ".join(repr(m) for m in missing)
+                + " when invoked."
+            ),
+            "evidence": f"args_keys={{list(args.keys())}}",
+        }}
+    workspace = Path(context.get("workspace") or ".")
+    path = workspace / str(args["dest"])
+    path.write_text(str(args["body"]) + "\\n", encoding="utf-8")
+    return {{
+        "ok": True,
+        "result": {{"path": str(path), "contains": str(args["body"])}},
+        "error": None,
+        "evidence": f"wrote {{path}} size={{path.stat().st_size}}",
+    }}
+'''
+
+            def diagnose(self, observation, failed_approaches=None, prior_solutions=None):
+                from jarvis.observer import Observer
+
+                err = str(observation.get("exception") or "")
+                phase = str(observation.get("phase") or "")
+                parsed = ContextBuilder.parse_missing_arg_names(err)
+                if parsed:
+                    d = {
+                        "root_cause": "context.args missing required keys",
+                        "fault_layer": "context_args",
+                        "rewrite_skill": False,
+                        "what_to_change": "Prepare args from user goal and retest",
+                        "approach": "context_args_prep",
+                        "approach_changed": True,
+                        "needs_research": False,
+                        "research_queries": [],
+                        "needs_new_deps": [],
+                        "missing_args": parsed,
+                        "required_args": parsed,
+                        "suggested_args": {},
+                        "test_plan": "retest with prepared context.args",
+                        "expected_artifacts": [],
+                        "is_unfixable": False,
+                        "diagnosis": err[:300],
+                    }
+                    d["approach_fingerprint"] = Observer.fingerprint_approach(
+                        d["approach"]
+                    )
+                    return ContextBuilder.enrich_diagnosis_args(
+                        d, observation, str(observation.get("goal") or "")
+                    )
+                # Verifier issues are not skill-code faults in this scenario
+                if phase == "VERIFY" or "VERIFIER" in err.upper():
+                    approach = "verifier_align"
+                    fp = Observer.fingerprint_approach(approach)
+                    return {
+                        "root_cause": err[:500],
+                        "fault_layer": "verifier",
+                        "rewrite_skill": False,
+                        "what_to_change": "Keep skill; rely on result.path evidence",
+                        "approach": approach,
+                        "approach_fingerprint": fp,
+                        "approach_changed": True,
+                        "needs_research": False,
+                        "research_queries": [],
+                        "needs_new_deps": [],
+                        "missing_args": [],
+                        "required_args": [],
+                        "suggested_args": {},
+                        "test_plan": "retest with same args",
+                        "expected_artifacts": [],
+                        "is_unfixable": False,
+                        "diagnosis": err[:300],
+                    }
+                approach = "unexpected_skill_fix"
+                fp = Observer.fingerprint_approach(approach)
+                return {
+                    "root_cause": err[:500],
+                    "fault_layer": "skill_code",
+                    "rewrite_skill": True,
+                    "what_to_change": "fix skill",
+                    "approach": approach,
+                    "approach_fingerprint": fp,
+                    "approach_changed": True,
+                    "needs_research": False,
+                    "research_queries": [],
+                    "needs_new_deps": [],
+                    "missing_args": [],
+                    "required_args": [],
+                    "suggested_args": {},
+                    "test_plan": "retest",
+                    "expected_artifacts": [],
+                    "is_unfixable": False,
+                    "diagnosis": err[:300],
+                }
+
+            def verify_claim(self, goal, result, evidence) -> dict:
+                return {"achieved": True, "confidence": 0.9, "reason": "advisory"}
+
+            def converse(self, user_text, history=None) -> str:
+                return "ok"
+
+        phases_a: list[str] = []
+        logs_a: list[str] = []
+        brain_a = ArgsFaultBrain()
+        orch_a = Orchestrator(
+            root=args_root,
+            brain=brain_a,
+            on_status=lambda s: phases_a.append(s),
+            on_log=lambda m: logs_a.append(m),
+        )
+        # Quoted values only — arg *names* come from skill error / diagnosis,
+        # not from hardcoded path/content keys in the goal.
+        goal_a = 'Create "args_e2e_out.txt" containing "ARGS_OK"'
+        result_a = orch_a.run_cycle(goal_a)
+        assert result_a.get("success"), result_a
+        out = args_root / "workspace_runtime" / "args_e2e_out.txt"
+        assert out.exists() and "ARGS_OK" in out.read_text(encoding="utf-8"), out
+        # Skill written once — context_args repair must not rewrite skill
+        assert brain_a.build_count == 1, brain_a.build_count
+        assert "OBSERVE" in phases_a and "DIAGNOSE" in phases_a and "RETEST" in phases_a
+        assert any("context_args" in m or "CONTEXT repair" in m for m in logs_a), logs_a[-20:]
+        assert any("Skip skill rewrite" in m for m in logs_a), logs_a[-20:]
+        orch_a.close()
+        print("  OK args     empty args → context_args diagnose → retest (no rewrite)")
+    except Exception as exc:
+        msg = f"E2E_ARGS: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)
