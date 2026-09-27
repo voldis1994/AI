@@ -53,15 +53,45 @@ _OPS = {
 
 
 def knowledge_blob(research: dict[str, Any], entry: Optional[dict] = None) -> str:
-    """Flatten knowledge into a single narrative for semantic comparison."""
+    """
+    Flatten VERIFY-ready knowledge into a narrative.
+
+    Never includes research `raw`, scrape dumps, skill-repair jargon, or
+    diagnostic / failed-approach logs — only clean synthesized fields.
+    """
+    # Prefer explicit KnowledgeArtifact payload when present
+    art = research.get("artifact") if isinstance(research, dict) else None
+    if isinstance(art, dict) and (
+        art.get("summary") or art.get("concepts") or art.get("explanations")
+    ):
+        from jarvis.knowledge_artifact import KnowledgeArtifact
+
+        return KnowledgeArtifact.from_dict(art).narrative()
+
     entry = entry or {}
     parts = [
-        str(research.get("approach") or entry.get("approach") or ""),
+        str(research.get("approach") or entry.get("approach") or entry.get("summary") or ""),
         str(research.get("summary") or entry.get("summary") or ""),
-        " ".join(str(x) for x in (research.get("key_apis") or entry.get("key_apis") or [])),
-        " ".join(str(x) for x in (research.get("pitfalls") or entry.get("pitfalls") or [])),
-        str(research.get("test_idea") or entry.get("test_idea") or ""),
-        str(research.get("raw") or "")[:3000],
+        " ".join(
+            str(x)
+            for x in (
+                research.get("concepts")
+                or research.get("key_apis")
+                or entry.get("concepts")
+                or entry.get("key_apis")
+                or []
+            )
+        ),
+        " ".join(str(x) for x in (research.get("explanations") or entry.get("explanations") or [])),
+        " ".join(str(x) for x in (research.get("examples") or entry.get("examples") or [])),
+        str(
+            research.get("practice")
+            or research.get("test_idea")
+            or entry.get("practice")
+            or entry.get("test_idea")
+            or ""
+        ),
+        # Intentionally NO research["raw"] — logs must not enter VERIFY
     ]
     pr = research.get("practical_result") or entry.get("practical_result")
     if isinstance(pr, dict):
@@ -74,25 +104,76 @@ def knowledge_blob(research: dict[str, Any], entry: Optional[dict] = None) -> st
 
 
 def has_substance(research: dict[str, Any], entry: Optional[dict] = None) -> bool:
-    """True when knowledge has real learning content (not empty / skill template)."""
+    """True when clean synthesized knowledge has real learning content."""
+    art = research.get("artifact") if isinstance(research, dict) else None
+    if isinstance(art, dict) and (
+        art.get("summary") or art.get("concepts") or art.get("explanations")
+    ):
+        from jarvis.knowledge_artifact import KnowledgeArtifact
+
+        return KnowledgeArtifact.from_dict(art).has_substance()
+
     entry = entry or {}
-    approach = str(research.get("approach") or entry.get("summary") or "").strip()
+    approach = str(
+        research.get("approach") or research.get("summary") or entry.get("summary") or ""
+    ).strip()
     if _SKILL_JARGON_RE.search(approach):
         return False
-    key_apis = list(research.get("key_apis") or entry.get("key_apis") or [])
-    pitfalls = list(research.get("pitfalls") or entry.get("pitfalls") or [])
-    test_idea = str(research.get("test_idea") or entry.get("test_idea") or "")
+    concepts = list(
+        research.get("concepts")
+        or research.get("key_apis")
+        or entry.get("concepts")
+        or entry.get("key_apis")
+        or []
+    )
+    explanations = list(research.get("explanations") or entry.get("explanations") or [])
+    examples = list(research.get("examples") or entry.get("examples") or [])
+    test_idea = str(
+        research.get("practice")
+        or research.get("test_idea")
+        or entry.get("practice")
+        or entry.get("test_idea")
+        or ""
+    )
     learning_test = bool(test_idea) and not _SKILL_TEST_IDEA_RE.search(test_idea)
-    raw = str(research.get("raw") or "")
-    if len(approach) >= 40 and (key_apis or pitfalls or learning_test):
+    # Do NOT use research raw length as substance — that rewarded polluted logs
+    if len(approach) >= 40 and (concepts or explanations or examples or learning_test):
         return True
     if len(approach) >= 80:
         return True
-    if key_apis and learning_test:
+    if concepts and (explanations or examples or learning_test):
         return True
-    if len(raw) >= 200 and (key_apis or learning_test):
+    narr = knowledge_blob(research, entry)
+    if len(narr) >= 120 and (concepts or explanations):
         return True
     return False
+
+
+def diagnose_artifact_gaps(
+    user_request: str,
+    research: dict[str, Any],
+    entry: Optional[dict] = None,
+) -> list[str]:
+    """
+    Deterministic gap list when semantic relatedness is high but VERIFY fails.
+
+    Returns concrete KnowledgeArtifact fields to fill — not a full re-research.
+    """
+    from jarvis.knowledge_artifact import KnowledgeArtifact
+
+    art_data = (research or {}).get("artifact")
+    if isinstance(art_data, dict):
+        art = KnowledgeArtifact.from_dict(art_data)
+    else:
+        art = KnowledgeArtifact.from_dict({**(entry or {}), **(research or {})})
+    art.user_request = user_request or art.user_request
+    gaps = art.missing_fields(user_request)
+    # If relatedness is already high, prefer structural gaps over goal_coverage spam
+    blob = knowledge_blob(research, entry)
+    related = soft_relatedness(user_request, blob) if blob else 0.0
+    if related >= 0.45 and "goal_coverage" in gaps:
+        gaps = [g for g in gaps if g != "goal_coverage"]
+    return gaps or art.missing_fields(user_request)
 
 
 def requests_practical_result(user_request: str) -> bool:

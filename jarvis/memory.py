@@ -612,19 +612,36 @@ class Memory:
         from jarvis.intent import IntentClassifier
 
         slug = IntentClassifier.topic_slug(topic or goal or "topic")
+        art = research.get("artifact") if isinstance(research.get("artifact"), dict) else {}
         entry = {
             "ts": time.time(),
             "topic": topic or slug,
             "goal": goal,
+            "request_id": art.get("request_id") or research.get("request_id") or "",
             "queries": list(queries or [])[:8],
-            "summary": (summary or research.get("approach") or "")[:4000],
-            "approach": research.get("approach"),
+            "summary": (
+                summary
+                or art.get("summary")
+                or research.get("summary")
+                or research.get("approach")
+                or ""
+            )[:4000],
+            "approach": art.get("summary") or research.get("approach"),
+            "concepts": list(art.get("concepts") or research.get("concepts") or research.get("key_apis") or [])[:20],
+            "explanations": list(art.get("explanations") or research.get("explanations") or [])[:12],
+            "examples": list(art.get("examples") or research.get("examples") or [])[:8],
+            "practice": str(art.get("practice") or research.get("practice") or research.get("test_idea") or ""),
             "libraries": list(research.get("libraries") or [])[:12],
-            "key_apis": list(research.get("key_apis") or [])[:20],
-            "pitfalls": list(research.get("pitfalls") or [])[:12],
-            "test_idea": research.get("test_idea") or "",
-            "practical_result": research.get("practical_result"),
-            "sources": list(research.get("sources") or [])[:12],
+            "key_apis": list(
+                art.get("concepts") or research.get("concepts") or research.get("key_apis") or []
+            )[:20],
+            "pitfalls": [],  # never persist diagnostic gap labels as knowledge
+            "test_idea": str(art.get("practice") or research.get("practice") or research.get("test_idea") or ""),
+            "practical_result": art.get("practical_result") or research.get("practical_result"),
+            "sources": list(
+                art.get("source_evidence") or research.get("source_evidence") or research.get("sources") or []
+            )[:12],
+            "artifact": art or None,
             "result_count": len(research.get("results") or []),
             "verified": bool(verified),
         }
