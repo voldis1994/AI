@@ -69,6 +69,14 @@ class SkillBuilder:
         """
         name = self._safe_name(skill_name)
         self.on_log(f"BUILD: generating skill '{name}' v{version}")
+        # Clear CODE tab — real generation/stream follows (no demo content)
+        try:
+            self.on_event(
+                "code_delta",
+                {"code": "", "stage": "start", "name": name, "version": version},
+            )
+        except Exception:
+            pass
 
         research_for_brain = dict(research)
         if research.get("results"):
@@ -117,6 +125,18 @@ class SkillBuilder:
                 diagnosis=diagnosis,
             )
             source = "knowledge_synthesis"
+            try:
+                self.on_event(
+                    "code_delta",
+                    {
+                        "code": code[:12000],
+                        "stage": "delta",
+                        "name": name,
+                        "source": source,
+                    },
+                )
+            except Exception:
+                pass
 
         code = self._ensure_meta(code, name, description, research, version)
 

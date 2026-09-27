@@ -48,6 +48,7 @@ from jarvis.capability_match import (
     format_match_log,
     verify_implies_capability_mismatch,
 )
+from jarvis.workspace_events import action_summary_for_status
 
 logger = logging.getLogger("jarvis.orchestrator")
 
@@ -108,6 +109,11 @@ class Orchestrator:
         # Multi-model pool logs (ROUTE / WARM / FALLBACK / ESCALATION) → cycle log
         if hasattr(self.brain, "set_logger"):
             self.brain.set_logger(self._log)
+        # Live CODE stream + other GUI events share this bus
+        if hasattr(self.brain, "set_event_callback"):
+            self.brain.set_event_callback(self._event)
+        elif hasattr(self.brain, "on_event"):
+            self.brain.on_event = self._event
         self.memory = Memory(db)
         self.ledger = Ledger(db)
         self.registry = CapabilityRegistry(db)
@@ -146,7 +152,7 @@ class Orchestrator:
             timeout=float(self.calibration.research_timeout()),
         )
         self.research.max_open_sources = int(self.calibration.max_open_sources())
-        self.deps = DependencyManager(on_log=self._log)
+        self.deps = DependencyManager(on_log=self._log, on_event=self._event)
         self.builder = SkillBuilder(
             self.skills_dir,
             brain=self.brain,
@@ -2359,16 +2365,7 @@ class Orchestrator:
                     constraints=task_goal.with_args(args).constraints,
                 )
                 self.perf.end(phase_build)
-                if built.get("path"):
-                    self._event(
-                        "skill_file",
-                        path=built.get("path"),
-                        name=built.get("name") or skill_name,
-                        version=attempt_version,
-                        ok=bool(built.get("ok")),
-                        source=built.get("source") or phase_build,
-                        code=str(built.get("code") or "")[:12000],
-                    )
+                # skill_file event already fired by SkillBuilder (single source)
                 # Never accept an unchanged skill_code repair as progress
                 if (
                     built.get("ok")
@@ -2538,7 +2535,7 @@ class Orchestrator:
             test_result = self.tester.test(
                 built["path"], goal=goal, args=args
             )
-            self._emit_subprocess(test_result, mode=str(phase_test).lower())
+            # subprocess event already fired by SkillTester (single source)
             self.ledger.log(
                 task_id,
                 phase_test,
@@ -3627,10 +3624,7 @@ class Orchestrator:
             args=exec_args,
             file_path=skill.get("file_path"),
         )
-        self._emit_subprocess(
-            {**result, "skill_path": skill.get("file_path") or skill.get("name")},
-            mode="execute",
-        )
+        # subprocess event already fired by SkillLoader (single source)
         self.ledger.log(
             task_id,
             "EXECUTE",
@@ -3928,6 +3922,9 @@ class Orchestrator:
             pass
         # Mirror phase to workspace GUI (async consumer — never wait)
         self._event("phase", status=status)
+        summary = action_summary_for_status(status)
+        if summary:
+            self._event("action", text=summary, status=status)
 
     def _event(self, kind: str, payload: Any = None, **extra: Any) -> None:
         """Fire structured workspace event; must never block the cycle.
@@ -3949,19 +3946,44 @@ class Orchestrator:
             pass
 
     def _emit_verify(self, verification: dict[str, Any], *, context: str = "") -> None:
+        verified = bool(verification.get("verified"))
+        reason = str(verification.get("reason") or "")[:500]
         self._event(
             "verify",
-            verified=bool(verification.get("verified")),
-            reason=str(verification.get("reason") or "")[:500],
+            verified=verified,
+            reason=reason,
             checks=verification.get("checks") or [],
             context=context,
         )
+        summary = action_summary_for_status(
+            "VERIFY", reason=reason, verified=verified
+        )
+        if summary:
+            self._event(
+                "action",
+                text=summary,
+                status="VERIFY",
+                verified=verified,
+                reason=reason,
+            )
 
     def _emit_subprocess(self, result: dict[str, Any], *, mode: str) -> None:
+        """Emit real subprocess I/O for TERMINAL (inline EXECUTE path only)."""
+        import sys
+
+        skill_path = str(result.get("skill_path") or "")
+        command = str(
+            result.get("command")
+            or (
+                f"{sys.executable} {skill_path}"
+                if skill_path
+                else f"{sys.executable} <skill>"
+            )
+        )
         self._event(
             "subprocess",
             mode=mode,
-            command=f"skill:{Path(str(result.get('skill_path') or '')).name or mode}",
+            command=command,
             stdout=str(result.get("stdout") or "")[:8000],
             stderr=str(result.get("stderr") or "")[:8000],
             traceback=str(result.get("traceback") or "")[:8000],
@@ -3969,7 +3991,7 @@ class Orchestrator:
             timed_out=bool(result.get("timed_out")),
             ok=bool(result.get("ok")),
             error=str(result.get("error") or "")[:500],
-            skill_path=str(result.get("skill_path") or ""),
+            skill_path=skill_path,
         )
 
     def close(self) -> None:

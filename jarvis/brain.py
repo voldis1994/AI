@@ -66,6 +66,7 @@ class Brain:
         host: str = DEFAULT_HOST,
         timeout: float = DEFAULT_CHAT_TIMEOUT,
         on_log: Optional[Callable[[str], None]] = None,
+        on_event: Optional[Callable[[str, dict], None]] = None,
         router: Optional[ModelRouter] = None,
     ) -> None:
         # Legacy single-model hint / forced override (tests may pin a model)
@@ -75,6 +76,8 @@ class Brain:
         self._client = None
         self._force_single_model = False
         self.on_log = on_log or (lambda _m: None)
+        # Same pipeline event bus as Orchestrator (code_delta, etc.)
+        self.on_event = on_event or (lambda _k, _p: None)
         self.router = router or ModelRouter(
             list_models=self._list_model_names,
             on_log=self._route_log,
@@ -88,6 +91,31 @@ class Brain:
     def set_logger(self, on_log: Callable[[str], None]) -> None:
         self.on_log = on_log or (lambda _m: None)
         self.router.set_logger(self._route_log)
+
+    def set_event_callback(
+        self, on_event: Optional[Callable[[str, dict], None]]
+    ) -> None:
+        self.on_event = on_event or (lambda _k, _p: None)
+
+    def _emit_code_delta(
+        self,
+        code: str,
+        *,
+        stage: str = "delta",
+        name: str = "",
+    ) -> None:
+        """Fire-and-forget live code stream for CODE tab (never blocks)."""
+        try:
+            self.on_event(
+                "code_delta",
+                {
+                    "code": code,
+                    "stage": stage,
+                    "name": name,
+                },
+            )
+        except Exception:
+            pass
 
     def ensure_pool_ready(self, *, warm: bool = True) -> dict[str, Any]:
         """
@@ -206,6 +234,7 @@ class Brain:
         expect_code: bool = False,
         escalate_error_only: bool = False,
         model: Optional[str] = None,
+        on_stream: Optional[Callable[[str], None]] = None,
     ) -> str:
         """
         Chat via concurrent model pool.
@@ -214,6 +243,9 @@ class Brain:
         walks a mandatory pipeline. Escalation runs only when the prior result
         is truly insufficient. Same work is not re-executed on another model
         within the request context unless escalating after insufficiency.
+
+        on_stream: optional callback receiving accumulated text as Ollama
+        tokens arrive (used for live CODE tab; not a separate model).
         """
         full: list[dict[str, str]] = []
         if system:
@@ -241,6 +273,11 @@ class Brain:
                     f"MODEL DEDUPE: reuse {work_key_name} "
                     f"(skip re-run on another model)"
                 )
+                if on_stream is not None:
+                    try:
+                        on_stream(str(cached))
+                    except Exception:
+                        pass
                 return cached
 
         decision = self.pool.acquire(
@@ -252,12 +289,21 @@ class Brain:
         t0 = time.perf_counter()
         self.pool.mark_in_flight(decision.model, +1)
         try:
-            text = self._chat_on_model(
-                full,
-                temperature,
-                decision.model,
-                keep_alive=self.pool.keep_alive_for(decision.model),
-            )
+            if on_stream is not None:
+                text = self._chat_on_model_stream(
+                    full,
+                    temperature,
+                    decision.model,
+                    on_stream=on_stream,
+                    keep_alive=self.pool.keep_alive_for(decision.model),
+                )
+            else:
+                text = self._chat_on_model(
+                    full,
+                    temperature,
+                    decision.model,
+                    keep_alive=self.pool.keep_alive_for(decision.model),
+                )
         finally:
             self.pool.mark_in_flight(decision.model, -1)
         self._record_model_timing(
@@ -445,6 +491,155 @@ class Brain:
 
         return self._http_chat(messages, temperature, model=model, keep_alive=ka)
 
+    def _chat_on_model_stream(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float,
+        model: str,
+        *,
+        on_stream: Callable[[str], None],
+        keep_alive: Any = None,
+    ) -> str:
+        """Stream tokens from Ollama; invoke on_stream(accumulated) as they arrive."""
+        ka = KEEP_ALIVE_ACTIVE if keep_alive is None else keep_alive
+        client = self._get_client()
+        if client is not None:
+            try:
+                kwargs: dict[str, Any] = {
+                    "model": model,
+                    "messages": messages,
+                    "options": {"temperature": temperature},
+                    "stream": True,
+                }
+                try:
+                    stream = client.chat(**kwargs, keep_alive=ka)
+                except TypeError:
+                    stream = client.chat(**kwargs)
+                accumulated = ""
+                for chunk in stream:
+                    piece = ""
+                    if isinstance(chunk, dict):
+                        piece = str(
+                            (chunk.get("message") or {}).get("content") or ""
+                        )
+                    else:
+                        try:
+                            piece = str(
+                                (getattr(chunk, "message", None) or {}).get(
+                                    "content"
+                                )
+                                or getattr(
+                                    getattr(chunk, "message", None),
+                                    "content",
+                                    "",
+                                )
+                                or ""
+                            )
+                        except Exception:
+                            piece = ""
+                    if piece:
+                        accumulated += piece
+                        try:
+                            on_stream(accumulated)
+                        except Exception:
+                            pass
+                return accumulated.strip()
+            except Exception as exc:
+                logger.error("ollama stream chat failed (%s): %s", model, exc)
+                if _is_connection_failure(exc):
+                    try:
+                        self.router.invalidate_cache()
+                    except Exception:
+                        pass
+                    return f"[BRAIN ERROR] Ollama unreachable: {exc}"
+                return self._http_chat_stream(
+                    messages,
+                    temperature,
+                    model=model,
+                    on_stream=on_stream,
+                    keep_alive=ka,
+                )
+        return self._http_chat_stream(
+            messages,
+            temperature,
+            model=model,
+            on_stream=on_stream,
+            keep_alive=ka,
+        )
+
+    def _http_chat_stream(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float,
+        model: Optional[str] = None,
+        *,
+        on_stream: Callable[[str], None],
+        keep_alive: Any = None,
+    ) -> str:
+        use_model = model or self.model
+        ka = KEEP_ALIVE_ACTIVE if keep_alive is None else keep_alive
+        try:
+            import urllib.request
+
+            payload = json.dumps(
+                {
+                    "model": use_model,
+                    "messages": messages,
+                    "stream": True,
+                    "keep_alive": ka,
+                    "options": {"temperature": temperature},
+                }
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.host}/api/chat",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            accumulated = ""
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                while True:
+                    line = resp.readline()
+                    if not line:
+                        break
+                    line = line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except Exception:
+                        continue
+                    piece = str(
+                        (data.get("message") or {}).get("content") or ""
+                    )
+                    if piece:
+                        accumulated += piece
+                        try:
+                            on_stream(accumulated)
+                        except Exception:
+                            pass
+                    if data.get("done"):
+                        break
+            return accumulated.strip()
+        except Exception as exc:
+            logger.error("HTTP stream chat failed (%s): %s", use_model, exc)
+            if _is_connection_failure(exc):
+                try:
+                    self.router.invalidate_cache()
+                except Exception:
+                    pass
+                return f"[BRAIN ERROR] Ollama unreachable: {exc}"
+            # Fall back to non-streaming once
+            text = self._http_chat(
+                messages, temperature, model=use_model, keep_alive=ka
+            )
+            if text and on_stream is not None:
+                try:
+                    on_stream(text)
+                except Exception:
+                    pass
+            return text
+
     def _http_chat(
         self,
         messages: list[dict[str, str]],
@@ -498,6 +693,7 @@ class Brain:
         expect_code: bool = False,
         escalate_error_only: bool = False,
         model: Optional[str] = None,
+        on_stream: Optional[Callable[[str], None]] = None,
     ) -> str:
         messages = [{"role": "user", "content": prompt}]
         return self.chat(
@@ -511,6 +707,7 @@ class Brain:
             expect_code=expect_code,
             escalate_error_only=escalate_error_only,
             model=model,
+            on_stream=on_stream,
         )
 
     # ── Structured helpers ──────────────────────────────────────────────
@@ -916,12 +1113,21 @@ class Brain:
         is_repair = bool(diagnosis or error_log or previous_code)
         temperature = 0.35 if is_repair else 0.15
         work = "code_repair" if is_repair else "skill_code"
+
+        def _stream_to_ui(accumulated: str) -> None:
+            # Show exact model output as it arrives (same CODE editor).
+            # Prefer extracted python when fences appear; otherwise raw text.
+            shown = self._extract_python(accumulated) or accumulated
+            self._emit_code_delta(shown, stage="delta", name=skill_name)
+
+        self._emit_code_delta("", stage="start", name=skill_name)
         raw = self.generate(
             "\n\n".join(parts),
             system=system,
             temperature=temperature,
             work=work,
             expect_code=True,
+            on_stream=_stream_to_ui,
         )
         code = self._extract_python(raw)
         # Failed CODING → retry CODING with failure context (same tier, not REASONING)
@@ -939,6 +1145,7 @@ class Brain:
                 ]
                 if error_log:
                     retry_parts.append(f"FAILURE CONTEXT:\n{str(error_log)[:4000]}")
+                self._emit_code_delta("", stage="start", name=skill_name)
                 raw2 = self.generate(
                     "\n\n".join(retry_parts),
                     system=system,
@@ -946,10 +1153,14 @@ class Brain:
                     work="code_repair",
                     model=esc.model,
                     expect_code=True,
+                    on_stream=_stream_to_ui,
                 )
                 code2 = self._extract_python(raw2)
                 if code2 and ("def run" in code2 or "SKILL_META" in code2):
+                    self._emit_code_delta(code2, stage="done", name=skill_name)
                     return code2
+        if code:
+            self._emit_code_delta(code, stage="done", name=skill_name)
         return code
 
     def diagnose(

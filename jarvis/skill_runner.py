@@ -154,6 +154,9 @@ def run_skill_subprocess(
         else:
             error = skill_payload.get("error")
 
+        # Display command points at the skill module actually loaded (real path).
+        # Isolation still uses python -c runner; argv kept for diagnostics.
+        display_cmd = f"{sys.executable} {path}"
         return {
             "ok": bool(skill_payload.get("ok")) if skill_payload else False,
             "result": skill_payload.get("result") if skill_payload else None,
@@ -168,6 +171,8 @@ def run_skill_subprocess(
             "killed": killed or timed_out,
             "crash": crash,
             "skill_path": str(path),
+            "command": display_cmd,
+            "argv": [sys.executable, "-c", "<skill_runner>"],
         }
 
 

@@ -3518,6 +3518,177 @@ def run(context):
         traceback.print_exc()
         errors.append(msg)
 
+    # Live UI events: CODE/TERMINAL/WORKSPACE share real pipeline bus (no demo data)
+    print("  — e2e live UI events (code_delta / subprocess / action) —")
+    try:
+        from jarvis.workspace_events import action_summary_for_status as _act_sum
+
+        assert _act_sum("PLAN") == "Planning..."
+        assert _act_sum("BUILD_SKILL") == "Generating code..."
+        assert _act_sum("TEST") == "Testing..."
+        assert _act_sum("REPAIR") == "Repairing..."
+        assert "Verifier failed" in _act_sum(
+            "VERIFY", reason="content missing", verified=False
+        )
+
+        ui_root = root / "data" / "_e2e_live_ui"
+        if ui_root.exists():
+            shutil.rmtree(ui_root)
+        ui_root.mkdir(parents=True)
+
+        class LiveUIBrain(Brain):
+            def __init__(self) -> None:
+                super().__init__()
+                self.builds = 0
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": ["create", "file"],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                return {
+                    "steps": ["build"],
+                    "can_reuse": [],
+                    "missing": [goal],
+                    "needs_research": False,
+                    "needs_new_skill": True,
+                    "skill_name": "live_ui_skill",
+                    "skill_description": goal,
+                    "research_queries": [],
+                    "args": {"dest": "live_ui.txt", "body": "LIVE_UI_OK"},
+                    "required_args": ["dest", "body"],
+                }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                return {"dest": "live_ui.txt", "body": "LIVE_UI_OK"}
+
+            def write_skill_code(
+                self,
+                skill_name,
+                description,
+                research,
+                previous_code=None,
+                error_log=None,
+                diagnosis=None,
+                failed_approaches=None,
+                test_plan=None,
+                **kwargs,
+            ) -> str:
+                self.builds += 1
+                # Simulate streamed generation via the same code_delta bus
+                chunks = [
+                    "from pathlib import Path\n",
+                    "SKILL_META = {'name': %r, 'description': %r, "
+                    "'capabilities': ['file'], 'dependencies': [], "
+                    "'version': 1, 'required_args': ['dest', 'body']}\n"
+                    % (skill_name, description or ""),
+                    "def run(context):\n",
+                    "    args = context.get('args') or {}\n"
+                    "    ws = Path(context.get('workspace') or '.')\n"
+                    "    path = ws / str(args['dest'])\n"
+                    "    path.write_text(str(args['body']) + '\\n', encoding='utf-8')\n"
+                    "    return {'ok': True, 'result': {'path': str(path)}, "
+                    "'error': None, 'evidence': f'wrote {path}'}\n",
+                ]
+                acc = ""
+                if hasattr(self, "_emit_code_delta"):
+                    self._emit_code_delta("", stage="start", name=skill_name)
+                for ch in chunks:
+                    acc += ch
+                    if hasattr(self, "_emit_code_delta"):
+                        self._emit_code_delta(acc, stage="delta", name=skill_name)
+                if hasattr(self, "_emit_code_delta"):
+                    self._emit_code_delta(acc, stage="done", name=skill_name)
+                return acc
+
+            def diagnose(self, observation, failed_approaches=None, prior_solutions=None):
+                return {
+                    "root_cause": "n/a",
+                    "fault_layer": "skill_code",
+                    "rewrite_skill": True,
+                    "what_to_change": "n/a",
+                    "approach": "live_ui",
+                    "approach_changed": True,
+                    "needs_research": False,
+                    "missing_knowledge": [],
+                    "research_queries": [],
+                    "needs_new_deps": [],
+                    "missing_args": [],
+                    "required_args": ["dest", "body"],
+                    "suggested_args": {"dest": "live_ui.txt", "body": "LIVE_UI_OK"},
+                    "test_plan": "VERIFY",
+                    "expected_artifacts": ["live_ui.txt"],
+                    "is_unfixable": False,
+                    "diagnosis": "ok",
+                }
+
+            def verify_claim(self, goal, result, evidence) -> dict:
+                return {"achieved": True, "confidence": 0.9, "reason": "advisory"}
+
+            def converse(self, user_text, history=None) -> str:
+                return "ok"
+
+        events: list[tuple[str, dict]] = []
+        orch_ui = Orchestrator(
+            root=ui_root,
+            brain=LiveUIBrain(),
+            on_event=lambda k, p: events.append((k, dict(p or {}))),
+        )
+        result_ui = orch_ui.run_cycle(
+            'Create "live_ui.txt" containing "LIVE_UI_OK"'
+        )
+        assert result_ui.get("success"), result_ui
+        kinds = [k for k, _ in events]
+        assert "code_delta" in kinds, kinds
+        assert "subprocess" in kinds, kinds
+        assert "action" in kinds, kinds
+        assert "skill_file" in kinds, kinds
+        code_deltas = [p for k, p in events if k == "code_delta"]
+        assert any(p.get("stage") == "delta" and "def run" in str(p.get("code") or "")
+                   for p in code_deltas), code_deltas[:3]
+        # Final skill_file code is real generated source (not a demo stub)
+        skill_ev = next(p for k, p in events if k == "skill_file")
+        assert "def run" in str(skill_ev.get("code") or "")
+        assert "LIVE_UI_OK" in str(skill_ev.get("code") or "") or "args" in str(
+            skill_ev.get("code") or ""
+        )
+        # Subprocess carries real command + path (not a simulated shell)
+        sub = next(p for k, p in events if k == "subprocess")
+        assert str(sub.get("command") or "").strip()
+        assert "live_ui_skill" in str(sub.get("command") or sub.get("skill_path") or "")
+        actions = [str(p.get("text") or "") for k, p in events if k == "action"]
+        assert any("Planning" in a for a in actions), actions
+        assert any("Generating code" in a for a in actions), actions
+        assert any("Testing" in a for a in actions), actions
+        # No duplicate subprocess for same mode+command from dual emitters
+        sub_keys = [
+            (p.get("mode"), p.get("command"), p.get("returncode"))
+            for k, p in events
+            if k == "subprocess"
+        ]
+        assert len(sub_keys) == len(set(sub_keys)), sub_keys
+        out_ui = ui_root / "workspace_runtime" / "live_ui.txt"
+        assert out_ui.exists() and "LIVE_UI_OK" in out_ui.read_text(encoding="utf-8")
+        orch_ui.close()
+        print("  OK live UI events — code_delta/subprocess/action from real pipeline")
+    except Exception as exc:
+        msg = f"E2E_LIVE_UI: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
     # 5) Orchestrator boots + conversation logs must not echo USER/JARVIS replies
     try:
         echoed: list[str] = []
