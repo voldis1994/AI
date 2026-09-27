@@ -77,7 +77,7 @@ class Orchestrator:
 
         self.memory.add_message("user", text)
         self._status("THINKING")
-        self._log(f"USER: {text}")
+        # Do not _log USER/JARVIS reply here — GUI/CLI already display them once.
 
         # Fast-path commands
         low = text.lower().strip()
@@ -131,7 +131,6 @@ class Orchestrator:
                 )
             self.memory.add_message("assistant", reply)
             self._status("IDLE")
-            self._log(f"JARVIS: {reply[:500]}")
             return {"type": "conversation", "reply": reply}
 
         # Task path — full learning cycle
@@ -220,7 +219,7 @@ class Orchestrator:
                 )
                 self.ledger.log(task_id, "SAVE_EXPERIENCE", outcome)
                 self.ledger.finish(task_id, False, {"outcome": outcome})
-                self._log(f"[{task_id}] FAIL: {outcome}")
+                self._log(f"[{task_id}] FAIL")
                 return {
                     "type": "task",
                     "success": False,
