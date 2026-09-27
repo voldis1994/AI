@@ -16,6 +16,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from jarvis.request_items import (
+    classify_request_items,
+    path_segment_tokens,
+    sanitize_libraries,
+)
+
 
 # Generic placeholder / invented values — not task-specific file names.
 _INVENTED_RE = re.compile(
@@ -194,6 +200,41 @@ class TaskGoal:
         }
 
     @classmethod
+    def path_segment_tokens(
+        cls,
+        request: str,
+        artifacts: Optional[tuple[str, ...] | list[str]] = None,
+    ) -> set[str]:
+        """Stems/dirs from path-like request tokens — never deps or arg keys."""
+        return path_segment_tokens(request, artifacts)
+
+    @classmethod
+    def classify_items(
+        cls,
+        request: str,
+        *,
+        args: Optional[dict[str, Any]] = None,
+        artifacts: Optional[tuple[str, ...] | list[str]] = None,
+    ) -> list:
+        """PATH/FILE/LIBRARY/COMMAND/CONTENT/REQUIREMENT classification."""
+        return classify_request_items(
+            request, grounded_args=args, artifacts=artifacts
+        )
+
+    @classmethod
+    def sanitize_libraries(
+        cls,
+        names: Optional[list],
+        request: str,
+        *,
+        artifacts: Optional[tuple[str, ...] | list[str]] = None,
+        skill_code: Optional[str] = None,
+    ) -> list[str]:
+        return sanitize_libraries(
+            names, request, artifacts=artifacts, skill_code=skill_code
+        )
+
+    @classmethod
     def is_polluted_arg_key(
         cls,
         key: str,
@@ -205,6 +246,7 @@ class TaskGoal:
         True when a key looks like a request content-token promoted to an arg name.
 
         Schema keys and explicit key=value names in the request are never polluted.
+        Path stems (e.g. calculator from workspace/calculator.py) are always polluted.
         """
         k = str(key or "").strip()
         if not k:
@@ -213,6 +255,9 @@ class TaskGoal:
             return False
         if re.search(rf"(?i)\b{re.escape(k)}\s*[:=]", request or ""):
             return False
+        # Path segments of output files must never become arg keys / deps
+        if k.lower() in cls.path_segment_tokens(request):
+            return True
         # Very short keys that appear as bare words in the request are needles
         tokens = cls.request_tokens(request)
         # Also include stop-filtered scan so 'ti' (stopword) is still caught

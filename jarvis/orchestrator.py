@@ -1549,6 +1549,8 @@ class Orchestrator:
             "TaskGoal frozen",
             task_goal.to_dict(),
         )
+        # Classify PATH/FILE/LIBRARY/… before any research or install
+        self._log_request_items(task_id, task_goal)
 
         try:
             # MEMORY first — reuse verified knowledge before PLAN/RESEARCH
@@ -2167,7 +2169,8 @@ class Orchestrator:
         )
         if need_entry_research:
             research = self._do_research(
-                task_id, skill_name, goal, plan.get("research_queries") or [goal]
+                task_id, skill_name, goal, plan.get("research_queries") or [goal],
+                task_goal=task_goal,
             )
             recovery.research_count += 1
         elif prior_research:
@@ -2453,12 +2456,19 @@ class Orchestrator:
 
                 meta = built["meta"]
                 caps = meta.get("capabilities") or [description]
-                deps_list = list(
+                # Only install libraries the skill code actually imports
+                deps_list = self._safe_deps(
                     meta.get("dependencies")
                     or research.get("libraries")
                     or (diagnosis or {}).get("needs_new_deps")
-                    or []
+                    or [],
+                    task_goal=task_goal,
+                    skill_code=str(built.get("code") or ""),
                 )
+                # Persist sanitized deps back onto meta / research
+                if isinstance(meta, dict):
+                    meta["dependencies"] = list(deps_list)
+                research["libraries"] = list(deps_list)
                 self._register_candidate_safe(
                     skill_name=skill_name,
                     description=meta.get("description") or description,
@@ -2481,8 +2491,12 @@ class Orchestrator:
                     {"args": args, "fault_layer": (diagnosis or {}).get("fault_layer")},
                 )
 
-            # ── INSTALL DEPS ────────────────────────────────────────────
+            # ── INSTALL DEPS (LIBRARY only — never path/file tokens) ───
             self._status("INSTALL_DEPS")
+            deps_list = self._safe_deps(
+                deps_list, task_goal=task_goal,
+                skill_code=str((built or {}).get("code") or ""),
+            )
             dep_result = self.deps.ensure(deps_list)
             self.ledger.log(task_id, "INSTALL_DEPS", dep_result.get("details"), dep_result)
             if not dep_result.get("ok"):
@@ -2736,10 +2750,24 @@ class Orchestrator:
                     f"(no identical research cycle)"
                 )
             if layer == "environment" and diagnosis.get("needs_new_deps"):
-                self.deps.ensure(list(diagnosis["needs_new_deps"]))
+                safe = self._safe_deps(
+                    diagnosis["needs_new_deps"],
+                    task_goal=task_goal,
+                    skill_code=str((built or {}).get("code") or last_code or ""),
+                )
+                diagnosis["needs_new_deps"] = safe
+                if safe:
+                    self.deps.ensure(safe)
             # legacy alias
             if layer in ("dependency",) and diagnosis.get("needs_new_deps"):
-                self.deps.ensure(list(diagnosis["needs_new_deps"]))
+                safe = self._safe_deps(
+                    diagnosis["needs_new_deps"],
+                    task_goal=task_goal,
+                    skill_code=str((built or {}).get("code") or last_code or ""),
+                )
+                diagnosis["needs_new_deps"] = safe
+                if safe:
+                    self.deps.ensure(safe)
             if diagnosis.get("stop_recovery"):
                 break
             # loop → REPAIR correct layer on next iteration
@@ -2758,12 +2786,63 @@ class Orchestrator:
         )
         return self.registry.get_skill(skill_name), args, task_goal
 
+    def _safe_deps(
+        self,
+        names: Any,
+        *,
+        task_goal: Optional[TaskGoal] = None,
+        skill_code: str = "",
+    ) -> list[str]:
+        """Sanitize install targets — PATH/FILE/CONTENT never become pip packages."""
+        req = (task_goal.user_request if task_goal else "") or ""
+        arts = list(task_goal.artifacts) if task_goal else []
+        # When skill code is present, only external imports are installable
+        code = skill_code if skill_code else None
+        return TaskGoal.sanitize_libraries(
+            list(names or []),
+            req,
+            artifacts=arts,
+            skill_code=code,
+        )
+
+    def _log_request_items(self, task_id: str, task_goal: TaskGoal) -> dict[str, list[str]]:
+        """Classify request tokens before research/install (PATH ≠ LIBRARY)."""
+        items = TaskGoal.classify_items(
+            task_goal.user_request,
+            artifacts=task_goal.artifacts,
+        )
+        by_kind: dict[str, list[str]] = {}
+        for it in items:
+            by_kind.setdefault(it.kind.value, []).append(it.text)
+        self._log(
+            f"[{task_id}] REQUEST ITEMS: "
+            + ", ".join(
+                f"{k}={v[:4]}" for k, v in sorted(by_kind.items()) if v
+            )
+        )
+        self._event(
+            "action",
+            text="Classifying request items...",
+            status="REQUEST",
+            items={k: v[:8] for k, v in by_kind.items()},
+        )
+        self.ledger.log(
+            task_id,
+            "REQUEST_ITEMS",
+            "classified",
+            {k: v[:12] for k, v in by_kind.items()},
+        )
+        return by_kind
+
     def _do_research(
-        self, task_id: str, skill_name: str, goal: str, queries: list
+        self, task_id: str, skill_name: str, goal: str, queries: list,
+        task_goal: Optional[TaskGoal] = None,
     ) -> dict:
         self._status("RESEARCH")
         if not isinstance(queries, list):
             queries = [str(queries)]
+        if task_goal is None:
+            task_goal = TaskGoal.from_request(goal, goal=goal)
         # Skill mode: brain notes only when Ollama is ONLINE (no offline hang)
         research = self.research.research(
             queries,
@@ -2772,6 +2851,12 @@ class Orchestrator:
             network=True,
             use_brain=None,  # auto: available() only
             append_python=True,
+        )
+        # Drop path/file stems that research_notes or PyPI may have leaked
+        research["libraries"] = self._safe_deps(
+            research.get("libraries") or [],
+            task_goal=task_goal,
+            skill_code="",  # no skill yet — only explicit LIBRARY-safe names
         )
         self._event(
             "research",
@@ -3176,7 +3261,9 @@ class Orchestrator:
                 f"[{task_id}] KNOWLEDGE-GAP RESEARCH: sig={fail_sig} "
                 f"missing={missing_knowledge!r} queries={len(queries)}"
             )
-            new_research = self._do_research(task_id, skill_name, goal, list(queries))
+            new_research = self._do_research(
+                task_id, skill_name, goal, list(queries), task_goal=task_goal
+            )
             research = self._merge_research(research, new_research)
             research["knowledge_history"] = self.memory.get_research_knowledge(
                 skill_name, limit=8
@@ -3223,15 +3310,21 @@ class Orchestrator:
             diagnosis["adaptive_research"] = False
 
         if diagnosis.get("needs_new_deps"):
-            dep_r = self.deps.ensure(list(diagnosis["needs_new_deps"]))
-            self.ledger.log(task_id, "INSTALL_DEPS", "from diagnosis", dep_r)
-            research.setdefault("libraries", [])
-            research["libraries"] = list(
-                dict.fromkeys(
-                    list(research.get("libraries") or [])
-                    + list(diagnosis["needs_new_deps"])
-                )
+            safe_deps = self._safe_deps(
+                diagnosis["needs_new_deps"],
+                task_goal=task_goal,
+                skill_code=str(code or ""),
             )
+            diagnosis["needs_new_deps"] = safe_deps
+            if safe_deps:
+                dep_r = self.deps.ensure(safe_deps)
+                self.ledger.log(task_id, "INSTALL_DEPS", "from diagnosis", dep_r)
+                research.setdefault("libraries", [])
+                research["libraries"] = list(
+                    dict.fromkeys(
+                        list(research.get("libraries") or []) + list(safe_deps)
+                    )
+                )
 
         research["fix_plan"] = diagnosis.get("test_plan")
         research["approach"] = diagnosis.get("approach")
