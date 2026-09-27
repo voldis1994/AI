@@ -482,10 +482,20 @@ class Orchestrator:
                 skill_name, path=repair_of.get("file_path")
             )
 
-        # Initial research (may be refreshed after DIAGNOSE)
+        # Load previously saved research knowledge, then gather new research
+        prior_knowledge = self.memory.get_research_knowledge(skill_name, limit=8)
+        prior_research = self.memory.get_latest_research(skill_name)
         research = self._do_research(
             task_id, skill_name, goal, plan.get("research_queries") or [goal]
         )
+        if prior_research:
+            research = self._merge_research(prior_research, research)
+        if prior_knowledge:
+            research["knowledge_history"] = prior_knowledge
+            self._log(
+                f"[{task_id}] Loaded {len(prior_knowledge)} saved knowledge "
+                f"entries for {skill_name}"
+            )
 
         # Pull prior learning from SQLite
         failed_approaches = self.memory.get_failed_approaches(skill_name)
@@ -828,9 +838,16 @@ class Orchestrator:
         if not isinstance(queries, list):
             queries = [str(queries)]
         research = self.research.research(queries, goal=goal)
+        # Persist knowledge (history + latest snapshot) so repairs can reuse it
+        saved = self.memory.save_research_knowledge(
+            skill_name, research, goal=goal, queries=queries
+        )
+        research["knowledge_history"] = saved.get("history") or []
         self.ledger.log(task_id, "RESEARCH", "Research complete", {
             "libraries": research.get("libraries"),
             "results": len(research.get("results") or []),
+            "knowledge_saved": True,
+            "knowledge_entries": len(research["knowledge_history"]),
             "sources": [
                 {
                     "url": s.get("url"),
@@ -846,8 +863,14 @@ class Orchestrator:
         self._status("LEARN")
         self.ledger.log(task_id, "LEARN", (research.get("approach") or "")[:500], {
             "result_count": len(research.get("results") or []),
+            "knowledge_entries": len(research["knowledge_history"]),
+            "repair_insight": (research.get("repair_insight") or "")[:300],
         })
-        self.memory.set_fact(f"research:{skill_name}", research)
+        self._log(
+            f"[{task_id}] KNOWLEDGE SAVED: {skill_name} "
+            f"entries={len(research['knowledge_history'])} "
+            f"approach={(research.get('approach') or '')[:80]!r}"
+        )
         return research
 
     def _observe_diagnose_enrich(
@@ -1106,6 +1129,9 @@ class Orchestrator:
             )
             new_research = self._do_research(task_id, skill_name, goal, list(queries))
             research = self._merge_research(research, new_research)
+            research["knowledge_history"] = self.memory.get_research_knowledge(
+                skill_name, limit=8
+            )
             # Research must drive a NEW approach for the next repair
             researched_approach = str(research.get("approach") or "").strip()
             if researched_approach:

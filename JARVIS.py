@@ -1559,6 +1559,147 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
+    # 4e) E2E: brain stub → knowledge synthesis; research knowledge persisted
+    print("  — e2e research→knowledge→code (no unimplemented stub) + save —")
+    try:
+        from jarvis.skill_builder import SkillBuilder as _SB
+
+        kn_root = root / "data" / "_e2e_knowledge"
+        if kn_root.exists():
+            shutil.rmtree(kn_root)
+        kn_root.mkdir(parents=True)
+
+        class StubThenUselessBrain(Brain):
+            """Always returns unimplemented stub — builder must synthesize."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.write_calls = 0
+                self.research_notes_calls = 0
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": user_text.split()[:8],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                return {
+                    "steps": ["synthesize skill from research"],
+                    "can_reuse": [],
+                    "missing": [goal],
+                    "needs_research": True,
+                    "needs_new_skill": True,
+                    "skill_name": "knowledge_skill",
+                    "skill_description": goal,
+                    "research_queries": [goal, "python pathlib write file"],
+                    "args": {"dest": "know_out.txt", "body": "KNOW_OK"},
+                    "required_args": ["dest", "body"],
+                }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                return {"dest": "know_out.txt", "body": "KNOW_OK"}
+
+            def research_notes(self, query: str, gathered: str) -> dict:
+                self.research_notes_calls += 1
+                return {
+                    "approach": "pathlib_write_from_args",
+                    "libraries": [],
+                    "key_apis": ["pathlib", "write_text"],
+                    "pitfalls": ["never ship unimplemented stub"],
+                    "test_idea": "verifier checks dest+body",
+                    "repair_insight": "write body into dest under workspace",
+                }
+
+            def write_skill_code(self, *a, **kw) -> str:
+                self.write_calls += 1
+                # Classic failure mode from the screenshot
+                return '''
+SKILL_META = {"name": "knowledge_skill", "description": "x", "capabilities": [],
+ "dependencies": [], "version": 1}
+def run(context: dict) -> dict:
+    return {
+        "ok": False,
+        "result": None,
+        "error": "Skill body not implemented yet",
+        "evidence": "TODO",
+    }
+'''
+
+            def diagnose(self, observation, failed_approaches=None, prior_solutions=None):
+                from jarvis.observer import Observer
+                approach = "force_knowledge_synthesis"
+                fp = Observer.fingerprint_approach(approach)
+                return {
+                    "root_cause": "unimplemented stub instead of researched code",
+                    "fault_layer": "skill_code",
+                    "rewrite_skill": True,
+                    "what_to_change": "Turn research knowledge into working run()",
+                    "approach": approach,
+                    "approach_fingerprint": fp,
+                    "approach_changed": True,
+                    "needs_research": True,
+                    "research_queries": ["python pathlib write file from dict args"],
+                    "needs_new_deps": [],
+                    "missing_args": [],
+                    "required_args": ["dest", "body"],
+                    "suggested_args": {"dest": "know_out.txt", "body": "KNOW_OK"},
+                    "test_plan": "VERIFY know_out.txt contains KNOW_OK",
+                    "expected_artifacts": ["know_out.txt"],
+                    "is_unfixable": False,
+                    "diagnosis": str(observation.get("exception") or "")[:300],
+                }
+
+            def verify_claim(self, goal, result, evidence) -> dict:
+                return {"achieved": True, "confidence": 0.9, "reason": "advisory"}
+
+            def converse(self, user_text, history=None) -> str:
+                return "ok"
+
+        logs_k: list[str] = []
+        brain_k = StubThenUselessBrain()
+        orch_k = Orchestrator(
+            root=kn_root,
+            brain=brain_k,
+            on_log=lambda m: logs_k.append(m),
+        )
+        goal_k = 'Create "know_out.txt" containing "KNOW_OK"'
+        result_k = orch_k.run_cycle(goal_k)
+        assert result_k.get("success"), result_k
+        out_k = kn_root / "workspace_runtime" / "know_out.txt"
+        assert out_k.exists() and "KNOW_OK" in out_k.read_text(encoding="utf-8"), out_k
+        # Brain returned stub, but builder must not ship it
+        assert brain_k.write_calls >= 1
+        assert any("knowledge_synthesis" in m or "synthesizing from research" in m
+                   for m in logs_k), logs_k[-40:]
+        skill_code = Path(orch_k.registry.get_skill("knowledge_skill")["file_path"]).read_text(
+            encoding="utf-8"
+        )
+        assert not _SB.is_unimplemented_stub(skill_code)
+        assert "Skill body not implemented yet" not in skill_code
+        # Knowledge must be saved and reloadable
+        hist = orch_k.memory.get_research_knowledge("knowledge_skill")
+        assert hist, hist
+        assert orch_k.memory.get_latest_research("knowledge_skill")
+        assert any("KNOWLEDGE SAVED" in m for m in logs_k), logs_k[-30:]
+        orch_k.close()
+        print("  OK knowledge stub→synthesis + research knowledge persisted")
+    except Exception as exc:
+        msg = f"E2E_KNOWLEDGE: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
     # 5) Orchestrator boots + conversation logs must not echo USER/JARVIS replies
     try:
         echoed: list[str] = []
