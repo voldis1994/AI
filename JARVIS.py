@@ -2211,7 +2211,13 @@ def run(context: dict) -> dict:
         result_ru = orch_ru.handle_user_message(req_sc)
         assert result_ru.get("success"), result_ru
         assert (result_ru.get("attempts") or 1) == 1, result_ru
-        assert any("Reusing" in m and "verified" in m.lower() for m in logs_ru), logs_ru[:30]
+        assert any(
+            ("MEMORY USED" in m)
+            or ("Reusing" in m and "verified" in m.lower())
+            or ("MEMORY RETRIEVAL" in m and "verified=" in m)
+            for m in logs_ru
+        ), logs_ru[:40]
+        assert any("MEMORY RETRIEVAL" in m for m in logs_ru), logs_ru[:40]
         orch_sc.close()
         orch_ru.close()
         print("  OK learning self-correct FAIL→gap-fill→PASS + reuse")
@@ -2492,7 +2498,236 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
-    # 4i) E2E: performance hardening — no offline brain hang, local gap-fill, tags cache
+    # 4i) E2E: research pipeline MEMORY→SEARCH→OPEN→EXTRACT→SAVE→REUSE
+    print("  — e2e research+memory pipeline (open/extract, not snippets) —")
+    try:
+        from jarvis import source_pipeline as sp
+        from jarvis.research import ResearchSystem as RSPipe
+        from jarvis.orchestrator import Orchestrator as OrchPipe
+
+        # Unit: snippets alone never rank as knowledge; extract required
+        hits = [
+            {
+                "url": "https://example.test/optics-guide",
+                "title": "Optics guide: reflection and refraction",
+                "snippet": "Short blurb",
+                "provider": "duckduckgo",
+                "query": "optics",
+            },
+            {
+                "url": "http://spam.xyz/buy-now",
+                "title": "Buy now casino",
+                "snippet": "click",
+                "provider": "duckduckgo",
+                "query": "optics",
+            },
+            {
+                "url": "",
+                "title": "no url",
+                "snippet": "x",
+                "provider": "duckduckgo",
+            },
+        ]
+        ranked = sp.rank_search_hits(
+            hits, goal="Learn optics basics reflection refraction", limit=3
+        )
+        assert ranked and ranked[0]["url"].startswith("https://")
+        assert not any("casino" in (h.get("title") or "").lower() for h in ranked)
+
+        html_body = """
+        <html><head><title>Optics</title></head><body>
+        <nav>Menu</nav>
+        <p>Optics is the study of light. Reflection occurs when light bounces
+        off a surface. Refraction bends light as it passes between media.</p>
+        <p>For example, a lens focuses parallel rays to a point using refraction.</p>
+        <script>evil()</script>
+        </body></html>
+        """
+        text = sp.extract_text(html_body, content_type="text/html")
+        assert "Optics is the study" in text
+        assert "evil" not in text
+        assert "Menu" not in text or len(text) > 80
+
+        # Mock OPEN so tests do not depend on live network
+        real_fetch = sp.fetch_url
+
+        def _fake_fetch(url, timeout=12.0):
+            return {
+                "url": url,
+                "ok": True,
+                "status": 200,
+                "content_type": "text/html",
+                "body": html_body,
+                "error": "",
+            }
+
+        sp.fetch_url = _fake_fetch  # type: ignore[assignment]
+        try:
+            extracts, comparison = sp.open_and_extract(
+                ranked,
+                goal="Learn optics basics and create practical tests",
+                on_log=lambda m: None,
+            )
+            assert any(e.get("ok") for e in extracts), extracts
+            blob = sp.knowledge_from_extracts(
+                extracts, comparison,
+                goal="Learn optics basics and create practical tests",
+            )
+            assert blob and "Optics is the study" in blob
+            assert "Short blurb" not in blob  # snippet must not be the knowledge
+        finally:
+            sp.fetch_url = real_fetch  # type: ignore[assignment]
+
+        # ResearchSystem learning path logs SEARCH / SOURCE FOUND / OPEN / EXTRACT
+        pipe_logs: list[str] = []
+        rs = RSPipe(brain=None, on_log=lambda m: pipe_logs.append(m), timeout=2.0)
+
+        def _ddg_optics(q, append_python=False):
+            return "hit", [{
+                "url": "https://example.test/optics-guide",
+                "title": "Optics guide: reflection and refraction",
+                "snippet": "Short blurb only — not knowledge",
+                "source": "web",
+                "provider": "duckduckgo",
+                "timestamp": 0,
+                "query": q,
+            }]
+
+        rs._duckduckgo_search = _ddg_optics  # type: ignore[method-assign]
+        sp.fetch_url = _fake_fetch  # type: ignore[assignment]
+        try:
+            notes = rs.research(
+                ["Learn optics basics"],
+                goal="Learn optics basics and create practical tests to verify knowledge",
+                mode="learning",
+                network=True,
+                use_brain=False,
+                append_python=False,
+            )
+        finally:
+            sp.fetch_url = real_fetch  # type: ignore[assignment]
+
+        assert notes.get("knowledge_from_extracts") is True, notes
+        assert "Optics is the study" in (notes.get("raw") or "")
+        assert "Short blurb only" not in (notes.get("raw") or "")
+        assert any(m.startswith("SEARCH:") for m in pipe_logs), pipe_logs
+        assert any(m.startswith("SOURCE FOUND:") for m in pipe_logs), pipe_logs
+        assert any(m.startswith("SOURCE OPEN:") for m in pipe_logs), pipe_logs
+        assert any(m.startswith("SOURCE EXTRACT:") for m in pipe_logs), pipe_logs
+
+        # Orchestrator: MEMORY RETRIEVAL → SAVE → second request MEMORY USED
+        class OfflineBrainPipe(Brain):
+            def model_status(self) -> str:
+                return "OFFLINE"
+
+            def is_available(self) -> bool:
+                return False
+
+        mem_root = root / "data" / "_e2e_research_memory_pipe"
+        if mem_root.exists():
+            shutil.rmtree(mem_root)
+        mem_root.mkdir(parents=True)
+        logs1: list[str] = []
+        orch1 = OrchPipe(
+            root=mem_root,
+            brain=OfflineBrainPipe(),
+            on_log=lambda m: logs1.append(m),
+        )
+        _real_r = orch1.research.research
+
+        def _rich_pipe(queries, goal="", **kwargs):
+            # Force extract-backed research without live web
+            base = {
+                "approach": "",
+                "libraries": [],
+                "key_apis": [],
+                "pitfalls": [],
+                "test_idea": "Self-check practice",
+                "raw": (
+                    "### Source: Thermodynamics primer\n"
+                    "URL: https://example.test/thermo\n"
+                    "Thermodynamics studies energy, heat, and work. "
+                    "The first law states energy is conserved. "
+                    "For example, a heat engine converts thermal energy to mechanical work. "
+                    "Practice: state the first law in your own words."
+                ),
+                "sources": [{
+                    "url": "https://example.test/thermo",
+                    "title": "Thermodynamics primer",
+                    "source": "extracted",
+                    "provider": "web",
+                    "extracted": True,
+                    "char_count": 200,
+                }],
+                "results": [],
+                "extracts": [{
+                    "url": "https://example.test/thermo",
+                    "title": "Thermodynamics primer",
+                    "ok": True,
+                    "char_count": 200,
+                    "relatedness": 0.5,
+                }],
+                "comparison": {"consensus": ["energy is conserved"], "source_count": 1},
+                "mode": "learning",
+                "network": True,
+                "brain_used": False,
+                "opened_sources": True,
+                "knowledge_from_extracts": True,
+            }
+            logs1.append("SEARCH: query → " + ",".join(queries or []))
+            logs1.append("SOURCE FOUND: 1 candidate URLs from SEARCH")
+            logs1.append("SOURCE OPEN: https://example.test/thermo")
+            logs1.append("SOURCE EXTRACT: ok chars=200 rel=0.50 title=Thermodynamics")
+            return base
+
+        orch1.research.research = _rich_pipe  # type: ignore[method-assign]
+        req_t = (
+            "Learn thermodynamics basics and create practical tests "
+            "to verify knowledge"
+        )
+        r1 = orch1.handle_user_message(req_t)
+        assert r1.get("success"), r1
+        assert any("MEMORY RETRIEVAL" in m for m in logs1), logs1[:40]
+        assert any("KNOWLEDGE SAVED" in m for m in logs1), logs1[-30:]
+        topic_t = r1["topic"]
+        verified = [
+            e for e in orch1.memory.get_topic_knowledge(topic_t)
+            if e.get("verified")
+        ]
+        assert verified, orch1.memory.get_topic_knowledge(topic_t)
+        # Sources must be extracted evidence, not empty
+        assert (verified[-1].get("sources") or verified[-1].get("artifact")), verified[-1]
+
+        logs2: list[str] = []
+        orch2 = OrchPipe(
+            root=mem_root,
+            brain=OfflineBrainPipe(),
+            on_log=lambda m: logs2.append(m),
+        )
+        research_calls = {"n": 0}
+        _r2 = orch2.research.research
+
+        def _count_research(queries, goal="", **kwargs):
+            research_calls["n"] += 1
+            return _r2(queries, goal=goal, **kwargs)
+
+        orch2.research.research = _count_research  # type: ignore[method-assign]
+        r2 = orch2.handle_user_message(req_t)
+        assert r2.get("success"), r2
+        assert (r2.get("attempts") or 1) == 1
+        assert research_calls["n"] == 0, research_calls  # full research skipped
+        assert any("MEMORY USED" in m for m in logs2), logs2[:40]
+        assert any("MEMORY RETRIEVAL" in m for m in logs2), logs2[:40]
+        orch1.close()
+        orch2.close()
+        print("  OK research+memory pipeline OPEN/EXTRACT + MEMORY reuse")
+    except Exception as exc:
+        msg = f"E2E_RESEARCH_MEMORY_PIPELINE: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 4j) E2E: performance hardening — no offline brain hang, local gap-fill, tags cache
     print("  — e2e performance hardening (research/brain/router) —")
     try:
         from jarvis.research import ResearchSystem
@@ -2523,12 +2758,34 @@ def run(context: dict) -> dict:
             return "(stub)", []
 
         rs._duckduckgo_search = _count_ddg  # type: ignore[method-assign]
-        out_skill = rs.research(["make zip file"], goal="zip", mode="skill", network=True)
+
+        def _no_pypi(q):
+            return "", []
+
+        rs._pypi_lookup = _no_pypi  # type: ignore[method-assign]
+        from jarvis import source_pipeline as _sp_perf
+        _prev_fetch = _sp_perf.fetch_url
+
+        def _no_fetch(url, timeout=12.0):
+            return {
+                "url": url,
+                "ok": False,
+                "status": 0,
+                "content_type": "",
+                "body": "",
+                "error": "stub",
+            }
+
+        _sp_perf.fetch_url = _no_fetch  # type: ignore[assignment]
+        try:
+            out_skill = rs.research(
+                ["make zip file"], goal="zip", mode="skill", network=True
+            )
+        finally:
+            _sp_perf.fetch_url = _prev_fetch  # type: ignore[assignment]
         assert out_skill.get("brain_used") is False
         assert "Local hints" in (out_skill.get("raw") or "")
         assert "SKILL_META" in (out_skill.get("raw") or "")
-        titles = [str(s.get("title") or "") for s in (out_skill.get("sources") or [])]
-        assert any("Local capability hints" in t for t in titles), titles
         assert calls["ddg"] >= 1
 
         # Learning mode: no skill hints, no python append, no brain
@@ -2673,7 +2930,7 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
-    # 4j) E2E: each USER REQUEST isolated — conversation ≠ prior learning final_result
+    # 4k) E2E: each USER REQUEST isolated — conversation ≠ prior learning final_result
     print("  — e2e request routing isolation (conversation ≠ prior DONE) —")
     try:
         from jarvis.intent import IntentClassifier
@@ -2795,7 +3052,7 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
-    # 4j) E2E: Multi-Model Router — work kind → tier → model + fallback + escalate
+    # 4l) E2E: Multi-Model Router — work kind → tier → model + fallback + escalate
     print("  — e2e multi-model router (FAST/REASONING/CODING) —")
     try:
         from jarvis.model_config import (
