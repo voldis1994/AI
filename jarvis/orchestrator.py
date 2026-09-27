@@ -41,6 +41,12 @@ from jarvis.knowledge_artifact import (
 from jarvis.recovery import ProgressAwareRecovery
 from jarvis.calibration import AutoCalibration
 from jarvis.perf import PerfTracker, set_active_tracker
+from jarvis.capability_match import (
+    evaluate_capability,
+    format_decision_log,
+    format_match_log,
+    verify_implies_capability_mismatch,
+)
 
 logger = logging.getLogger("jarvis.orchestrator")
 
@@ -1653,37 +1659,39 @@ class Orchestrator:
             )
             self.perf.end("CONTEXT", arg_count=len(task_args))
 
-            # CHECK CAPABILITIES — only skills that fit THIS request
+            # CHECK CAPABILITIES — TaskGoal-compatible skills only (not name similarity)
             self._status("CHECK_CAPABILITIES")
-            plan = self._sanitize_action_plan(plan, goal)
-            reuse = plan.get("can_reuse") or []
-            matched = []
-            for name in reuse:
-                sk = self.registry.get_skill(name)
-                if sk and sk["status"] == "ACTIVE" and self._skill_fits_goal(sk, goal):
-                    matched.append(sk)
-            # Loose keyword fallback only when planner did not demand a new skill
-            if not matched and not plan.get("needs_new_skill"):
-                keywords = plan.get("research_queries") or [goal]
-                tokens = []
-                for k in keywords:
-                    tokens.extend(str(k).split())
-                tokens.extend(str(goal).split())
-                for sk in self.registry.match_skills(tokens, only_active=True):
-                    if self._skill_fits_goal(sk, goal):
-                        matched.append(sk)
+            plan = self._sanitize_action_plan(plan, goal, task_goal=task_goal)
+            matched, match_reports = self._select_compatible_skills(
+                plan, task_goal, task_id=task_id
+            )
+            decision = "REUSE" if (matched and not plan.get("needs_new_skill")) else "BUILD_NEW"
+            self._log(
+                format_decision_log(
+                    decision,
+                    skill=matched[0]["name"] if matched else "",
+                    detail=f"candidates={len(matched)}",
+                )
+            )
             self.ledger.log(
                 task_id,
                 "CHECK_CAPABILITIES",
-                f"Matched {len(matched)} active skills (goal-filtered)",
-                {"names": [m["name"] for m in matched], "plan_skill": plan.get("skill_name")},
+                f"decision={decision} matched={len(matched)}",
+                {
+                    "decision": decision,
+                    "names": [m["name"] for m in matched],
+                    "plan_skill": plan.get("skill_name"),
+                    "matches": match_reports[:8],
+                },
             )
 
             skill_record = None
             exec_result = None
+            reused_compatible = False
 
             if matched and not plan.get("needs_new_skill"):
                 skill_record = matched[0]
+                reused_compatible = True
                 self._log(f"[{task_id}] Reusing ACTIVE skill: {skill_record['name']}")
                 # Refresh args with skill meta hints — still grounded to TaskGoal
                 task_args = self.contexts.build(
@@ -1700,7 +1708,7 @@ class Orchestrator:
                     task_id, skill_record, goal, args=task_args, task_goal=task_goal
                 )
                 if not exec_result.get("ok"):
-                    # Mark broken and fall through to repair/learn
+                    # Compatible skill failed execution → REPAIR (not BUILD_NEW)
                     self.registry.mark_failure(
                         skill_record["name"],
                         str(exec_result.get("error") or "execution failed"),
@@ -1709,7 +1717,14 @@ class Orchestrator:
                         skill_record["name"], "broken_detected", "BROKEN", exec_result
                     )
                     self._log(
-                        f"[{task_id}] Skill broken — entering repair/learn path"
+                        format_decision_log(
+                            "REPAIR",
+                            skill=skill_record["name"],
+                            detail="execution failed on compatible skill",
+                        )
+                    )
+                    self._log(
+                        f"[{task_id}] Skill broken — entering repair path"
                     )
                     skill_record, task_args, task_goal = self._learn_or_repair(
                         task_id, goal, plan, repair_of=skill_record,
@@ -1720,6 +1735,12 @@ class Orchestrator:
                             task_id, skill_record, goal, task_args, task_goal
                         )
             else:
+                self._log(
+                    format_decision_log(
+                        "BUILD_NEW",
+                        detail="no TaskGoal-compatible ACTIVE skill",
+                    )
+                )
                 skill_record, task_args, task_goal = self._learn_or_repair(
                     task_id, goal, plan, repair_of=None,
                     task_args=task_args, task_goal=task_goal,
@@ -1816,9 +1837,44 @@ class Orchestrator:
                 extra={"phase": "outer_verify", "task_id": task_id},
             )
 
-            # VERIFY FAIL → OBSERVE → DIAGNOSE → REPAIR → RETEST (then re-execute)
+            # VERIFY FAIL → capability mismatch? BUILD_NEW : REPAIR compatible skill
             if not verification.get("verified"):
-                if skill_record:
+                repair_target = skill_record
+                if skill_record and task_goal is not None:
+                    compat = evaluate_capability(skill_record, task_goal)
+                    self._log(format_match_log(compat))
+                    mismatch = verify_implies_capability_mismatch(
+                        verification, skill_record, task_goal
+                    )
+                    if mismatch or not compat.get("compatible"):
+                        self._log(
+                            format_decision_log(
+                                "BUILD_NEW",
+                                skill=skill_record["name"],
+                                detail=(
+                                    "VERIFY fail + capability mismatch — "
+                                    "will not repair unrelated skill"
+                                ),
+                            )
+                        )
+                        # Do not mutate the unrelated specialized skill
+                        plan = dict(plan or {})
+                        plan["needs_new_skill"] = True
+                        plan["needs_research"] = True
+                        plan["can_reuse"] = []
+                        plan["skill_name"] = (
+                            Brain._slug(task_goal.user_request)[:40] or "new_skill"
+                        )
+                        repair_target = None
+                    else:
+                        self._log(
+                            format_decision_log(
+                                "REPAIR",
+                                skill=skill_record["name"],
+                                detail="VERIFY fail on TaskGoal-compatible skill",
+                            )
+                        )
+                if skill_record and repair_target is not None:
                     self.registry.mark_failure(
                         skill_record["name"],
                         verification.get("reason") or "verify failed",
@@ -1834,15 +1890,19 @@ class Orchestrator:
                     )
                 self._log(
                     f"[{task_id}] VERIFY FAIL vs TaskGoal — "
-                    f"entering OBSERVE→DIAGNOSE→REPAIR→RETEST"
+                    + (
+                        "BUILD_NEW (capability mismatch)"
+                        if repair_target is None
+                        else "entering OBSERVE→DIAGNOSE→REPAIR→RETEST"
+                    )
                 )
                 skill_record, task_args, task_goal = self._learn_or_repair(
                     task_id,
                     goal,
                     plan,
-                    repair_of=skill_record,
+                    repair_of=repair_target,
                     task_args=task_args,
-                    verify_failure=verification,
+                    verify_failure=verification if repair_target is not None else None,
                     task_goal=task_goal,
                 )
                 if skill_record and skill_record.get("status") == "ACTIVE":
@@ -2005,16 +2065,25 @@ class Orchestrator:
         planned_name = str(plan.get("skill_name") or "").strip()
         if planned_name and not repair_of:
             existing_planned = self.registry.get_skill(planned_name)
-            if existing_planned and not self._skill_fits_goal(existing_planned, goal):
+            if existing_planned and not self._skill_fits_goal(
+                existing_planned, goal, task_goal=task_goal
+            ):
                 self._log(
                     f"[{task_id}] Ignoring unrelated existing skill_name="
                     f"{planned_name!r} for goal={goal!r}"
+                )
+                self._log(
+                    format_decision_log(
+                        "BUILD_NEW",
+                        skill=planned_name,
+                        detail="planned skill incompatible with TaskGoal",
+                    )
                 )
                 planned_name = ""
         skill_name = (
             (repair_of or {}).get("name")
             or planned_name
-            or self.brain._slug(goal)[:40]
+            or self.brain._slug(task_goal.user_request or goal)[:40]
             or "new_skill"
         )
         description = plan.get("skill_description") or goal
@@ -3439,86 +3508,121 @@ class Orchestrator:
     def _offline_classify(self, text: str) -> dict:
         return IntentClassifier.classify_offline(text)
 
-    def _sanitize_action_plan(self, plan: dict, goal: str) -> dict:
+    def _sanitize_action_plan(
+        self, plan: dict, goal: str, task_goal: Optional[TaskGoal] = None
+    ) -> dict:
         """Drop unrelated can_reuse / skill_name inherited from prior capabilities."""
         plan = dict(plan or {})
+        tg = task_goal or TaskGoal.from_request(goal, goal=goal)
         reuse = []
         for name in plan.get("can_reuse") or []:
             sk = self.registry.get_skill(str(name))
-            if sk and self._skill_fits_goal(sk, goal):
+            if not sk:
+                continue
+            match = evaluate_capability(sk, tg)
+            self._log(format_match_log(match))
+            if match.get("compatible"):
                 reuse.append(sk["name"])
         plan["can_reuse"] = reuse
         planned = str(plan.get("skill_name") or "").strip()
         if planned:
             existing = self.registry.get_skill(planned)
-            # Only reject when the name refers to an EXISTING unrelated skill.
+            # Only reject when the name refers to an EXISTING incompatible skill.
             # Fresh planner names (not yet registered) are kept.
-            if existing and not self._skill_fits_goal(existing, goal):
-                plan["skill_name"] = Brain._slug(goal)[:40] or "new_skill"
-                plan["needs_new_skill"] = True
+            if existing:
+                match = evaluate_capability(existing, tg)
+                self._log(format_match_log(match))
+                if not match.get("compatible"):
+                    plan["skill_name"] = Brain._slug(tg.user_request or goal)[:40] or "new_skill"
+                    plan["needs_new_skill"] = True
         else:
-            plan["skill_name"] = Brain._slug(goal)[:40] or "new_skill"
+            plan["skill_name"] = Brain._slug(tg.user_request or goal)[:40] or "new_skill"
         if not reuse and not plan.get("needs_new_skill"):
             # No fitting skill → must build for THIS goal
             plan["needs_new_skill"] = True
             plan["needs_research"] = True
         return plan
 
+    def _select_compatible_skills(
+        self,
+        plan: dict,
+        task_goal: TaskGoal,
+        *,
+        task_id: str = "",
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Rank ACTIVE skills that can fulfill this TaskGoal (not keyword bait)."""
+        reports: list[dict[str, Any]] = []
+        scored: list[tuple[float, dict[str, Any]]] = []
+        seen: set[str] = set()
+
+        def _consider(sk: dict[str, Any]) -> None:
+            name = str(sk.get("name") or "")
+            if not name or name in seen or sk.get("status") != "ACTIVE":
+                return
+            seen.add(name)
+            match = evaluate_capability(sk, task_goal)
+            self._log(format_match_log(match))
+            reports.append(match)
+            if match.get("compatible"):
+                scored.append((float(match.get("score") or 0.0), sk))
+
+        for name in plan.get("can_reuse") or []:
+            sk = self.registry.get_skill(str(name))
+            if sk:
+                _consider(sk)
+
+        # Fallback candidates from registry keywords — still require TaskGoal compatibility
+        if not scored and not plan.get("needs_new_skill"):
+            keywords = plan.get("research_queries") or [task_goal.user_request]
+            tokens: list[str] = []
+            for k in keywords:
+                tokens.extend(str(k).split())
+            tokens.extend(str(task_goal.user_request).split())
+            tokens.extend(str(a) for a in task_goal.artifacts)
+            for sk in self.registry.match_skills(tokens, only_active=True):
+                _consider(sk)
+
+        scored.sort(key=lambda x: -x[0])
+        matched = [sk for _, sk in scored]
+        if task_id:
+            self._log(
+                f"[{task_id}] capability candidates compatible="
+                f"{[m['name'] for m in matched]}"
+            )
+        return matched, reports
+
     @staticmethod
     def _name_fits_goal(name: str, goal: str) -> bool:
-        """True if skill/plan name shares meaningful tokens with the goal."""
+        """Legacy name overlap helper (kept for offline fallbacks)."""
         if not name or not goal:
             return False
-        name_l = str(name).lower().replace("-", "_")
-        goal_l = str(goal).lower()
-        if name_l in goal_l:
-            return True
-        parts = [p for p in re.split(r"[_\s]+", name_l) if len(p) >= 4]
-        # Generic verbs alone are not enough to claim a fit
-        generic = {
-            "create", "write", "make", "build", "file", "files", "skill",
-            "data", "test", "tests", "run", "exec", "handle", "new",
+        tg = TaskGoal.from_request(goal, goal=goal)
+        fake = {
+            "name": name,
+            "description": goal,
+            "capabilities": [],
+            "status": "ACTIVE",
+            "file_path": "",
         }
-        meaningful = [p for p in parts if p not in generic]
-        if not meaningful:
-            # Name is only generic tokens — require full slug fragment in goal
-            return any(p in goal_l for p in parts) and len(parts) >= 2
-        hits = sum(1 for p in meaningful if p in goal_l)
-        return hits >= 1
+        return bool(evaluate_capability(fake, tg).get("compatible"))
 
-    def _skill_fits_goal(self, skill: dict, goal: str) -> bool:
-        """Whether an ACTIVE skill is relevant to THIS user goal (not prior context)."""
+    def _skill_fits_goal(
+        self, skill: dict, goal: str, task_goal: Optional[TaskGoal] = None
+    ) -> bool:
+        """Whether skill is TaskGoal-compatible (actions/artifacts/domain)."""
         if not skill or not goal:
             return False
-        if self._name_fits_goal(str(skill.get("name") or ""), goal):
-            return True
-        hay_parts = [
-            str(skill.get("description") or ""),
-            *list(skill.get("capabilities") or []),
-        ]
-        hay = " ".join(hay_parts).lower()
-        goal_tokens = [
-            t.lower() for t in re.findall(r"[A-Za-z0-9_]{4,}", goal)
-            if t.lower() not in {
-                "create", "write", "make", "build", "file", "files",
-                "with", "that", "this", "from", "into", "please",
-                "izveido", "uzraksti", "failu", "saturu", "learn",
-                "study", "basics", "knowledge", "using", "about",
-            }
-        ]
-        if not goal_tokens:
-            return False
-        hits = sum(1 for t in goal_tokens if t in hay or t in str(skill.get("name") or "").lower())
-        # Need solid overlap — one shared generic word is not enough
-        return hits >= 2 or (
-            hits >= 1 and self._name_fits_goal(str(skill.get("name") or ""), goal)
-        )
+        tg = task_goal or TaskGoal.from_request(goal, goal=goal)
+        return bool(evaluate_capability(skill, tg).get("compatible"))
 
     def _offline_plan(self, goal: str, caps: list[str]) -> dict:
-        matched = [
-            m for m in self.registry.match_skills(goal.split(), only_active=True)
-            if self._skill_fits_goal(m, goal)
-        ]
+        tg = TaskGoal.from_request(goal, goal=goal)
+        matched = []
+        for m in self.registry.match_skills(goal.split(), only_active=True):
+            match = evaluate_capability(m, tg)
+            # Quiet offline plan — match logs happen at CHECK_CAPABILITIES
+            if match.get("compatible"):
+                matched.append(m)
         # Universal offline arg draft — no task-specific key hardcoding
         draft_args = TaskGoal.sanitize_args(
             ContextBuilder._offline_extract(goal), goal

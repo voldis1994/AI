@@ -136,6 +136,8 @@ def run_check(root: Path) -> int:
         "jarvis.memory",
         "jarvis.ledger",
         "jarvis.capability_registry",
+        "jarvis.capability_match",
+        "jarvis.task_goal",
         "jarvis.research",
         "jarvis.source_pipeline",
         "jarvis.dependency_manager",
@@ -3210,6 +3212,308 @@ def run(context: dict) -> dict:
         print("  OK stabilize — conversation/perf/TaskGoal/repair→PASS")
     except Exception as exc:
         msg = f"E2E_STABILIZE: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # Capability match: unrelated ACTIVE bait must not be REPAIR'd for a new TaskGoal
+    print("  — e2e capability match (BUILD_NEW vs unrelated ACTIVE bait) —")
+    try:
+        from jarvis.capability_match import evaluate_capability as _eval_cap
+
+        cap_root = root / "data" / "_e2e_capability"
+        if cap_root.exists():
+            shutil.rmtree(cap_root)
+        cap_root.mkdir(parents=True)
+        skills_dir = cap_root / "skills"
+        skills_dir.mkdir(parents=True)
+        ws_dir = cap_root / "workspace_runtime"
+        ws_dir.mkdir(parents=True)
+
+        # Bait skill: specialized "decorators" — must NOT absorb unrelated tasks
+        bait_path = skills_dir / "python_decorators_basics.py"
+        bait_path.write_text(
+            '''
+SKILL_META = {
+    "name": "python_decorators_basics",
+    "description": "Teach Python decorators with wrap examples",
+    "capabilities": ["decorators", "wrap functions", "decorator syntax"],
+}
+def run(context):
+    return {"ok": True, "result": "decorators lesson", "error": None, "evidence": "decorated"}
+'''.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        class CapBrain(Brain):
+            def __init__(self) -> None:
+                super().__init__()
+                self.builds = 0
+                self.repaired_bait = False
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": user_text.split()[:8],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                # Planner wrongly offers the bait (simulates semantic lure)
+                return {
+                    "steps": ["handle goal"],
+                    "can_reuse": ["python_decorators_basics"],
+                    "missing": [],
+                    "needs_research": False,
+                    "needs_new_skill": False,
+                    "skill_name": "python_decorators_basics",
+                    "skill_description": goal,
+                    "research_queries": [goal, "python programming"],
+                    "args": {},
+                    "required_args": [],
+                }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                return {}
+
+            def research_notes(self, query: str, gathered: str) -> dict:
+                return {
+                    "approach": "pathlib_write",
+                    "libraries": [],
+                    "key_apis": ["Path.write_text"],
+                    "pitfalls": [],
+                    "test_idea": "artifact exists",
+                }
+
+            def write_skill_code(
+                self,
+                skill_name,
+                description,
+                research,
+                previous_code=None,
+                error_log=None,
+                diagnosis=None,
+                failed_approaches=None,
+                test_plan=None,
+                **kwargs,
+            ) -> str:
+                self.builds += 1
+                if skill_name == "python_decorators_basics":
+                    self.repaired_bait = True
+                # Universal writer for whatever artifact the TaskGoal asks
+                return f'''
+SKILL_META = {{
+    "name": "{skill_name}",
+    "description": {description!r},
+    "capabilities": ["write file artifact"],
+}}
+from pathlib import Path
+def run(context):
+    ws = Path(context["workspace"])
+    target = ws / "alpha_report.txt"
+    target.write_text("ALPHA_OK", encoding="utf-8")
+    return {{"ok": True, "result": str(target), "error": None, "evidence": target.read_text(encoding="utf-8")}}
+'''.strip()
+
+            def diagnose(self, *a, **k):
+                return {
+                    "fault_layer": "skill_code",
+                    "approach": "pathlib_write",
+                    "rewrite_skill": True,
+                    "summary": "fix skill",
+                }
+
+            def chat(self, *a, **k):
+                return "{}"
+
+        logs_c: list[str] = []
+        orch_c = Orchestrator(
+            root=cap_root,
+            brain=CapBrain(),
+            on_log=lambda m: logs_c.append(m),
+        )
+        # Register bait as ACTIVE (trusted-looking)
+        orch_c.registry.register_candidate(
+            name="python_decorators_basics",
+            description="Teach Python decorators with wrap examples",
+            file_path=str(bait_path),
+            capabilities=["decorators", "wrap functions", "decorator syntax"],
+            version=1,
+        )
+        orch_c.registry.set_status("python_decorators_basics", "ACTIVE")
+        bait_before = orch_c.registry.get_skill("python_decorators_basics")
+        assert bait_before and bait_before["status"] == "ACTIVE"
+
+        # Matcher unit: bait incompatible with new TaskGoal
+        tg_alpha = __import__("jarvis.task_goal", fromlist=["TaskGoal"]).TaskGoal.from_request(
+            "Create file alpha_report.txt containing ALPHA_OK"
+        )
+        bait_match = _eval_cap(bait_before, tg_alpha)
+        assert bait_match["compatible"] is False, bait_match
+
+        result_c = orch_c.handle_user_message(
+            "Create file alpha_report.txt containing ALPHA_OK"
+        )
+        assert result_c.get("success") is True, result_c
+        assert any("CAPABILITY MATCH:" in m for m in logs_c), logs_c[-40:]
+        assert any(
+            "CAPABILITY MATCH:" in m
+            and "python_decorators_basics" in m
+            and "compatible=False" in m
+            for m in logs_c
+        ), [m for m in logs_c if "CAPABILITY" in m]
+        assert any("CAPABILITY DECISION: BUILD_NEW" in m for m in logs_c), [
+            m for m in logs_c if "CAPABILITY" in m
+        ]
+        # Must not REPAIR the bait into a universal skill
+        assert not orch_c.brain.repaired_bait, "bait skill was rewritten"
+        bait_after = orch_c.registry.get_skill("python_decorators_basics")
+        assert bait_after["status"] == "ACTIVE", bait_after
+        assert int(bait_after["version"]) == int(bait_before["version"])
+        # New skill/artifact for THIS TaskGoal
+        alpha = ws_dir / "alpha_report.txt"
+        assert alpha.exists() and "ALPHA_OK" in alpha.read_text(encoding="utf-8")
+        new_skills = [
+            s["name"]
+            for s in orch_c.registry.list_skills()
+            if s["name"] != "python_decorators_basics" and s["status"] == "ACTIVE"
+        ]
+        assert new_skills, orch_c.registry.list_skills()
+
+        # Second distinct task + calculator bait → still BUILD_NEW, not calculator REPAIR
+        calc_path = skills_dir / "simple_calculator.py"
+        calc_path.write_text(
+            "SKILL_META={'name':'simple_calculator','capabilities':['arithmetic']}\n"
+            "def run(c):\n    return {'ok': True, 'result': 0, 'error': None, 'evidence': '0'}\n",
+            encoding="utf-8",
+        )
+        orch_c.registry.register_candidate(
+            name="simple_calculator",
+            description="Add subtract multiply divide numbers",
+            file_path=str(calc_path),
+            capabilities=["arithmetic", "calculator"],
+            version=1,
+        )
+        orch_c.registry.set_status("simple_calculator", "ACTIVE")
+
+        class CapBrain2(CapBrain):
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                return {
+                    "steps": ["handle goal"],
+                    "can_reuse": ["simple_calculator", "python_decorators_basics"],
+                    "missing": [],
+                    "needs_research": False,
+                    "needs_new_skill": False,
+                    "skill_name": "simple_calculator",
+                    "skill_description": goal,
+                    "research_queries": [goal],
+                    "args": {},
+                    "required_args": [],
+                }
+
+            def write_skill_code(self, skill_name, description, research, **kwargs):
+                self.builds += 1
+                if skill_name in ("simple_calculator", "python_decorators_basics"):
+                    self.repaired_bait = True
+                return f'''
+SKILL_META = {{"name": "{skill_name}", "capabilities": ["write beta_notes.md"]}}
+from pathlib import Path
+def run(context):
+    p = Path(context["workspace"]) / "beta_notes.md"
+    p.write_text("BETA_OK", encoding="utf-8")
+    return {{"ok": True, "result": str(p), "error": None, "evidence": "BETA_OK"}}
+'''.strip()
+
+        logs_c2: list[str] = []
+        brain2 = CapBrain2()
+        orch_c2 = Orchestrator(
+            root=cap_root,
+            brain=brain2,
+            on_log=lambda m: logs_c2.append(m),
+        )
+        # Keep registry skills from same DB
+        r2 = orch_c2.handle_user_message(
+            "Create markdown file beta_notes.md containing BETA_OK"
+        )
+        assert r2.get("success") is True, r2
+        assert any("CAPABILITY DECISION: BUILD_NEW" in m for m in logs_c2), [
+            m for m in logs_c2 if "CAPABILITY" in m
+        ]
+        assert any(
+            "compatible=False" in m and "simple_calculator" in m for m in logs_c2
+        ), [m for m in logs_c2 if "CAPABILITY MATCH" in m]
+        assert not brain2.repaired_bait
+        assert (ws_dir / "beta_notes.md").read_text(encoding="utf-8") == "BETA_OK"
+        calc_after = orch_c2.registry.get_skill("simple_calculator")
+        assert calc_after["status"] == "ACTIVE"
+        assert int(calc_after["version"]) == 1
+
+        # Compatible REUSE still works
+        class CapBrainReuse(CapBrain):
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                reuse = []
+                for line in known_capabilities:
+                    if "alpha_report" in line or "alpha" in line.lower():
+                        # pick any non-bait ACTIVE that fits
+                        pass
+                # Prefer the skill that wrote alpha_report
+                for s in known_capabilities:
+                    name = s.split()[0]
+                    if name not in ("python_decorators_basics", "simple_calculator"):
+                        reuse.append(name)
+                        break
+                return {
+                    "steps": ["reuse"],
+                    "can_reuse": reuse,
+                    "missing": [] if reuse else [goal],
+                    "needs_research": not bool(reuse),
+                    "needs_new_skill": not bool(reuse),
+                    "skill_name": reuse[0] if reuse else "alpha_report",
+                    "skill_description": goal,
+                    "research_queries": [goal],
+                    "args": {},
+                    "required_args": [],
+                }
+
+            def write_skill_code(self, *a, **k):
+                self.builds += 1
+                raise AssertionError("REUSE must not rebuild")
+
+        logs_r: list[str] = []
+        orch_r = Orchestrator(
+            root=cap_root,
+            brain=CapBrainReuse(),
+            on_log=lambda m: logs_r.append(m),
+        )
+        # Ensure alpha artifact gone so reuse skill recreates it
+        if alpha.exists():
+            alpha.unlink()
+        r3 = orch_r.handle_user_message(
+            "Create file alpha_report.txt containing ALPHA_OK"
+        )
+        assert r3.get("success") is True, r3
+        assert any("CAPABILITY DECISION: REUSE" in m for m in logs_r), [
+            m for m in logs_r if "CAPABILITY" in m
+        ]
+        assert orch_r.brain.builds == 0
+        assert alpha.exists()
+
+        orch_c.close()
+        orch_c2.close()
+        orch_r.close()
+        print("  OK capability match — bait rejected, BUILD_NEW, compatible REUSE")
+    except Exception as exc:
+        msg = f"E2E_CAPABILITY_MATCH: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)
