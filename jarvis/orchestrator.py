@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -78,6 +79,8 @@ class Orchestrator:
 
         self.on_log = on_log or (lambda m: None)
         self.on_status = on_status or (lambda s: None)
+        # Isolates the in-flight USER REQUEST (never share final_result across turns)
+        self._active_request_id: Optional[str] = None
 
         db = self.data_dir / "jarvis.db"
         self.brain = brain or Brain()
@@ -96,27 +99,44 @@ class Orchestrator:
     # ── Public API ──────────────────────────────────────────────────────
 
     def handle_user_message(self, text: str) -> dict[str, Any]:
-        """Route a user message to conversation or full task cycle."""
-        text = (text or "").strip()
-        if not text:
-            return {"type": "error", "reply": "Empty message."}
+        """
+        Route ONE user message in isolation:
 
-        self.memory.add_message("user", text)
+        INTENT → correct handler → EXECUTE/ANSWER → own reply → DONE
+
+        Never reuses a previous request's final_result / DONE outcome as the
+        answer for a new request (conversation must not echo prior learning).
+        """
+        text = (text or "").strip()
+        request_id = uuid.uuid4().hex[:12]
+        if not text:
+            return {
+                "type": "error",
+                "reply": "Empty message.",
+                "request_id": request_id,
+            }
+
+        # Per-request state — do not read/write cross-request result caches
+        self._active_request_id = request_id
+        self.memory.add_message(
+            "user", text, meta={"request_id": request_id, "phase": "received"}
+        )
         self._status("THINKING")
+        self._log(f"REQUEST_ID: {request_id} text={text[:120]!r}")
         # Do not _log USER/JARVIS reply here — GUI/CLI already display them once.
 
         # Fast-path commands
         low = text.lower().strip()
         if low in ("/status", "status"):
             reply = self._format_status()
-            self.memory.add_message("assistant", reply)
-            self._status("IDLE")
-            return {"type": "status", "reply": reply}
+            return self._finish_request(
+                request_id, text, "status", reply, intent_name="status"
+            )
         if low in ("/skills", "skills"):
             reply = self._format_skills()
-            self.memory.add_message("assistant", reply)
-            self._status("IDLE")
-            return {"type": "skills", "reply": reply}
+            return self._finish_request(
+                request_id, text, "skills", reply, intent_name="skills"
+            )
         if low.startswith("/help"):
             reply = (
                 "JARVIS commands:\n"
@@ -125,11 +145,11 @@ class Orchestrator:
                 "  /help    — this help\n"
                 "Or ask anything / give a task to learn & execute."
             )
-            self.memory.add_message("assistant", reply)
-            self._status("IDLE")
-            return {"type": "help", "reply": reply}
+            return self._finish_request(
+                request_id, text, "help", reply, intent_name="help"
+            )
 
-        # Classify THIS request independently (never inherit prior skill)
+        # Classify THIS request independently (never inherit prior skill/result)
         model_status = self.brain.model_status()
         brain_up = model_status == "ONLINE"
         if not brain_up:
@@ -137,54 +157,220 @@ class Orchestrator:
         else:
             intent = self.brain.classify_intent(text)
         intent = IntentClassifier.normalize(intent, text)
+        intent_name = str(intent.get("intent") or "conversation")
         self._log(
-            f"INTENT: {intent.get('intent')} needs_capability="
-            f"{intent.get('needs_capability')} goal={intent.get('goal')!r}"
+            f"INTENT: {intent_name} request_id={request_id} "
+            f"needs_capability={intent.get('needs_capability')} "
+            f"goal={intent.get('goal')!r}"
         )
 
-        if intent.get("intent") == "conversation":
+        if intent_name == "conversation":
             self._status("CONVERSING")
-            history = self.memory.chat_history_for_llm(10)
-            history = [m for m in history if not (m["role"] == "user" and m["content"] == text)]
-            if brain_up:
-                reply = self.brain.converse(text, history=history)
-            elif model_status == "MODEL MISSING":
-                reply = (
-                    f"[MODEL MISSING] Ollama darbojas, bet modelis "
-                    f"{self.brain.model} nav atrasts. Palaid: "
-                    f"ollama pull {self.brain.model}. Saņēmu: {text}"
-                )
-            else:
-                reply = (
-                    "[Ollama OFFLINE] Esmu JARVIS. Palaiž Ollama ar modeli "
-                    f"{self.brain.model}, lai runātu un mācītos. "
-                    f"Saņēmu: {text}"
-                )
-            self.memory.add_message("assistant", reply)
+            reply = self._answer_conversation(
+                text,
+                request_id=request_id,
+                brain_up=brain_up,
+                model_status=model_status,
+            )
+            out = self._finish_request(
+                request_id,
+                text,
+                "conversation",
+                reply,
+                intent_name="conversation",
+                intent=intent,
+                success=True,
+            )
+            self._status("DONE")
             self._status("IDLE")
-            return {"type": "conversation", "reply": reply, "intent": intent}
+            return out
 
-        # Learning / knowledge request — research + verify + save topic knowledge.
-        # Must NOT enter skill build/repair or inherit previous capabilities.
-        if intent.get("intent") == "learning":
+        # Learning / knowledge — isolated cycle; no prior final_result as reply
+        if intent_name == "learning":
             goal = intent.get("goal") or text
             result = self.run_learning_cycle(goal, original_request=text)
             reply = result.get("reply") or result.get("outcome") or str(result)
-            self.memory.add_message(
-                "assistant", reply, meta={"task_id": result.get("task_id"), "intent": "learning"}
+            reply = self._ensure_fresh_reply(
+                reply, text, request_id=request_id, intent_name="learning"
             )
-            self._status("IDLE" if result.get("success") else "ERROR")
-            result["intent"] = intent
-            return result
+            out = self._finish_request(
+                request_id,
+                text,
+                "learning",
+                reply,
+                intent_name="learning",
+                intent=intent,
+                success=bool(result.get("success")),
+                extra={
+                    k: v
+                    for k, v in result.items()
+                    if k
+                    not in (
+                        "reply", "outcome", "type", "intent", "request_id",
+                        "success",
+                    )
+                },
+            )
+            return out
 
-        # Action task path — use/build/repair a skill for THIS request only
+        # Action task — isolated cycle for THIS request only
         goal = intent.get("goal") or text
         result = self.run_cycle(goal, original_request=text)
         reply = result.get("reply") or result.get("outcome") or str(result)
-        self.memory.add_message("assistant", reply, meta={"task_id": result.get("task_id")})
-        self._status("IDLE" if result.get("success") else "ERROR")
-        result["intent"] = intent
-        return result
+        reply = self._ensure_fresh_reply(
+            reply, text, request_id=request_id, intent_name="task"
+        )
+        out = self._finish_request(
+            request_id,
+            text,
+            "task",
+            reply,
+            intent_name="task",
+            intent=intent,
+            success=bool(result.get("success")),
+            extra={
+                k: v
+                for k, v in result.items()
+                if k
+                not in (
+                    "reply", "outcome", "type", "intent", "request_id",
+                    "success",
+                )
+            },
+        )
+        return out
+
+    def _answer_conversation(
+        self,
+        text: str,
+        *,
+        request_id: str,
+        brain_up: bool,
+        model_status: str,
+    ) -> str:
+        """Produce a fresh conversational answer for THIS request only."""
+        # Exclude learning/task DONE turns so prior final_result cannot leak in
+        history = self.memory.conversation_history_for_llm(8)
+        history = [
+            m for m in history
+            if not (m.get("role") == "user" and m.get("content") == text)
+        ]
+        if brain_up:
+            reply = self.brain.converse(text, history=history)
+        elif model_status == "MODEL MISSING":
+            reply = (
+                f"[MODEL MISSING] Ollama darbojas, bet modelis "
+                f"{self.brain.model} nav atrasts. Palaid: "
+                f"ollama pull {self.brain.model}. Saņēmu: {text}"
+            )
+        else:
+            reply = (
+                "[Ollama OFFLINE] Esmu JARVIS. Palaiž Ollama ar modeli "
+                f"{self.brain.model}, lai runātu un mācītos. "
+                f"Saņēmu: {text}"
+            )
+        return self._ensure_fresh_reply(
+            reply, text, request_id=request_id, intent_name="conversation"
+        )
+
+    def _ensure_fresh_reply(
+        self,
+        reply: Any,
+        user_text: str,
+        *,
+        request_id: str,
+        intent_name: str,
+    ) -> str:
+        """
+        Reject stale reuse of a previous learning/task final_result as this
+        request's answer (especially for conversation).
+        """
+        text = str(reply or "").strip()
+        prior = self.memory.last_cycle_assistant_reply()
+        stale = False
+        if prior and text:
+            if text == prior.strip():
+                stale = True
+            elif (
+                intent_name == "conversation"
+                and Memory._looks_like_cycle_outcome(text)
+                and (
+                    prior.strip()[:120] in text
+                    or text[:120] in prior.strip()
+                )
+            ):
+                stale = True
+
+        if stale and intent_name == "conversation":
+            self._log(
+                f"STALE_REPLY_REJECTED request_id={request_id} "
+                f"— refusing prior cycle final_result as conversation answer"
+            )
+            # Retry once with zero history (no prior DONE in context)
+            if self.brain.is_available():
+                try:
+                    text = self.brain.converse(user_text, history=[])
+                except Exception:
+                    text = ""
+            if (
+                not text
+                or text.strip() == (prior or "").strip()
+                or Memory._looks_like_cycle_outcome(text)
+            ):
+                text = (
+                    f"Saņēmu jūsu jautājumu: {user_text}\n"
+                    "(Iepriekšējā mācīšanās/uzdevuma rezultāts netiek atkārtots — "
+                    "atbildi uz šo pieprasījumu.)"
+                )
+        elif stale:
+            self._log(
+                f"STALE_REPLY_WARN request_id={request_id} intent={intent_name} "
+                f"— reply matched a prior cycle outcome"
+            )
+        return str(text or "").strip()
+
+    def _finish_request(
+        self,
+        request_id: str,
+        user_text: str,
+        result_type: str,
+        reply: str,
+        *,
+        intent_name: str,
+        intent: Optional[dict] = None,
+        success: Optional[bool] = None,
+        extra: Optional[dict] = None,
+    ) -> dict[str, Any]:
+        """Persist assistant reply tagged to THIS request_id and return payload."""
+        meta = {
+            "request_id": request_id,
+            "intent": intent_name,
+            "user_text": user_text[:500],
+        }
+        if extra and extra.get("task_id") is not None:
+            meta["task_id"] = extra.get("task_id")
+        self.memory.add_message("assistant", reply, meta=meta)
+        if success is False:
+            self._status("ERROR")
+        elif result_type in ("learning", "task") and success:
+            self._status("DONE")
+            self._status("IDLE")
+        elif result_type not in ("conversation",):
+            self._status("IDLE")
+        out: dict[str, Any] = {
+            "type": result_type,
+            "reply": reply,
+            "request_id": request_id,
+            "intent": intent or {"intent": intent_name, "goal": user_text},
+        }
+        if success is not None:
+            out["success"] = success
+        if extra:
+            out.update(extra)
+        # Clear active id only if we still own the turn
+        if getattr(self, "_active_request_id", None) == request_id:
+            self._active_request_id = None
+        return out
 
     def run_learning_cycle(
         self, goal: str, original_request: Optional[str] = None

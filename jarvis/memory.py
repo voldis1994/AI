@@ -156,6 +156,76 @@ class Memory:
             if m["role"] in ("user", "assistant")
         ]
 
+    def conversation_history_for_llm(self, limit: int = 8) -> list[dict[str, str]]:
+        """
+        History for the conversation handler only.
+
+        Excludes learning/task cycle turns so a prior DONE / final_result cannot
+        be reused as the answer to a new chat question.
+        """
+        msgs = self.recent_messages(max(limit * 4, 24))
+        skip: set[int] = set()
+        for i, m in enumerate(msgs):
+            if m.get("role") != "assistant":
+                continue
+            meta = m.get("meta") if isinstance(m.get("meta"), dict) else {}
+            intent = str(meta.get("intent") or "").lower()
+            if (
+                intent in ("learning", "task")
+                or meta.get("task_id")
+                or self._looks_like_cycle_outcome(str(m.get("content") or ""))
+            ):
+                skip.add(i)
+                if i > 0 and msgs[i - 1].get("role") == "user":
+                    skip.add(i - 1)
+
+        out: list[dict[str, str]] = []
+        for i, m in enumerate(msgs):
+            if i in skip:
+                continue
+            if m.get("role") not in ("user", "assistant"):
+                continue
+            content = str(m.get("content") or "").strip()
+            if not content:
+                continue
+            out.append({"role": str(m["role"]), "content": content})
+        return out[-limit:]
+
+    def last_cycle_assistant_reply(self) -> Optional[str]:
+        """Most recent learning/task assistant reply (for stale-result guards)."""
+        for m in reversed(self.recent_messages(30)):
+            if m.get("role") != "assistant":
+                continue
+            meta = m.get("meta") if isinstance(m.get("meta"), dict) else {}
+            intent = str(meta.get("intent") or "").lower()
+            content = str(m.get("content") or "")
+            if (
+                intent in ("learning", "task")
+                or meta.get("task_id")
+                or self._looks_like_cycle_outcome(content)
+            ):
+                return content
+        return None
+
+    @staticmethod
+    def _looks_like_cycle_outcome(content: str) -> bool:
+        """Heuristic for untagged learning/task final replies."""
+        if not content:
+            return False
+        head = content.lstrip()[:80].upper()
+        markers = (
+            "DONE.",
+            "DONE ",
+            "LEARNING VERIFY",
+            "LEARNING COMPLETE",
+            "SKILL RESULT",
+            "VERIFIER PASS",
+            "VERIFIER FAIL",
+            "DONE NAV ATĻAUTS",
+            "DONE NAV ATLAUTS",
+        )
+        return any(head.startswith(m) or m in content[:200].upper() for m in markers)
+
     def save_experience(
         self,
         goal: str,

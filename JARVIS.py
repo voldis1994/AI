@@ -76,6 +76,8 @@ class JarvisGUI:
     def __init__(self, root_dir: Path) -> None:
         self.root_dir = root_dir
         self.busy = False
+        # Monotonic id so late worker threads cannot paint a stale reply
+        self._request_seq = 0
 
         self.win = tk.Tk()
         self.win.title("JARVIS")
@@ -411,6 +413,8 @@ class JarvisGUI:
             return
         self.entry.delete(0, tk.END)
         self.busy = True
+        self._request_seq += 1
+        seq = self._request_seq
         self.send_btn.configure(state=tk.DISABLED)
         self._append("user", f"YOU › {text}")
         self._ui_status("WORKING")
@@ -424,11 +428,25 @@ class JarvisGUI:
                     tag = "error"
                 elif result.get("success") is False:
                     tag = "error"
-                self._append(tag, f"JARVIS › {reply}")
+
+                def show_reply() -> None:
+                    # Drop stale workers — never show a prior request's final_result
+                    if seq != self._request_seq:
+                        return
+                    self._append(tag, f"JARVIS › {reply}")
+
+                self.win.after(0, show_reply)
             except Exception as exc:
-                self._append("error", f"JARVIS › Internal error: {exc}")
+                def show_err() -> None:
+                    if seq != self._request_seq:
+                        return
+                    self._append("error", f"JARVIS › Internal error: {exc}")
+
+                self.win.after(0, show_err)
             finally:
                 def done() -> None:
+                    if seq != self._request_seq:
+                        return
                     self.busy = False
                     self.send_btn.configure(state=tk.NORMAL)
                     self._refresh_stats()
@@ -2003,6 +2021,128 @@ def run(context: dict) -> dict:
         print("  OK learning semantic VERIFY + practical result checked")
     except Exception as exc:
         msg = f"E2E_LEARNING_SEMANTIC: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 4i) E2E: each USER REQUEST isolated — conversation ≠ prior learning final_result
+    print("  — e2e request routing isolation (conversation ≠ prior DONE) —")
+    try:
+        from jarvis.intent import IntentClassifier
+        from jarvis.memory import Memory
+
+        route_root = root / "data" / "_e2e_request_routing"
+        if route_root.exists():
+            shutil.rmtree(route_root)
+        route_root.mkdir(parents=True)
+
+        prior_done = (
+            "DONE. Learning complete — knowledge verified & saved.\n"
+            "Topic: sample_topic\n"
+            "Attempts: 1\n"
+            "Approach: initial_topic_research\n"
+            "Summary: prior learning final_result that must not leak\n"
+            "Sources: 0"
+        )
+
+        class HistoryLeakBrain(Brain):
+            """Simulates the bug: if prior DONE is in history, echo it as the reply."""
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, text: str) -> dict:
+                return IntentClassifier.classify_offline(text)
+
+            def converse(self, user_text: str, history=None) -> str:
+                for m in history or []:
+                    content = str((m or {}).get("content") or "")
+                    if Memory._looks_like_cycle_outcome(content):
+                        return content  # stale reuse of prior final_result
+                return f"Fresh conversational answer about: {user_text}"
+
+        orch_r = Orchestrator(
+            root=route_root,
+            brain=HistoryLeakBrain(),
+            on_log=lambda m: None,
+            on_status=lambda s: None,
+        )
+        # Plant a completed learning turn in conversation memory
+        orch_r.memory.add_message(
+            "user",
+            "Learn sample topic thoroughly",
+            meta={"request_id": "oldreq01", "intent": "learning", "phase": "received"},
+        )
+        orch_r.memory.add_message(
+            "assistant",
+            prior_done,
+            meta={"request_id": "oldreq01", "intent": "learning", "task_id": 99},
+        )
+        assert orch_r.memory.last_cycle_assistant_reply() == prior_done
+        # Filtered history must NOT include the learning DONE pair
+        hist = orch_r.memory.conversation_history_for_llm(8)
+        assert not any(
+            Memory._looks_like_cycle_outcome(m.get("content") or "") for m in hist
+        ), hist
+        assert not any("sample topic" in (m.get("content") or "").lower() for m in hist), hist
+
+        chat_q = "What is photosynthesis in simple terms?"
+        assert IntentClassifier.classify_offline(chat_q)["intent"] == "conversation"
+        result_c = orch_r.handle_user_message(chat_q)
+        assert result_c.get("type") == "conversation", result_c
+        assert result_c.get("request_id"), result_c
+        assert result_c.get("request_id") != "oldreq01"
+        reply_c = result_c.get("reply") or ""
+        assert reply_c.strip() != prior_done.strip(), reply_c
+        assert "DONE. Learning complete" not in reply_c, reply_c
+        assert "prior learning final_result" not in reply_c, reply_c
+        assert "photosynthesis" in reply_c.lower() or "Fresh conversational" in reply_c, reply_c
+        # Second request still isolated — sticky stale brain path
+        orch_r.close()
+
+        class StickyStaleBrain(Brain):
+            """Always returns prior DONE — _ensure_fresh_reply must reject it."""
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, text: str) -> dict:
+                return IntentClassifier.classify_offline(text)
+
+            def converse(self, user_text: str, history=None) -> str:
+                return prior_done
+
+        orch_s = Orchestrator(
+            root=route_root,
+            brain=StickyStaleBrain(),
+            on_log=lambda m: None,
+            on_status=lambda s: None,
+        )
+        orch_s.memory.add_message(
+            "assistant",
+            prior_done,
+            meta={"request_id": "oldreq02", "intent": "learning", "task_id": 100},
+        )
+        chat_q2 = "How are you today?"
+        result_s = orch_s.handle_user_message(chat_q2)
+        assert result_s.get("type") == "conversation", result_s
+        assert result_s.get("request_id")
+        reply_s = result_s.get("reply") or ""
+        assert reply_s.strip() != prior_done.strip(), reply_s
+        assert "DONE. Learning complete" not in reply_s, reply_s
+        assert chat_q2[:20] in reply_s or "jautājumu" in reply_s.lower() or "How are you" in reply_s
+        # Distinct request_ids across turns
+        assert result_c.get("request_id") != result_s.get("request_id")
+        orch_s.close()
+        print("  OK request routing isolation — conversation ≠ prior learning DONE")
+    except Exception as exc:
+        msg = f"E2E_REQUEST_ROUTING: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)
