@@ -535,6 +535,7 @@ class Memory:
             "key_apis": list(research.get("key_apis") or [])[:20],
             "pitfalls": list(research.get("pitfalls") or [])[:12],
             "test_idea": research.get("test_idea") or "",
+            "practical_result": research.get("practical_result"),
             "sources": list(research.get("sources") or [])[:12],
             "result_count": len(research.get("results") or []),
             "verified": bool(verified),

@@ -1929,6 +1929,84 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
+    # 4h) E2E: LEARNING VERIFY is semantic (no token hits) + practical result
+    print("  — e2e learning semantic VERIFY + practical result —")
+    try:
+        from jarvis import learning_verify as lv
+
+        # Unit: paraphrase covers goal without exact keyword equality
+        paraphrase_knowledge = {
+            "approach": (
+                "Study how devices exchange data: addressing, routing, and "
+                "protocols that move packets across links on a network."
+            ),
+            "key_apis": ["addressing models", "routing basics", "protocol layers"],
+            "pitfalls": ["confusing local and wide links"],
+            "test_idea": "Self-check: explain packet delivery in your own words.",
+            "raw": "Notes about communication between computers.",
+            "sources": [{"title": "local"}],
+            "results": [{"title": "x"}],
+        }
+        j_ok = lv.offline_semantic_judgment(
+            "Learn networking fundamentals", paraphrase_knowledge
+        )
+        assert j_ok["covers_goal"], j_ok
+        j_bad = lv.offline_semantic_judgment(
+            "Learn networking fundamentals",
+            {
+                **paraphrase_knowledge,
+                "approach": "Bake sourdough bread with long fermentation.",
+                "key_apis": ["flour hydration", "starter feeding"],
+                "raw": "bakery notes",
+            },
+        )
+        assert not j_bad["covers_goal"], j_bad
+
+        # Unit: practical ask produces + verifies a concrete result (any expression)
+        expr_req = "Learn arithmetic and compute 12+5"
+        assert lv.requests_practical_result(expr_req)
+        produced = lv.produce_practical_offline(expr_req, paraphrase_knowledge)
+        assert produced.get("result") == 17, produced
+        assert lv.verify_practical_offline(expr_req, produced)["ok"]
+
+        sem_root = root / "data" / "_e2e_learning_semantic"
+        if sem_root.exists():
+            shutil.rmtree(sem_root)
+        sem_root.mkdir(parents=True)
+
+        class OfflineBrainSem(Brain):
+            def model_status(self) -> str:
+                return "OFFLINE"
+
+            def is_available(self) -> bool:
+                return False
+
+        logs_sem: list[str] = []
+        orch_sem = Orchestrator(
+            root=sem_root,
+            brain=OfflineBrainSem(),
+            on_log=lambda m: logs_sem.append(m),
+        )
+        # Universal practical learning request — expression not hardcoded in product code
+        req_sem = "Learn arithmetic basics and compute 12+5"
+        result_sem = orch_sem.handle_user_message(req_sem)
+        assert result_sem.get("type") == "learning", result_sem
+        assert result_sem.get("success"), result_sem
+        ver = result_sem.get("verification") or {}
+        check_names = [c.get("name") for c in (ver.get("checks") or [])]
+        assert "semantic_goal_coverage" in check_names, check_names
+        assert "practical_result" in check_names, check_names
+        assert not any("token_hits" in str(c) for c in (ver.get("checks") or []))
+        assert (ver.get("practical_result") or {}).get("result") == 17, ver
+        assert "Practical result" in (result_sem.get("reply") or "")
+        orch_sem.close()
+        print("  OK learning semantic VERIFY + practical result checked")
+    except Exception as exc:
+        msg = f"E2E_LEARNING_SEMANTIC: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
     # 5) Orchestrator boots + conversation logs must not echo USER/JARVIS replies
     try:
         echoed: list[str] = []

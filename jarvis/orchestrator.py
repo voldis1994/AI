@@ -31,6 +31,7 @@ from jarvis.observer import Observer
 from jarvis.context_builder import ContextBuilder
 from jarvis.task_goal import TaskGoal
 from jarvis.intent import IntentClassifier
+from jarvis import learning_verify as learn_v
 
 logger = logging.getLogger("jarvis.orchestrator")
 
@@ -231,6 +232,7 @@ class Orchestrator:
                     "key_apis": list(latest.get("key_apis") or []),
                     "pitfalls": list(latest.get("pitfalls") or []),
                     "test_idea": latest.get("test_idea") or "",
+                    "practical_result": latest.get("practical_result"),
                     "sources": list(latest.get("sources") or []),
                     "results": [],
                     "raw": str(latest.get("summary") or ""),
@@ -272,6 +274,7 @@ class Orchestrator:
                 fresh = self._enrich_learning_research(
                     fresh,
                     goal=goal,
+                    user_request=task_goal.user_request,
                     missing=(diagnosis or {}).get("missing_knowledge") if diagnosis else None,
                     approach_label=current_approach,
                 )
@@ -280,6 +283,10 @@ class Orchestrator:
                 )
                 research["approach_label"] = current_approach
                 research["attempt"] = attempt
+                # If USER REQUEST asks for a concrete answer/result, produce it
+                research["practical_result"] = self._produce_learning_practical(
+                    task_goal.user_request, research
+                )
 
                 # SAVE draft knowledge after every research pass
                 saved = self.memory.save_topic_knowledge(
@@ -343,6 +350,15 @@ class Orchestrator:
                         ),
                         verified=True,
                     )
+                    practical = research.get("practical_result") or {}
+                    practical_line = ""
+                    if isinstance(practical, dict) and (
+                        practical.get("answer") or practical.get("result") is not None
+                    ):
+                        practical_line = (
+                            f"\nPractical result: "
+                            f"{practical.get('result', practical.get('answer'))!r}"
+                        )
                     outcome = (
                         f"DONE. Learning complete — knowledge verified & saved.\n"
                         f"Topic: {topic}\n"
@@ -350,6 +366,7 @@ class Orchestrator:
                         f"Approach: {current_approach}\n"
                         f"Summary: {(saved.get('entry') or {}).get('summary', '')[:400]}\n"
                         f"Sources: {len((research.get('sources') or []))}"
+                        f"{practical_line}"
                     )
                     self._status("SAVE_EXPERIENCE")
                     self.memory.save_experience(
@@ -599,19 +616,24 @@ class Orchestrator:
         research: dict[str, Any],
         *,
         goal: str,
+        user_request: Optional[str] = None,
         missing: Optional[list] = None,
         approach_label: str = "",
     ) -> dict[str, Any]:
-        """Ensure learning research has structured notes (universal, no topic hardcode)."""
+        """Build structured learning notes that answer the USER REQUEST (no keyword stuffing)."""
         out = dict(research or {})
         missing = [str(m) for m in (missing or []) if m]
+        request = (user_request or goal or "").strip()
 
         if self.brain.is_available():
             try:
                 notes = self.brain.research_notes(
-                    f"LEARNING (not a skill): {goal}\n"
-                    f"Missing knowledge to fill: {missing or ['core concepts', 'practice checks']}\n"
-                    f"Approach label: {approach_label}",
+                    f"LEARNING (not a skill): {request}\n"
+                    f"Missing aspects to fill: "
+                    f"{missing or ['core concepts', 'worked examples', 'practice checks']}\n"
+                    f"Approach label: {approach_label}\n"
+                    "Produce conceptual notes that answer the user goal; "
+                    "do not optimize for keyword overlap.",
                     str(out.get("raw") or "")[:8000],
                 )
                 if isinstance(notes, dict):
@@ -629,7 +651,6 @@ class Orchestrator:
             except Exception as exc:
                 self._log(f"LEARNING enrich brain notes failed ({exc}); offline")
 
-        # Offline structured extraction when still thin
         key_apis = list(out.get("key_apis") or [])
         pitfalls = list(out.get("pitfalls") or [])
         test_idea = str(out.get("test_idea") or "")
@@ -637,43 +658,76 @@ class Orchestrator:
         raw = str(out.get("raw") or "")
 
         if not key_apis:
-            # Pull significant tokens / Hint lines from gathered research
+            # Prefer research Hint lines — never stuff raw request tokens as "APIs"
             for line in raw.splitlines():
                 s = line.strip().lstrip("-").strip()
                 if s.lower().startswith("hint:"):
                     tip = s.split(":", 1)[-1].strip()
                     if tip and tip not in key_apis:
                         key_apis.append(tip)
-            for tok in IntentClassifier._keywords(goal):
-                if len(tok) >= 4 and tok not in key_apis:
-                    key_apis.append(tok)
-                if len(key_apis) >= 8:
-                    break
+            if not key_apis and approach:
+                # Split approach into short conceptual bullets
+                for part in re.split(r"[.;\n]", approach):
+                    part = part.strip()
+                    if 12 <= len(part) <= 120 and part not in key_apis:
+                        key_apis.append(part)
+                    if len(key_apis) >= 6:
+                        break
             out["key_apis"] = key_apis[:12]
 
         if not pitfalls and missing:
             out["pitfalls"] = [
-                f"Previously missing: {m}" for m in missing[:6]
+                f"Previously missing aspect: {m}" for m in missing[:6]
             ]
 
         if not test_idea or _SKILL_TEST_IDEA_RE.search(test_idea):
-            # Universal practice check derived from the request — not skill-run
-            concepts = IntentClassifier._keywords(goal)[:5]
             out["test_idea"] = (
-                "Self-check: explain "
-                + (", ".join(concepts) if concepts else "the topic")
-                + " and answer 3 practice questions covering the USER REQUEST."
+                "Self-check: explain the topic in your own words, "
+                "give one worked example, and answer practice questions "
+                "that match the USER REQUEST goal."
             )
 
         if not approach or len(approach) < 40:
-            apis = ", ".join(str(x) for x in (out.get("key_apis") or [])[:6])
+            focus = "; ".join(str(x) for x in (out.get("key_apis") or [])[:4])
             out["approach"] = (
-                f"{approach_label or 'learning'}: study concepts for: {goal}. "
-                f"Focus points: {apis}. "
+                f"{approach_label or 'learning'}: build understanding for the "
+                f"user goal — {request}. "
+                f"Focus: {focus or 'core concepts and worked examples'}. "
                 f"Verify with: {out.get('test_idea')}"
             )[:1200]
 
         return out
+
+    def _produce_learning_practical(
+        self, user_request: str, research: dict[str, Any]
+    ) -> Optional[dict[str, Any]]:
+        """Produce a concrete answer/result when the USER REQUEST asks for one."""
+        if not learn_v.requests_practical_result(user_request):
+            # Still useful to keep a short derived answer for semantic verify
+            # only when knowledge already has substance — optional.
+            return research.get("practical_result")
+
+        knowledge = {
+            "approach": research.get("approach"),
+            "key_apis": list(research.get("key_apis") or [])[:12],
+            "pitfalls": list(research.get("pitfalls") or [])[:8],
+            "test_idea": research.get("test_idea"),
+            "summary": str(research.get("approach") or "")[:2000],
+        }
+        if self.brain.is_available():
+            try:
+                produced = self.brain.produce_learning_answer(user_request, knowledge)
+                if isinstance(produced, dict) and (
+                    produced.get("answer") or produced.get("result") is not None
+                ):
+                    # Prefer offline arithmetic when expression present (deterministic)
+                    offline = learn_v.produce_practical_offline(user_request, research)
+                    if offline.get("source") == "offline_expression":
+                        return offline
+                    return produced
+            except Exception as exc:
+                self._log(f"LEARNING practical brain produce failed ({exc}); offline")
+        return learn_v.produce_practical_offline(user_request, research)
 
     def _diagnose_learning_gap(
         self,
@@ -771,10 +825,10 @@ class Orchestrator:
             q = " ".join(str(q).split())
             if q and q not in out_q:
                 out_q.append(q)
-        approach = f"fill_missing_{'+'.join(missing[:3]) or 'coverage'}_v{attempt + 1}"
+        approach = f"fill_missing_{'+'.join(str(m)[:24] for m in missing[:3]) or 'coverage'}_v{attempt + 1}"
         return {
             "root_cause": root,
-            "missing_knowledge": missing or ["structured_notes", "topic_alignment"],
+            "missing_knowledge": missing or ["goal_coverage", "knowledge_substance"],
             "approach": approach,
             "approach_changed": True,
             "research_queries": out_q[:6],
@@ -787,31 +841,35 @@ class Orchestrator:
         research: dict[str, Any],
         entry: dict[str, Any],
     ) -> dict[str, Any]:
-        """Independent checks that researched knowledge matches the USER REQUEST."""
+        """
+        Semantically verify learning: USER REQUEST → knowledge → goal answered.
+
+        Does NOT require exact keyword/token matches. If the request also asks
+        for a concrete/practical result, that result must be present and correct.
+        """
         checks: list[dict[str, Any]] = []
         missing: list[str] = []
         request = task_goal.user_request
-        raw = str(research.get("raw") or "")
         approach = str(research.get("approach") or entry.get("summary") or "")
-        key_apis = list(research.get("key_apis") or [])
-        pitfalls = list(research.get("pitfalls") or [])
-        test_idea = str(research.get("test_idea") or entry.get("test_idea") or "")
-        sources = list(research.get("sources") or [])
-        results = list(research.get("results") or [])
+        practical = research.get("practical_result") or entry.get("practical_result")
+        blob = learn_v.knowledge_blob(research, entry)
 
-        has_body = bool(raw.strip()) or bool(approach.strip()) or bool(key_apis)
+        # Baseline: real knowledge present (not skill-repair template)
+        substance = learn_v.has_substance(research, entry)
         checks.append({
-            "name": "knowledge_body",
-            "ok": has_body,
+            "name": "knowledge_substance",
+            "ok": substance,
             "detail": (
-                f"raw_len={len(raw)} approach_len={len(approach)} "
-                f"key_apis={len(key_apis)}"
+                f"substance={substance} approach_len={len(approach)} "
+                f"blob_len={len(blob)}"
             ),
         })
-        if not has_body:
-            missing.append("knowledge_body")
+        if not substance:
+            missing.append("knowledge_substance")
 
-        has_sources = bool(sources) or bool(results)
+        sources = list(research.get("sources") or entry.get("sources") or [])
+        results = list(research.get("results") or [])
+        has_sources = bool(sources) or bool(results) or bool(blob)
         checks.append({
             "name": "knowledge_sources",
             "ok": has_sources,
@@ -820,59 +878,7 @@ class Orchestrator:
         if not has_sources:
             missing.append("knowledge_sources")
 
-        # Structured learning notes — raw dump / skill defaults are not enough
-        learning_test = bool(test_idea) and not _SKILL_TEST_IDEA_RE.search(test_idea)
-        has_structure = bool(key_apis) or bool(pitfalls) or learning_test
-        # Approach must exist and not be only a skill-template sentence
-        approach_ok = bool(approach.strip()) and not any(
-            tok in approach.lower()
-            for tok in (
-                "skill must define skill_meta",
-                "return concrete result.path",
-            )
-        )
-        structured_ok = has_structure and approach_ok
-        checks.append({
-            "name": "structured_notes",
-            "ok": structured_ok,
-            "detail": (
-                f"key_apis={len(key_apis)} pitfalls={len(pitfalls)} "
-                f"learning_test={learning_test} approach_ok={approach_ok}"
-            ),
-        })
-        if not structured_ok:
-            missing.append("structured_notes")
-
-        # Topic tokens must appear in STRUCTURED notes (not only raw scrape)
-        tokens = [
-            t for t in IntentClassifier._keywords(request)
-            if len(t) >= 4
-        ][:8]
-        structured_blob = (
-            approach + "\n"
-            + " ".join(str(x) for x in key_apis) + "\n"
-            + " ".join(str(x) for x in pitfalls) + "\n"
-            + test_idea
-        ).lower()
-        hit = sum(1 for t in tokens if t.lower() in structured_blob)
-        need = 1 if len(tokens) <= 2 else max(1, len(tokens) // 2)
-        topic_ok = hit >= need if tokens else structured_ok
-        checks.append({
-            "name": "topic_alignment",
-            "ok": topic_ok,
-            "detail": f"structured_token_hits={hit}/{len(tokens)} need>={need}",
-        })
-        if not topic_ok:
-            missing.append("topic_alignment")
-            for t in tokens:
-                if t.lower() not in structured_blob and t.lower() not in missing:
-                    missing.append(f"concept:{t}")
-
-        repair_jargon = (
-            "rewrite_skill", "skill body not implemented", "fault_layer",
-            "protect_active", "pending_path",
-        )
-        contaminated = any(tok in approach.lower() for tok in repair_jargon)
+        contaminated = bool(learn_v._SKILL_JARGON_RE.search(approach))
         checks.append({
             "name": "no_skill_inherit",
             "ok": not contaminated,
@@ -885,33 +891,78 @@ class Orchestrator:
         if contaminated:
             missing.append("no_skill_inherit")
 
-        summary = approach or (raw[:500] if raw else "")
-        if self.brain.is_available() and has_body and structured_ok:
+        # Semantic goal coverage (brain when available; fuzzy offline otherwise)
+        judgment: dict[str, Any]
+        if self.brain.is_available() and substance:
             try:
-                judgment = self.brain.verify_claim(
-                    request,
-                    {"result": {"topic_knowledge": True, "key_apis": key_apis}},
-                    summary or raw[:2000],
-                )
-                checks.append({
-                    "name": "brain_advisory",
-                    "ok": bool(judgment.get("achieved")),
-                    "detail": str(judgment.get("reason") or "")[:300],
-                })
+                knowledge_pkg = {
+                    "approach": approach,
+                    "key_apis": list(research.get("key_apis") or [])[:12],
+                    "pitfalls": list(research.get("pitfalls") or [])[:8],
+                    "test_idea": research.get("test_idea"),
+                    "practical_result": practical,
+                    "summary": blob[:3000],
+                }
+                judgment = self.brain.judge_learning_coverage(request, knowledge_pkg)
             except Exception as exc:
-                checks.append({
-                    "name": "brain_advisory",
-                    "ok": True,
-                    "detail": f"skipped ({exc})",
-                })
+                self._log(f"LEARNING semantic judge failed ({exc}); offline")
+                judgment = learn_v.offline_semantic_judgment(request, research, entry)
+        else:
+            judgment = learn_v.offline_semantic_judgment(request, research, entry)
 
-        substantive = [c for c in checks if c["name"] != "brain_advisory"]
-        verified = all(c["ok"] for c in substantive) and bool(substantive)
+        covers = bool(judgment.get("covers_goal"))
+        checks.append({
+            "name": "semantic_goal_coverage",
+            "ok": covers,
+            "detail": str(judgment.get("reason") or "")[:300],
+        })
+        if not covers:
+            missing.append("goal_coverage")
+            for aspect in judgment.get("missing_aspects") or []:
+                if aspect and aspect not in missing:
+                    missing.append(str(aspect))
+
+        # Practical result when the request asks for a concrete answer
+        needs_practical = bool(
+            judgment.get("requires_practical_result")
+            if judgment.get("requires_practical_result") is not None
+            else learn_v.requests_practical_result(request)
+        )
+        if needs_practical:
+            # Prefer model practical_ok when present; always cross-check offline
+            offline_p = learn_v.verify_practical_offline(request, practical)
+            model_p = judgment.get("practical_ok")
+            if model_p is None:
+                practical_ok = offline_p["ok"]
+                detail = offline_p["detail"]
+            else:
+                practical_ok = bool(model_p) and offline_p["ok"]
+                detail = (
+                    f"model_practical_ok={model_p}; offline={offline_p['detail']}; "
+                    f"{judgment.get('practical_feedback') or ''}"
+                )[:300]
+            checks.append({
+                "name": "practical_result",
+                "ok": practical_ok,
+                "detail": detail,
+            })
+            if not practical_ok:
+                for m in offline_p.get("missing") or ["practical_result"]:
+                    if m not in missing:
+                        missing.append(m)
+        else:
+            checks.append({
+                "name": "practical_result",
+                "ok": True,
+                "detail": "not required by USER REQUEST",
+            })
+
+        verified = all(c["ok"] for c in checks) and bool(checks)
         reason = (
-            "LEARNING VERIFY PASS — topic knowledge covers USER REQUEST"
+            "LEARNING VERIFY PASS — knowledge semantically covers USER REQUEST"
             if verified
             else "LEARNING VERIFY FAIL — " + "; ".join(
-                f"{c['name']}:{c.get('detail')}" for c in substantive if not c["ok"]
+                f"{c['name']}:{c.get('detail')}" for c in checks if not c["ok"]
             )
         )
         return {
@@ -919,7 +970,9 @@ class Orchestrator:
             "reason": reason,
             "checks": checks,
             "missing_knowledge": missing,
-            "summary": summary[:2000],
+            "summary": (approach or blob)[:2000],
+            "judgment": judgment,
+            "practical_result": practical,
         }
 
     def run_cycle(self, goal: str, original_request: Optional[str] = None) -> dict[str, Any]:
