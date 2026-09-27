@@ -291,14 +291,16 @@ class JarvisGUI:
             "MODEL MISSING": f"MODEL MISSING — ollama pull {DEFAULT_MODEL}",
             "OFFLINE": "OFFLINE (start ollama serve)",
         }.get(status, status)
-        self._append(
-            "system",
-            "═" * 56 + "\n"
-            "  JARVIS online. Core stable. Skills learn themselves.\n"
-            f"  Brain: Ollama / {DEFAULT_MODEL} — {hint}\n"
-            "  Type a message, a task, or /help\n"
-            "═" * 56,
+        # Explicit + required: adjacent literals + trailing "═" * 56 would parse as
+        # (...banner body including "═") * 56 and spam the log dozens of times.
+        banner = (
+            ("═" * 56)
+            + "\n  JARVIS online. Core stable. Skills learn themselves.\n"
+            + f"  Brain: Ollama / {DEFAULT_MODEL} — {hint}\n"
+            + "  Type a message, a task, or /help\n"
+            + ("═" * 56)
         )
+        self._append("system", banner)
         self._ui_status("IDLE")
         self.brain_var.set(f"BRAIN: {status} · {DEFAULT_MODEL}")
 
