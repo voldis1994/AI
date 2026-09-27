@@ -664,6 +664,101 @@ class Memory:
             return [prior] if prior else []
         return list(prior)[-limit:]
 
+    def list_topic_knowledge_keys(self) -> list[str]:
+        """All knowledge:topic:* fact keys."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key FROM facts WHERE key LIKE 'knowledge:topic:%'"
+            ).fetchall()
+        return [str(r["key"]) for r in rows]
+
+    def retrieve_relevant_knowledge(
+        self,
+        query: str,
+        *,
+        topic: str = "",
+        limit: int = 6,
+        verified_only: bool = False,
+    ) -> dict[str, Any]:
+        """
+        MEMORY RETRIEVAL — find prior topic knowledge relevant to this request.
+
+        Scores exact topic slug first, then related topics via soft_relatedness.
+        Returns entries newest-first within score tiers.
+        """
+        from jarvis import learning_verify as lv
+        from jarvis.intent import IntentClassifier
+
+        q = (query or "").strip()
+        topic_slug = IntentClassifier.topic_slug(topic or q or "topic")
+        hits: list[tuple[float, dict[str, Any]]] = []
+
+        # 1) Exact topic history
+        for e in self.get_topic_knowledge(topic_slug, limit=12):
+            if not isinstance(e, dict):
+                continue
+            if verified_only and not e.get("verified"):
+                continue
+            blob = " ".join(
+                [
+                    str(e.get("summary") or ""),
+                    str(e.get("goal") or ""),
+                    " ".join(str(x) for x in (e.get("concepts") or [])[:8]),
+                ]
+            )
+            rel = lv.soft_relatedness(q, blob) if q else 0.5
+            hits.append((1.0 + rel, dict(e)))
+
+        # 2) Other topic stores (related subjects)
+        for key in self.list_topic_knowledge_keys():
+            if key == f"knowledge:topic:{topic_slug}":
+                continue
+            prior = self.get_fact(key) or []
+            if not isinstance(prior, list):
+                prior = [prior] if prior else []
+            for e in prior[-6:]:
+                if not isinstance(e, dict):
+                    continue
+                if verified_only and not e.get("verified"):
+                    continue
+                blob = " ".join(
+                    [
+                        str(e.get("topic") or ""),
+                        str(e.get("summary") or ""),
+                        str(e.get("goal") or ""),
+                        " ".join(str(x) for x in (e.get("concepts") or [])[:8]),
+                    ]
+                )
+                rel = lv.soft_relatedness(q, blob) if q else 0.0
+                if rel < 0.18:
+                    continue
+                hits.append((rel, dict(e)))
+
+        hits.sort(key=lambda x: -x[0])
+        # Dedupe by (topic, summary prefix)
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for score, e in hits:
+            sig = f"{e.get('topic')}|{str(e.get('summary') or '')[:80]}"
+            if sig in seen:
+                continue
+            seen.add(sig)
+            e = dict(e)
+            e["_retrieval_score"] = round(float(score), 4)
+            out.append(e)
+            if len(out) >= limit:
+                break
+
+        verified = [e for e in out if e.get("verified")]
+        return {
+            "query": q,
+            "topic": topic_slug,
+            "entries": out,
+            "verified": verified,
+            "count": len(out),
+            "verified_count": len(verified),
+        }
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

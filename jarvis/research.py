@@ -115,63 +115,131 @@ class ResearchSystem:
             })
 
         query_list = list(queries[:limit])
-        for q in query_list:
-            self.on_log(f"RESEARCH: query → {q}")
+        goal_text = goal or (queries[0] if queries else "")
+        search_hits: list[dict[str, Any]] = []
+        extracts: list[dict[str, Any]] = []
+        comparison: dict[str, Any] = {}
+        opened = False
 
         if network and query_list:
-            def _fetch_one(q: str) -> tuple[str, list[str], list[dict[str, Any]]]:
-                parts: list[str] = []
+            # ── SEARCH (candidates only — snippets ≠ knowledge) ─────────
+            self.on_log(f"SEARCH: starting ({len(query_list)} queries) mode={mode_key}")
+            for q in query_list:
+                self.on_log(f"SEARCH: query → {q}")
+
+            def _search_one(q: str) -> list[dict[str, Any]]:
                 local_results: list[dict[str, Any]] = []
-                html_notes, ddg_results = self._duckduckgo_search(
+                _html_notes, ddg_results = self._duckduckgo_search(
                     q, append_python=do_python
                 )
-                if html_notes:
-                    parts.append(f"### Search: {q}\n{html_notes}")
                 local_results.extend(ddg_results)
-                # Learning: skip PyPI package noise (not conceptual evidence)
                 if mode_key == "skill":
-                    pypi_notes, pypi_results = self._pypi_lookup(q)
-                    if pypi_notes:
-                        parts.append(f"### PyPI hint: {q}\n{pypi_notes}")
+                    _pypi_notes, pypi_results = self._pypi_lookup(q)
                     local_results.extend(pypi_results)
-                return q, parts, local_results
+                return local_results
 
             if len(query_list) <= 1:
                 for q in query_list:
-                    _, parts, local_results = _fetch_one(q)
-                    gathered_parts.extend(parts)
-                    results.extend(local_results)
+                    search_hits.extend(_search_one(q))
             else:
-                by_query: dict[str, tuple[list[str], list[dict[str, Any]]]] = {}
                 with ThreadPoolExecutor(max_workers=min(4, len(query_list))) as pool:
-                    futs = {pool.submit(_fetch_one, q): q for q in query_list}
+                    futs = {pool.submit(_search_one, q): q for q in query_list}
+                    by_q: dict[str, list[dict[str, Any]]] = {}
                     for fut in as_completed(futs):
-                        q, parts, local_results = fut.result()
-                        by_query[q] = (parts, local_results)
+                        q = futs[fut]
+                        by_q[q] = fut.result()
                 for q in query_list:
-                    parts, local_results = by_query.get(q, ([], []))
-                    gathered_parts.extend(parts)
-                    results.extend(local_results)
+                    search_hits.extend(by_q.get(q, []))
+
+            # Log SOURCE FOUND for real URL hits (not local placeholders)
+            url_hits = [
+                h for h in search_hits
+                if isinstance(h, dict) and str(h.get("url") or "").startswith("http")
+            ]
+            self.on_log(f"SOURCE FOUND: {len(url_hits)} candidate URLs from SEARCH")
+            for h in url_hits[:8]:
+                self.on_log(
+                    f"SOURCE FOUND: {(h.get('title') or '')[:80]} | "
+                    f"{(h.get('url') or '')[:120]}"
+                )
+
+            results.extend(search_hits)
+
+            # ── OPEN → EXTRACT → COMPARE (full content, not snippets) ───
+            from jarvis.source_pipeline import (
+                knowledge_from_extracts,
+                open_and_extract,
+            )
+
+            extracts, comparison = open_and_extract(
+                url_hits,
+                goal=goal_text,
+                on_log=self.on_log,
+                timeout=min(self.timeout + 2.0, 14.0),
+                max_open=4 if mode_key == "learning" else 3,
+            )
+            opened = True
+            knowledge_blob = knowledge_from_extracts(
+                extracts, comparison, goal=goal_text
+            )
+            if knowledge_blob:
+                gathered_parts.append(knowledge_blob)
+            else:
+                # Network failed / thin pages — do NOT promote snippets to knowledge
+                self.on_log(
+                    "SOURCE EXTRACT: no substantial full-page content; "
+                    "refusing to treat SEARCH snippets as knowledge"
+                )
+                if mode_key == "skill":
+                    # Skill path may still use search titles as weak API hints only
+                    weak = "\n".join(
+                        f"- {h.get('title')}: {(h.get('snippet') or '')[:160]}"
+                        for h in url_hits[:5]
+                        if h.get("title")
+                    )
+                    if weak:
+                        gathered_parts.append(
+                            "### Search titles (not verified page content)\n" + weak
+                        )
         elif not network:
-            # Gap-fill / local: keep query text as synthesis seed (no skill jargon)
+            # Gap-fill / local: query text as synthesis seed (no fake web knowledge)
+            self.on_log("SEARCH: skipped (local gap-fill / memory-assisted)")
             gathered_parts.append(
                 "### Gap-fill focus\n" + "\n".join(f"- {q}" for q in query_list)
             )
 
         gathered = "\n\n".join(gathered_parts)
 
-        sources = [
-            {
-                "url": r.get("url", ""),
-                "title": r.get("title", ""),
-                "source": r.get("source") or r.get("provider", ""),
-                "provider": r.get("provider", ""),
-                "timestamp": r.get("timestamp"),
-                "query": r.get("query", ""),
-            }
-            for r in results
-            if r.get("url") or r.get("source") == "local"
-        ]
+        # Sources for persistence: prefer OPENED extracts over bare search hits
+        sources: list[dict[str, Any]] = []
+        for e in extracts:
+            if not e.get("ok"):
+                continue
+            sources.append({
+                "url": e.get("url") or "",
+                "title": e.get("title") or "",
+                "source": "extracted",
+                "provider": e.get("provider") or "web",
+                "timestamp": time.time(),
+                "query": e.get("query") or "",
+                "char_count": e.get("char_count") or 0,
+                "relatedness": e.get("relatedness") or 0,
+                "extracted": True,
+            })
+        if not sources:
+            sources = [
+                {
+                    "url": r.get("url", ""),
+                    "title": r.get("title", ""),
+                    "source": r.get("source") or r.get("provider", ""),
+                    "provider": r.get("provider", ""),
+                    "timestamp": r.get("timestamp"),
+                    "query": r.get("query", ""),
+                    "extracted": False,
+                }
+                for r in results
+                if r.get("url") or r.get("source") == "local"
+            ]
 
         default_test = (
             "Self-check: restate concepts, give one example, answer a practice question."
@@ -184,28 +252,48 @@ class ResearchSystem:
             "key_apis": [],
             "pitfalls": [],
             "test_idea": default_test,
-            "raw": gathered[:12000],
+            "raw": gathered[:14000],
             "sources": sources[:30],
             "results": results[:30],
+            "extracts": [
+                {
+                    "url": e.get("url"),
+                    "title": e.get("title"),
+                    "ok": e.get("ok"),
+                    "char_count": e.get("char_count"),
+                    "relatedness": e.get("relatedness"),
+                    "text_preview": (e.get("text") or "")[:400],
+                }
+                for e in extracts[:8]
+            ],
+            "comparison": comparison,
             "mode": mode_key,
             "network": bool(network),
             "brain_used": False,
+            "opened_sources": opened,
+            "knowledge_from_extracts": bool(
+                opened and any(e.get("ok") for e in extracts)
+            ),
         }
 
         if brain_ok:
             try:
-                research_blob = gathered + "\n\nSTRUCTURED RESULTS:\n" + json.dumps(
+                # Feed EXTRACTED knowledge into skill synthesizer — not snippets
+                research_blob = gathered + "\n\nSTRUCTURED SOURCES:\n" + json.dumps(
                     sources[:15], ensure_ascii=False, default=str
                 )
                 synthesized = self.brain.research_notes(
-                    goal or (queries[0] if queries else ""),
+                    goal_text,
                     research_blob,
                 )
                 notes.update(
                     {
                         k: v
                         for k, v in synthesized.items()
-                        if k not in ("raw", "results", "sources", "mode", "network")
+                        if k not in (
+                            "raw", "results", "sources", "mode", "network",
+                            "extracts", "comparison",
+                        )
                     }
                 )
                 notes["brain_used"] = True
@@ -215,18 +303,25 @@ class ResearchSystem:
 
         if not notes.get("approach"):
             if mode_key == "learning":
-                notes["approach"] = (
-                    gathered[:800]
-                    or f"Study and explain: {goal or (queries[0] if queries else '')}"
-                )
+                # Prefer consensus lines from COMPARE
+                consensus = list((comparison or {}).get("consensus") or [])
+                if consensus:
+                    notes["approach"] = " ".join(str(c) for c in consensus[:4])[:800]
+                else:
+                    notes["approach"] = (
+                        gathered[:800]
+                        or f"Study and explain: {goal_text}"
+                    )
             else:
                 notes["approach"] = (
                     gathered[:800] or f"Implement Python solution for: {goal}"
                 )
 
         self.on_log(
-            f"RESEARCH: done — {len(notes.get('libraries') or [])} libs, "
-            f"{len(results)} results mode={mode_key} brain={notes['brain_used']}"
+            f"RESEARCH: done — extracts_ok="
+            f"{sum(1 for e in extracts if e.get('ok'))}/"
+            f"{len(extracts)} sources={len(sources)} "
+            f"mode={mode_key} brain={notes['brain_used']}"
         )
         return notes
 

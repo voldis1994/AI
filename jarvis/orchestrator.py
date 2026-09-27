@@ -426,9 +426,27 @@ class Orchestrator:
         )
 
         try:
-            prior_history = self.memory.get_topic_knowledge(topic, limit=8)
+            # ── MEMORY RETRIEVAL (before any SEARCH) ────────────────────
+            self._status("MEMORY")
+            retrieved = self.memory.retrieve_relevant_knowledge(
+                task_goal.user_request,
+                topic=topic,
+                limit=8,
+                verified_only=False,
+            )
+            self._log(
+                f"MEMORY RETRIEVAL: topic={topic} "
+                f"entries={retrieved.get('count', 0)} "
+                f"verified={retrieved.get('verified_count', 0)} "
+                f"request_id={request_id}"
+            )
+            prior_history = list(retrieved.get("entries") or [])
+            # Prefer exact-topic history order for gap diagnostics
+            exact_hist = self.memory.get_topic_knowledge(topic, limit=8)
+            if exact_hist:
+                prior_history = exact_hist
             verified_prior = [
-                e for e in prior_history
+                e for e in (retrieved.get("verified") or prior_history)
                 if isinstance(e, dict) and e.get("verified")
             ]
             failed_approaches = self.memory.get_failed_approaches(learn_key)
@@ -449,8 +467,8 @@ class Orchestrator:
                 )
                 research = self._research_from_artifact(artifact)
                 self._log(
-                    f"[{task_id}] Reusing verified KnowledgeArtifact for "
-                    f"topic:{topic} (skip full re-research)"
+                    f"MEMORY USED: verified knowledge for topic:{topic} "
+                    f"(skip full research) request_id={request_id}"
                 )
                 verification = self._verify_learning_knowledge(
                     task_goal, research, verified_prior[-1]
@@ -467,17 +485,42 @@ class Orchestrator:
                         attempt=1,
                         approach="reuse_verified_artifact",
                         queries=[],
+                        memory_used=True,
                     )
+                # Verified blob exists but gaps vs THIS request → search only missing
+                missing_from_mem = list(
+                    verification.get("missing_knowledge")
+                    or artifact.missing_fields(task_goal.user_request)
+                )
+                self._log(
+                    f"MEMORY USED: partial — verified base kept; "
+                    f"gap-only SEARCH for {missing_from_mem!r}"
+                )
+                gap_fill_seed = True
+            else:
+                gap_fill_seed = False
+                missing_from_mem = []
 
             queries = self._initial_learning_queries(goal)
+            if gap_fill_seed and missing_from_mem:
+                queries = gap_fill_queries(
+                    task_goal.user_request, missing_from_mem
+                )[:6]
             current_approach = "knowledge_artifact_synthesis"
             verification: dict[str, Any] = {}
             saved: dict[str, Any] = {}
             diagnosis: Optional[dict] = None
-            gap_fill_only = False
+            gap_fill_only = bool(gap_fill_seed)
             network_research_used = 0
             prior_gap_sig = ""
             stagnant_gap_rounds = 0
+            if gap_fill_seed:
+                diagnosis = {
+                    "missing_knowledge": list(missing_from_mem),
+                    "research_queries": list(queries),
+                    "gap_fill_only": True,
+                    "approach": "memory_gap_fill",
+                }
 
             for attempt in range(1, MAX_LEARNING_ATTEMPTS + 1):
                 ap_fp = Observer.fingerprint_approach(current_approach)
@@ -495,11 +538,9 @@ class Orchestrator:
                     (diagnosis or {}).get("missing_knowledge") or []
                 )
 
-                # RESEARCH — networked once; later attempts = local gap-fill only
-                use_network = (
-                    (not gap_fill_only)
-                    and network_research_used < MAX_LEARNING_NETWORK_RESEARCH
-                )
+                # RESEARCH — at most one networked SEARCH→OPEN→EXTRACT;
+                # further attempts are local gap-fill only
+                use_network = network_research_used < MAX_LEARNING_NETWORK_RESEARCH
                 self._status("RESEARCH")
                 self._log(
                     f"[{task_id}] LEARNING RESEARCH attempt={attempt}/"
@@ -521,7 +562,8 @@ class Orchestrator:
                     network_research_used += 1
                 fresh = self._learning_strip_skill_defaults(fresh)
 
-                # Deterministic KnowledgeArtifact synthesis (minimizes 30B calls)
+                # Deterministic KnowledgeArtifact synthesis from EXTRACTED pages
+                # (SEARCH snippets alone must not become knowledge)
                 artifact = self._synthesize_learning_artifact(
                     user_request=task_goal.user_request,
                     topic=topic,
@@ -530,6 +572,19 @@ class Orchestrator:
                     prior=artifact if (gap_fill_only or attempt > 1) else None,
                     missing=missing_gaps,
                 )
+                # Persist opened-source evidence (full-page extracts, not snippets)
+                if fresh.get("knowledge_from_extracts"):
+                    evidence = [
+                        s for s in (fresh.get("sources") or [])
+                        if isinstance(s, dict) and s.get("extracted")
+                    ]
+                    if evidence:
+                        artifact.source_evidence = evidence[:15]
+                    self._log(
+                        f"[{task_id}] SYNTHESIZE: from "
+                        f"{sum(1 for e in (fresh.get('extracts') or []) if e.get('ok'))} "
+                        f"opened sources (snippets excluded)"
+                    )
                 # Practical result on the clean artifact (offline first)
                 artifact.practical_result = self._produce_learning_practical(
                     task_goal.user_request, artifact.research_compat()
@@ -843,9 +898,13 @@ class Orchestrator:
         attempt: int,
         approach: str,
         queries: list,
+        memory_used: bool = False,
     ) -> dict[str, Any]:
         artifact.verified = True
         research = self._research_from_artifact(artifact)
+        # Attach extract evidence into source_evidence when present
+        if not artifact.source_evidence and research.get("sources"):
+            artifact.source_evidence = list(research.get("sources") or [])[:15]
         saved = self.memory.save_topic_knowledge(
             topic,
             research,
@@ -854,6 +913,17 @@ class Orchestrator:
             summary=artifact.summary,
             verified=True,
         )
+        self._log(
+            f"KNOWLEDGE SAVED: topic={topic} verified=True "
+            f"concepts={len(artifact.concepts)} "
+            f"sources={len(artifact.source_evidence)} "
+            f"request_id={request_id}"
+        )
+        if memory_used:
+            self._log(
+                f"MEMORY USED: served from prior verified knowledge "
+                f"topic={topic} request_id={request_id}"
+            )
         practical = artifact.practical_result or {}
         practical_line = ""
         if isinstance(practical, dict) and (
