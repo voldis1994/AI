@@ -163,13 +163,17 @@ class Brain:
     # ── Structured helpers ──────────────────────────────────────────────
 
     def converse(self, user_text: str, history: Optional[list[dict[str, str]]] = None) -> str:
-        """Casual conversation path: USER → Ollama → real reply."""
+        """Casual conversation path: answer THIS user message only."""
         system = (
             "Tu esi JARVIS — autonomais AI asistents. Atbildi skaidri un noderīgi. "
             "Runā latviešu valodā, ja lietotājs raksta latviski, citādi angļu. "
+            "CRITICAL: Answer ONLY the latest user message. "
+            "Do NOT repeat, paste, or reuse any previous learning/task DONE result, "
+            "skill output, verifier summary, or earlier final_result. "
             "Neizliecies, ka esi izpildījis darbību, ja tu to neesi izpildījis."
         )
-        messages = list(history or [])
+        # Keep history short — conversation turns only (caller should pre-filter)
+        messages = list(history or [])[-8:]
         messages.append({"role": "user", "content": user_text})
         return self.chat(messages, system=system, temperature=0.5)
 
