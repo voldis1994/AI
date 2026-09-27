@@ -56,10 +56,14 @@ FONT_STAT = ("Consolas", 10)
 
 
 def _mono() -> str:
-    """Pick first available monospace-ish family."""
+    """Pick first available monospace family (requires an existing Tk root)."""
     if tk is None or tkfont is None:
         return "Consolas"
-    families = {f.lower() for f in tkfont.families()}
+    try:
+        families = {f.lower() for f in tkfont.families()}
+    except Exception:
+        # Called before Tk() → TclError "too early to use font.families()"
+        return "Consolas"
     for name in (
         "Consolas",
         "Cascadia Mono",
@@ -132,6 +136,12 @@ class JarvisGUI:
         self._glitch_phase = 0
         self._bin_job = None
 
+        self.win = tk.Tk()
+        self.win.title("JARVIS")
+        self.win.configure(bg=BG)
+        self.win.geometry("1280x820")
+        self.win.minsize(980, 680)
+
         family = _mono()
         global FONT_MONO, FONT_TITLE, FONT_SUB, FONT_SMALL, FONT_STAT
         FONT_MONO = (family, 11)
@@ -139,12 +149,6 @@ class JarvisGUI:
         FONT_SUB = (family, 9)
         FONT_SMALL = (family, 9)
         FONT_STAT = (family, 10)
-
-        self.win = tk.Tk()
-        self.win.title("JARVIS")
-        self.win.configure(bg=BG)
-        self.win.geometry("1280x820")
-        self.win.minsize(980, 680)
 
         self._build_ui()
         self._bind_keys()
