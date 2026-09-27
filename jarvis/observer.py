@@ -178,3 +178,51 @@ class Observer:
     def fingerprint_approach(approach: str) -> str:
         text = " ".join((approach or "").lower().split())
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def fingerprint_error(observation: dict[str, Any]) -> str:
+        """
+        Fingerprint a failure for similarity detection across repair attempts.
+
+        Strips volatile paths/ids/quoted literals so the same class of error
+        (e.g. repeated VERIFY content_constraint misses) matches.
+        """
+        import re
+
+        vr = observation.get("verifier_result") or {}
+        if isinstance(vr, dict):
+            vr_reason = str(vr.get("reason") or "")
+        else:
+            vr_reason = str(vr or "")
+        parts = [
+            str(observation.get("phase") or ""),
+            str(observation.get("exception") or ""),
+            vr_reason,
+            str(observation.get("traceback") or "")[:800],
+            str((observation.get("skill_result") or {}).get("error") or ""),
+        ]
+        text = " ".join(parts).lower()
+        text = re.sub(r"[a-z]:\\[^\s\"']+", "<path>", text)
+        text = re.sub(r"(?:/[^\s\"']+)+", "<path>", text)
+        text = re.sub(r"\b[0-9a-f]{6,}\b", "<hex>", text)
+        text = re.sub(r"\bv?\d+\b", "<n>", text)
+        text = re.sub(r"['\"][^'\"]{1,120}['\"]", "<str>", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def count_similar_errors(
+        cls,
+        observation: dict[str, Any],
+        prior_observations: list[dict[str, Any]],
+    ) -> int:
+        """How many prior observations share this error fingerprint (incl. current if listed)."""
+        fp = observation.get("error_fingerprint") or cls.fingerprint_error(observation)
+        n = 0
+        for obs in prior_observations:
+            if not isinstance(obs, dict):
+                continue
+            prior_fp = obs.get("error_fingerprint") or cls.fingerprint_error(obs)
+            if prior_fp == fp:
+                n += 1
+        return n

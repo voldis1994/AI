@@ -275,9 +275,12 @@ class Brain:
     def research_notes(self, query: str, gathered: str) -> dict[str, Any]:
         """Summarize research into actionable learning notes."""
         system = (
-            "Summarize research for building a Python skill. Reply ONLY with JSON:\n"
-            '{"approach":"...","libraries":["pip-package"],'
-            '"key_apis":["..."],"pitfalls":["..."],"test_idea":"..."}'
+            "Summarize research for building or REPAIRING a Python skill. "
+            "Reply ONLY with JSON:\n"
+            '{"approach":"NEW strategy label distinct from prior failures",'
+            '"libraries":["pip-package"],'
+            '"key_apis":["..."],"pitfalls":["..."],"test_idea":"...",'
+            '"repair_insight":"what specifically to change in the next repair"}'
         )
         prompt = f"QUERY: {query}\n\nGATHERED INFO:\n{gathered[:8000]}"
         raw = self.generate(prompt, system=system, temperature=0.2)
@@ -287,7 +290,110 @@ class Brain:
             "key_apis": [],
             "pitfalls": [],
             "test_idea": "run skill and check return value",
+            "repair_insight": "",
         })
+
+    def generate_research_queries(
+        self,
+        observation: dict[str, Any],
+        diagnosis: Optional[dict[str, Any]] = None,
+        failed_approaches: Optional[list] = None,
+    ) -> list[str]:
+        """
+        Generate adaptive research questions from a repair-cycle failure.
+
+        Universal — no task-specific hardcoding. Uses observation, diagnosis,
+        traceback/error, failed approaches, and verifier failure.
+        """
+        system = (
+            "Generate focused web/research queries to unblock a failing JARVIS skill repair. "
+            "Reply ONLY with JSON: {\"research_queries\":[\"...\"]}\n"
+            "Rules:\n"
+            "- 2-5 concrete queries grounded in the failure data.\n"
+            "- Cover root cause, APIs/patterns to try, and how to satisfy verifier constraints.\n"
+            "- Do NOT invent a specific user filename/task; stay general to the failure class.\n"
+            "- Prefer Python stdlib / common library angles."
+        )
+        payload = {
+            "goal": observation.get("goal"),
+            "phase": observation.get("phase"),
+            "exception": str(observation.get("exception") or "")[:800],
+            "traceback": str(observation.get("traceback") or "")[:1200],
+            "stderr": str(observation.get("stderr") or "")[:600],
+            "verifier_result": observation.get("verifier_result"),
+            "diagnosis": {
+                k: (diagnosis or {}).get(k)
+                for k in (
+                    "root_cause", "fault_layer", "what_to_change", "approach",
+                    "test_plan", "missing_args", "expected_artifacts",
+                )
+            },
+            "failed_approaches": [
+                {
+                    "approach": a.get("approach"),
+                    "last_error": str(a.get("last_error") or "")[:200],
+                }
+                for a in (failed_approaches or [])[:8]
+            ],
+            "context_args_keys": list(
+                ((observation.get("context") or {}).get("args") or {}).keys()
+            ),
+        }
+        raw = self.generate(
+            json.dumps(payload, ensure_ascii=False, default=str)[:10000],
+            system=system,
+            temperature=0.3,
+        )
+        parsed = self._parse_json(raw, {})
+        queries = parsed.get("research_queries")
+        if isinstance(queries, list) and queries:
+            return [str(q).strip() for q in queries if str(q).strip()][:5]
+        return self._offline_research_queries(observation, diagnosis, failed_approaches)
+
+    @staticmethod
+    def _offline_research_queries(
+        observation: dict[str, Any],
+        diagnosis: Optional[dict[str, Any]] = None,
+        failed_approaches: Optional[list] = None,
+    ) -> list[str]:
+        """Deterministic query synthesis when the model is unavailable."""
+        diagnosis = diagnosis or {}
+        goal = str(observation.get("goal") or "")[:160]
+        err = str(observation.get("exception") or "")[:200]
+        root = str(diagnosis.get("root_cause") or err)[:200]
+        tb = str(observation.get("traceback") or "")
+        tb_line = ""
+        for line in tb.splitlines():
+            s = line.strip()
+            if s and not s.startswith("File ") and "Traceback" not in s:
+                tb_line = s[:160]
+                break
+        vr = observation.get("verifier_result") or {}
+        vr_reason = ""
+        if isinstance(vr, dict):
+            vr_reason = str(vr.get("reason") or "")[:200]
+        queries = [
+            f"python repair: {root}",
+            f"python {goal} error: {err}",
+        ]
+        if tb_line:
+            queries.append(f"python traceback: {tb_line}")
+        if vr_reason:
+            queries.append(f"skill verification failure: {vr_reason}")
+        for a in (failed_approaches or [])[:3]:
+            ap = str(a.get("approach") or "").strip()
+            if ap:
+                queries.append(f"python alternative after failed approach {ap[:80]}")
+        layer = str(diagnosis.get("fault_layer") or "")
+        if layer:
+            queries.append(f"python fix {layer} for: {root[:120]}")
+        # Dedupe preserving order
+        out: list[str] = []
+        for q in queries:
+            q = " ".join(q.split())
+            if q and q not in out:
+                out.append(q)
+        return out[:5]
 
     def write_skill_code(
         self,
@@ -397,6 +503,10 @@ class Brain:
             "test_harness: runner did not pass context correctly.\n"
             "- If the same approach already failed, set approach_changed=true "
             "and propose a meaningfully different approach.\n"
+            "- If the same/similar error repeats (prior_approaches or repeated VERIFY/"
+            "TEST failure), set needs_research=true and fill research_queries from the "
+            "observation, diagnosis, traceback, failed approaches, and verifier failure. "
+            "Research is required mid-repair — not only on first learning.\n"
             "- Do not claim the task is done; only diagnose.\n"
             "- Prefer concrete, testable next steps."
         )
@@ -467,10 +577,12 @@ class Brain:
                 )
             ),
             "approach_changed": True,
-            "needs_research": fb_layer == "skill_code" and not goal_mismatch,
+            # Mid-repair research is allowed for skill faults including VERIFY mismatches
+            "needs_research": fb_layer == "skill_code",
             "research_queries": [
                 f"python {observation.get('goal', '')}",
-                str(observation.get("exception") or "")[:120],
+                str(observation.get("exception") or "")[:160],
+                str((observation.get("verifier_result") or {}).get("reason") or "")[:160],
             ],
             "needs_new_deps": [],
             "missing_args": [],

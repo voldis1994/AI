@@ -868,6 +868,9 @@ class Orchestrator:
             observation["context"] = dict(observation["context"])
             observation["context"]["args"] = dict(task_args)
 
+        # Fingerprint this failure for adaptive mid-repair research
+        observation["error_fingerprint"] = Observer.fingerprint_error(observation)
+
         failure_id = self.memory.save_failure(
             skill_name, goal, observation,
             version=observation.get("version"),
@@ -878,6 +881,7 @@ class Orchestrator:
             "returncode": observation.get("returncode"),
             "exception": (observation.get("exception") or "")[:500],
             "code_fingerprint": observation.get("code_fingerprint"),
+            "error_fingerprint": observation.get("error_fingerprint"),
             "artifact_count": len(observation.get("artifacts") or []),
             "args_keys": list((task_args or {}).keys()),
         })
@@ -950,11 +954,15 @@ class Orchestrator:
                 "what_to_change": change,
                 "approach": approach,
                 "approach_changed": True,
-                "needs_research": layer == "skill_code" and not goal_mismatch,
-                "research_queries": [
-                    goal,
-                    str(observation.get("exception") or "")[:160],
-                ],
+                "needs_research": layer == "skill_code",
+                "research_queries": Brain._offline_research_queries(
+                    observation,
+                    {
+                        "root_cause": str(observation.get("exception") or "")[:500],
+                        "fault_layer": layer,
+                    },
+                    self.memory.get_failed_approaches(skill_name),
+                ),
                 "needs_new_deps": [],
                 "missing_args": list(parsed_missing),
                 "required_args": list(parsed_missing),
@@ -1011,6 +1019,16 @@ class Orchestrator:
                 f"suggested={list((diagnosis.get('suggested_args') or {}).keys())}"
             )
 
+        # Similarity vs prior failures (current observation already persisted)
+        prior_obs = [
+            f.get("observation")
+            for f in self.memory.recent_failures(skill_name, limit=12)
+            if isinstance(f.get("observation"), dict)
+        ]
+        similar_count = Observer.count_similar_errors(observation, prior_obs)
+        diagnosis["error_fingerprint"] = observation.get("error_fingerprint")
+        diagnosis["similar_failure_count"] = similar_count
+
         diag_id = self.memory.save_diagnosis(
             skill_name, goal, diagnosis, failure_id=failure_id
         )
@@ -1030,6 +1048,8 @@ class Orchestrator:
                 "suggested_args": diagnosis.get("suggested_args"),
                 "args_keys": list(new_args.keys()),
                 "test_plan": diagnosis.get("test_plan"),
+                "error_fingerprint": diagnosis.get("error_fingerprint"),
+                "similar_failure_count": similar_count,
             },
         )
         self._log(
@@ -1037,13 +1057,85 @@ class Orchestrator:
             f"| layer={diagnosis.get('fault_layer')!r} "
             f"rewrite_skill={diagnosis.get('rewrite_skill')} "
             f"| approach={diagnosis.get('approach')!r} "
-            f"changed={diagnosis.get('approach_changed')}"
+            f"changed={diagnosis.get('approach_changed')} "
+            f"| similar_errors={similar_count}"
         )
 
-        # RESEARCH if brain says so (usually not for pure context_args faults)
-        if diagnosis.get("needs_research") and diagnosis.get("fault_layer") != "context_args":
-            queries = diagnosis.get("research_queries") or [goal]
-            research = self._do_research(task_id, skill_name, goal, list(queries))
+        # ── Adaptive RESEARCH inside the repair cycle ───────────────────
+        # When the same/similar error repeats, generate fresh queries from
+        # observation + diagnosis + traceback + failed approaches + verifier.
+        repeated_error = similar_count >= 2  # current save + at least one prior
+        many_failed_approaches = len(failed) >= 2
+        layer_now = str(diagnosis.get("fault_layer") or "")
+
+        force_research = repeated_error or (
+            diagnosis.get("needs_research") and layer_now != "context_args"
+        ) or (
+            many_failed_approaches and layer_now == "skill_code"
+        )
+        # Pure first-time context_args prep does not need web research
+        if layer_now == "context_args" and not repeated_error:
+            force_research = False
+
+        if force_research:
+            diagnosis["needs_research"] = True
+            diagnosis["adaptive_research"] = bool(repeated_error or many_failed_approaches)
+            queries = list(diagnosis.get("research_queries") or [])
+            if self.brain.is_available():
+                try:
+                    generated = self.brain.generate_research_queries(
+                        observation, diagnosis, failed
+                    )
+                except Exception:
+                    generated = Brain._offline_research_queries(
+                        observation, diagnosis, failed
+                    )
+            else:
+                generated = Brain._offline_research_queries(
+                    observation, diagnosis, failed
+                )
+            for q in generated:
+                if q and q not in queries:
+                    queries.append(q)
+            if not queries:
+                queries = [goal, str(observation.get("exception") or "")[:160]]
+            diagnosis["research_queries"] = queries[:6]
+            self._log(
+                f"[{task_id}] ADAPTIVE RESEARCH: similar={similar_count} "
+                f"failed_approaches={len(failed)} queries={len(queries)}"
+            )
+            new_research = self._do_research(task_id, skill_name, goal, list(queries))
+            research = self._merge_research(research, new_research)
+            # Research must drive a NEW approach for the next repair
+            researched_approach = str(research.get("approach") or "").strip()
+            if researched_approach:
+                candidate = researched_approach.split("\n")[0][:100]
+                cand_fp = Observer.fingerprint_approach(candidate)
+                failed_fps = {a.get("approach_fingerprint") for a in failed}
+                if cand_fp in failed_fps:
+                    candidate = (
+                        f"{candidate} | researched-v{observation.get('version')}"
+                    )
+                    cand_fp = Observer.fingerprint_approach(candidate)
+                diagnosis["approach"] = candidate
+                diagnosis["approach_fingerprint"] = cand_fp
+                diagnosis["approach_changed"] = True
+                if research.get("repair_insight"):
+                    diagnosis["what_to_change"] = (
+                        f"{diagnosis.get('what_to_change')} | "
+                        f"RESEARCH: {research.get('repair_insight')}"
+                    )[:1000]
+            self.ledger.log(
+                task_id,
+                "RESEARCH",
+                f"adaptive repair research similar={similar_count}",
+                {
+                    "queries": queries[:6],
+                    "similar_failure_count": similar_count,
+                    "approach": diagnosis.get("approach"),
+                    "libraries": research.get("libraries"),
+                },
+            )
 
         if diagnosis.get("needs_new_deps"):
             dep_r = self.deps.ensure(list(diagnosis["needs_new_deps"]))
@@ -1059,17 +1151,20 @@ class Orchestrator:
         research["fix_plan"] = diagnosis.get("test_plan")
         research["approach"] = diagnosis.get("approach")
         research["diagnosis"] = diagnosis
+        research["adaptive_research"] = diagnosis.get("adaptive_research")
 
         last_error = (
             f"ROOT CAUSE: {diagnosis.get('root_cause')}\n"
             f"FAULT_LAYER: {diagnosis.get('fault_layer')}\n"
             f"CHANGE: {diagnosis.get('what_to_change')}\n"
             f"APPROACH: {diagnosis.get('approach')}\n"
+            f"RESEARCH_INSIGHT: {research.get('repair_insight') or ''}\n"
             f"ARGS: {json.dumps(new_args, default=str)[:500]}\n"
             f"EXCEPTION: {observation.get('exception')}\n"
             f"STDERR: {(observation.get('stderr') or '')[:800]}\n"
             f"STDOUT: {(observation.get('stdout') or '')[:400]}\n"
-            f"TRACEBACK: {(observation.get('traceback') or '')[:800]}"
+            f"TRACEBACK: {(observation.get('traceback') or '')[:800]}\n"
+            f"VERIFIER: {json.dumps(observation.get('verifier_result'), default=str)[:600]}"
         )
         self._status("REPAIR")
         self.ledger.log(
@@ -1077,7 +1172,8 @@ class Orchestrator:
             "REPAIR",
             f"prepare repair layer={diagnosis.get('fault_layer')} "
             f"rewrite_skill={diagnosis.get('rewrite_skill')} "
-            f"approach={diagnosis.get('approach')}",
+            f"approach={diagnosis.get('approach')} "
+            f"adaptive_research={diagnosis.get('adaptive_research')}",
         )
         return (
             diagnosis,
@@ -1087,6 +1183,37 @@ class Orchestrator:
             code,
             new_args,
         )
+
+    @staticmethod
+    def _merge_research(prior: dict, new: dict) -> dict:
+        """Merge adaptive research into prior notes — prefer new approach/insights."""
+        out = dict(prior or {})
+        new = dict(new or {})
+        for key in ("approach", "test_idea", "repair_insight", "raw"):
+            if new.get(key):
+                out[key] = new[key]
+        for key in ("libraries", "key_apis", "pitfalls"):
+            merged = list(out.get(key) or [])
+            for item in new.get(key) or []:
+                if item not in merged:
+                    merged.append(item)
+            out[key] = merged
+        for key in ("results", "sources"):
+            merged = list(new.get(key) or []) + list(out.get(key) or [])
+            # de-dupe by url+title
+            seen: set[str] = set()
+            uniq = []
+            for r in merged:
+                if not isinstance(r, dict):
+                    continue
+                sig = f"{r.get('url')}|{r.get('title')}"
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                uniq.append(r)
+            out[key] = uniq[:40]
+        out["adaptive"] = True
+        return out
 
     def _register_candidate_safe(
         self,
