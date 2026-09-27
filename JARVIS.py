@@ -550,6 +550,7 @@ def run_check(root: Path) -> int:
         "jarvis.brain",
         "jarvis.model_config",
         "jarvis.model_router",
+        "jarvis.recovery",
         "jarvis.memory",
         "jarvis.ledger",
         "jarvis.capability_registry",
@@ -1453,8 +1454,8 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
-    # 4d) E2E: repeated similar VERIFY failure → adaptive RESEARCH → new approach
-    print("  — e2e adaptive research on repeated repair failures —")
+    # 4d) E2E: repeated VERIFY fail → CODING repair (research NOT universal fallback)
+    print("  — e2e progress-aware repair (CODING, no research spam) —")
     try:
         from jarvis.observer import Observer as _Obs
 
@@ -1463,12 +1464,13 @@ def run(context: dict) -> dict:
             shutil.rmtree(ar_root)
         ar_root.mkdir(parents=True)
 
-        class AdaptiveResearchBrain(Brain):
+        class CodingFirstRepairBrain(Brain):
             def __init__(self) -> None:
                 super().__init__()
                 self.build_count = 0
                 self.research_notes_calls = 0
                 self.gen_query_calls = 0
+                self.diagnose_approaches: list[str] = []
 
             def model_status(self) -> str:
                 return "ONLINE"
@@ -1489,11 +1491,11 @@ def run(context: dict) -> dict:
                     "steps": ["build skill that honors args"],
                     "can_reuse": [],
                     "missing": [goal],
-                    "needs_research": True,
+                    "needs_research": False,  # CODING-first; no entry RESEARCH tax
                     "needs_new_skill": True,
                     "skill_name": "repeat_fail_skill",
                     "skill_description": goal,
-                    "research_queries": [goal],
+                    "research_queries": [],
                     "args": {"dest": "adapt_out.txt", "body": "ADAPT_OK"},
                     "required_args": ["dest", "body"],
                 }
@@ -1507,19 +1509,17 @@ def run(context: dict) -> dict:
                 self, observation, diagnosis=None, failed_approaches=None
             ):
                 self.gen_query_calls += 1
-                return Brain._offline_research_queries(
-                    observation, diagnosis, failed_approaches
-                )
+                return ["SHOULD_NOT_BE_CALLED_WITHOUT_KNOWLEDGE_GAP"]
 
             def research_notes(self, query: str, gathered: str) -> dict:
                 self.research_notes_calls += 1
                 return {
-                    "approach": f"researched_write_v{self.research_notes_calls}",
+                    "approach": "should_not_research",
                     "libraries": [],
-                    "key_apis": ["pathlib"],
-                    "pitfalls": ["do not leave file empty"],
-                    "test_idea": "verifier checks dest+body",
-                    "repair_insight": "write args body bytes into dest path",
+                    "key_apis": [],
+                    "pitfalls": [],
+                    "test_idea": "",
+                    "repair_insight": "",
                 }
 
             def write_skill_code(
@@ -1536,7 +1536,7 @@ def run(context: dict) -> dict:
                 self.build_count += 1
                 import json as _json
                 desc_lit = _json.dumps(description or "")
-                # First two builds: skill ok=True but empty file → same VERIFY fail
+                # First two builds: same VERIFY failure class (empty file)
                 if self.build_count <= 2:
                     return f'''
 from pathlib import Path
@@ -1561,7 +1561,7 @@ def run(context: dict) -> dict:
         "evidence": f"touched {{path}}",
     }}
 '''
-                # After adaptive research / enough repairs: honor args
+                # After stagnation forces new CODING approach: honor args
                 return f'''
 from pathlib import Path
 SKILL_META = {{
@@ -1587,7 +1587,7 @@ def run(context: dict) -> dict:
 
             def diagnose(self, observation, failed_approaches=None, prior_solutions=None):
                 err = str(observation.get("exception") or "")
-                approach = "empty_touch_then_research"
+                approach = "empty_touch_coding_repair"
                 fps = {
                     a.get("approach_fingerprint")
                     for a in (failed_approaches or [])
@@ -1596,6 +1596,7 @@ def run(context: dict) -> dict:
                 if fp in fps:
                     approach = approach + f"_v{len(fps)+1}"
                     fp = _Obs.fingerprint_approach(approach)
+                self.diagnose_approaches.append(approach)
                 return {
                     "root_cause": "file created empty; content missing for VERIFY",
                     "fault_layer": "skill_code",
@@ -1604,7 +1605,8 @@ def run(context: dict) -> dict:
                     "approach": approach,
                     "approach_fingerprint": fp,
                     "approach_changed": True,
-                    "needs_research": False,  # orchestrator must force on repeat
+                    "needs_research": False,
+                    "missing_knowledge": [],
                     "research_queries": [],
                     "needs_new_deps": [],
                     "missing_args": [],
@@ -1627,7 +1629,7 @@ def run(context: dict) -> dict:
 
         phases_r: list[str] = []
         logs_r: list[str] = []
-        brain_r = AdaptiveResearchBrain()
+        brain_r = CodingFirstRepairBrain()
         orch_r = Orchestrator(
             root=ar_root,
             brain=brain_r,
@@ -1640,14 +1642,221 @@ def run(context: dict) -> dict:
         out_r = ar_root / "workspace_runtime" / "adapt_out.txt"
         assert out_r.exists() and "ADAPT_OK" in out_r.read_text(encoding="utf-8")
         assert brain_r.build_count >= 3, brain_r.build_count
-        # Mid-repair adaptive research must have run (not only initial RESEARCH)
-        assert any("ADAPTIVE RESEARCH" in m for m in logs_r), logs_r[-50:]
-        assert brain_r.gen_query_calls >= 1 or brain_r.research_notes_calls >= 1
-        assert phases_r.count("RESEARCH") >= 2  # initial + adaptive
+        # Research must NOT be the universal fallback for repeated VERIFY fails
+        assert brain_r.gen_query_calls == 0, brain_r.gen_query_calls
+        assert not any("KNOWLEDGE-GAP RESEARCH" in m for m in logs_r), logs_r[-40:]
+        assert not any("ADAPTIVE RESEARCH" in m for m in logs_r), logs_r[-40:]
+        assert any("STAGNATION" in m or "CODING" in m for m in logs_r), logs_r[-50:]
+        assert phases_r.count("RESEARCH") == 0, phases_r
         orch_r.close()
-        print("  OK adaptive RESEARCH on repeated VERIFY failures → new approach")
+        print("  OK progress-aware CODING repair — no research spam on VERIFY repeat")
     except Exception as exc:
         msg = f"E2E_ADAPTIVE_RESEARCH: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 4d2) E2E: identical verifier failure must NOT repeat an identical cycle
+    print("  — e2e stagnation: identical VERIFY FAIL ≠ identical research cycle —")
+    try:
+        from jarvis.observer import Observer as _Obs2
+        from jarvis.recovery import ProgressAwareRecovery
+
+        st_root = root / "data" / "_e2e_stagnation"
+        if st_root.exists():
+            shutil.rmtree(st_root)
+        st_root.mkdir(parents=True)
+
+        class StickyVerifyFailBrain(Brain):
+            """Always emits the same broken skill → identical VERIFY failure."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.build_count = 0
+                self.research_notes_calls = 0
+                self.approaches: list[str] = []
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": ["create", "file"],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                return {
+                    "steps": ["build"],
+                    "can_reuse": [],
+                    "missing": [goal],
+                    "needs_research": False,
+                    "needs_new_skill": True,
+                    "skill_name": "sticky_fail_skill",
+                    "skill_description": goal,
+                    "research_queries": [],
+                    "args": {"dest": "sticky.txt", "body": "STICKY_OK"},
+                    "required_args": ["dest", "body"],
+                }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                return {"dest": "sticky.txt", "body": "STICKY_OK"}
+
+            def research_notes(self, query: str, gathered: str) -> dict:
+                self.research_notes_calls += 1
+                return {
+                    "approach": "identical_research_cycle",
+                    "libraries": [],
+                    "key_apis": [],
+                    "pitfalls": [],
+                    "test_idea": "",
+                    "repair_insight": "noop",
+                }
+
+            def generate_research_queries(
+                self, observation, diagnosis=None, failed_approaches=None
+            ):
+                return ["identical_query_should_not_loop"]
+
+            def write_skill_code(
+                self,
+                skill_name,
+                description,
+                research,
+                previous_code=None,
+                error_log=None,
+                diagnosis=None,
+                failed_approaches=None,
+                test_plan=None,
+            ) -> str:
+                self.build_count += 1
+                import json as _json
+                desc_lit = _json.dumps(description or "")
+                # Identical broken body every time (same failure_signature)
+                return f'''
+from pathlib import Path
+SKILL_META = {{
+    "name": "{skill_name}",
+    "description": {desc_lit},
+    "capabilities": ["sticky"],
+    "dependencies": [],
+    "version": {self.build_count},
+    "required_args": ["dest", "body"],
+}}
+def run(context: dict) -> dict:
+    args = context.get("args") or {{}}
+    workspace = Path(context.get("workspace") or ".")
+    path = workspace / str(args.get("dest") or "sticky.txt")
+    path.write_text("", encoding="utf-8")
+    return {{
+        "ok": True,
+        "result": {{"path": str(path), "contains": ""}},
+        "error": None,
+        "evidence": "empty",
+    }}
+'''
+
+            def diagnose(self, observation, failed_approaches=None, prior_solutions=None):
+                # Intentionally sticky approach label — recovery must diverge it
+                approach = "always_same_approach"
+                self.approaches.append(approach)
+                return {
+                    "root_cause": "identical empty artifact every time",
+                    "fault_layer": "skill_code",
+                    "rewrite_skill": True,
+                    "what_to_change": "write body",
+                    "approach": approach,
+                    "approach_fingerprint": _Obs2.fingerprint_approach(approach),
+                    "approach_changed": False,
+                    "needs_research": True,  # must be ignored without missing_knowledge
+                    "missing_knowledge": [],
+                    "research_queries": ["identical_query_should_not_loop"],
+                    "needs_new_deps": [],
+                    "missing_args": [],
+                    "required_args": ["dest", "body"],
+                    "suggested_args": {"dest": "sticky.txt", "body": "STICKY_OK"},
+                    "test_plan": "VERIFY",
+                    "expected_artifacts": [],
+                    "is_unfixable": False,
+                    "diagnosis": "sticky",
+                }
+
+            def verify_claim(self, goal, result, evidence) -> dict:
+                return {"achieved": False, "confidence": 0.1, "reason": "no"}
+
+            def converse(self, user_text, history=None) -> str:
+                return "ok"
+
+        logs_s: list[str] = []
+        phases_s: list[str] = []
+        brain_s = StickyVerifyFailBrain()
+        orch_s = Orchestrator(
+            root=st_root,
+            brain=brain_s,
+            on_log=lambda m: logs_s.append(m),
+            on_status=lambda s: phases_s.append(s),
+        )
+        result_s = orch_s.run_cycle('Create "sticky.txt" containing "STICKY_OK"')
+        assert not result_s.get("success"), result_s
+        # Must stop with unresolved report — not spin forever
+        assert any("RECOVERY STOP" in m or "RECOVERY BUDGET STOP" in m for m in logs_s), logs_s[-60:]
+        assert any("STAGNATION" in m for m in logs_s), logs_s[-60:]
+        # needs_research without missing_knowledge must NOT trigger research loop
+        assert brain_s.research_notes_calls == 0, brain_s.research_notes_calls
+        assert phases_s.count("RESEARCH") == 0, phases_s
+        assert not any("KNOWLEDGE-GAP RESEARCH" in m for m in logs_s)
+        assert not any("ADAPTIVE RESEARCH" in m for m in logs_s)
+        # Approaches must diverge after stagnation (not identical cycle)
+        diag_approaches = [
+            (d.get("diagnosis") or {}).get("approach")
+            if isinstance(d.get("diagnosis"), dict)
+            else d.get("approach")
+            for d in orch_s.memory.recent_diagnoses("sticky_fail_skill", 10)
+        ]
+        diag_approaches = [a for a in diag_approaches if a]
+        assert any("coding_diverge" in str(a) for a in diag_approaches), diag_approaches
+        # Failure signatures persisted
+        fails = orch_s.memory.recent_failures("sticky_fail_skill", 10)
+        assert fails
+        assert any(
+            (f.get("failure_signature") or (f.get("observation") or {}).get("failure_signature"))
+            for f in fails
+        )
+        # Unit: ProgressAwareRecovery itself rejects identical no-progress loops
+        tracker = ProgressAwareRecovery(max_attempts=4, stagnation_limit=2, max_research=1)
+        sig = "abc123sig"
+        for i in range(3):
+            tracker.record(
+                fault_layer="skill_code",
+                failure_signature=sig,
+                attempted_solution="same",
+                model_used="test",
+                result="VERIFY FAIL same",
+                artifacts=[{"path": "x", "exists": True, "size": 0}],
+                verifier_failure={"reason": "contains missing"},
+                code_fingerprint="deadbeef",
+                approach_fingerprint="samefp",
+            )
+            dec = tracker.evaluate(
+                failure_signature=sig,
+                fault_layer="skill_code",
+                diagnosis_needs_research=True,
+                missing_knowledge=[],
+            )
+        assert dec.stagnated
+        assert not dec.allow_research  # no knowledge gap
+        assert dec.prefer_coding
+        orch_s.close()
+        print("  OK stagnation — identical VERIFY FAIL does not repeat research cycle")
+    except Exception as exc:
+        msg = f"E2E_STAGNATION: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)
