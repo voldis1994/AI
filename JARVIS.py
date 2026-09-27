@@ -548,6 +548,8 @@ def run_check(root: Path) -> int:
     modules = [
         "jarvis",
         "jarvis.brain",
+        "jarvis.model_config",
+        "jarvis.model_router",
         "jarvis.memory",
         "jarvis.ledger",
         "jarvis.capability_registry",
