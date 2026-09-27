@@ -274,8 +274,13 @@ class JarvisGUI:
         self.send_btn.pack(side=tk.LEFT, padx=(8, 0))
 
     def _bind_keys(self) -> None:
-        self.entry.bind("<Return>", lambda _e: self._on_send())
+        # Single send path — Return must not also trigger button-default double fire
+        self.entry.bind("<Return>", self._on_return)
         self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_return(self, _event=None):
+        self._on_send()
+        return "break"
 
     # ── Boot / display helpers ──────────────────────────────────────────
 
@@ -298,15 +303,23 @@ class JarvisGUI:
         self.brain_var.set(f"BRAIN: {status} · {DEFAULT_MODEL}")
 
     def _append(self, tag: str, text: str) -> None:
+        """Append one line to the conversation/log widget (thread-safe)."""
         def _do() -> None:
             self.log.configure(state=tk.NORMAL)
             self.log.insert(tk.END, text.rstrip() + "\n\n", tag)
             self.log.see(tk.END)
             self.log.configure(state=tk.DISABLED)
 
-        self.win.after(0, _do)
+        if threading.current_thread() is threading.main_thread():
+            _do()
+        else:
+            self.win.after(0, _do)
 
     def _ui_log(self, msg: str) -> None:
+        """Process/cycle log sink only — not for USER input or final JARVIS replies.
+
+        Conversation turns are rendered once by _on_send from the return value.
+        """
         tag = "system"
         upper = msg.upper()
         if "FAIL" in upper or "ERROR" in upper or "EXCEPTION" in upper:
@@ -388,23 +401,26 @@ class JarvisGUI:
     # ── Interaction ─────────────────────────────────────────────────────
 
     def _on_send(self) -> None:
+        """Single owner for YOU › and JARVIS › display (one each per turn)."""
         if self.busy:
             return
         text = self.entry.get().strip()
         if not text:
             return
         self.entry.delete(0, tk.END)
-        self._append("user", f"YOU › {text}")
         self.busy = True
         self.send_btn.configure(state=tk.DISABLED)
+        self._append("user", f"YOU › {text}")
         self._ui_status("WORKING")
 
         def worker() -> None:
             try:
                 result = self.orch.handle_user_message(text)
                 reply = result.get("reply") or str(result)
-                tag = "jarvis" if result.get("success", True) or result.get("type") == "conversation" else "error"
+                tag = "jarvis"
                 if result.get("type") == "task" and not result.get("success"):
+                    tag = "error"
+                elif result.get("success") is False:
                     tag = "error"
                 self._append(tag, f"JARVIS › {reply}")
             except Exception as exc:
@@ -838,15 +854,25 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
-    # 5) Orchestrator boots on main root
+    # 5) Orchestrator boots + conversation logs must not echo USER/JARVIS replies
     try:
-        orch = Orchestrator(root=root, brain=Brain())
+        echoed: list[str] = []
+        orch = Orchestrator(
+            root=root,
+            brain=Brain(),
+            on_log=lambda m: echoed.append(m),
+        )
         stats = orch.get_dashboard_stats()
         assert "brain_status" in stats
         r = orch.handle_user_message("/status")
         assert "reply" in r
+        # /status reply is returned to UI — must not also be pushed via on_log
+        status_reply = r.get("reply") or ""
+        assert not any(status_reply and status_reply in m for m in echoed), echoed
+        assert not any(m.startswith("USER:") for m in echoed), echoed
+        assert not any(m.startswith("JARVIS:") for m in echoed), echoed
         orch.close()
-        print("  OK orch     boot + /status")
+        print("  OK orch     boot + /status (no USER/JARVIS log echo)")
     except Exception as exc:
         msg = f"ORCH: {exc}"
         print(f"  FAIL {msg}")
