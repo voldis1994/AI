@@ -440,6 +440,9 @@ class Memory:
             solutions = self._conn.execute(
                 "SELECT COUNT(*) AS c FROM learning_solutions"
             ).fetchone()["c"]
+        knowledge_entries = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM facts WHERE key LIKE 'knowledge:%'"
+        ).fetchone()["c"]
         return {
             "conversations": conversations,
             "experiences": experiences,
@@ -449,7 +452,57 @@ class Memory:
             "learning_failures": failures,
             "learning_diagnoses": diagnoses,
             "learning_solutions": solutions,
+            "knowledge_topics": knowledge_entries,
         }
+
+    # ── Research knowledge persistence ──────────────────────────────────
+
+    def save_research_knowledge(
+        self,
+        skill_name: str,
+        research: dict[str, Any],
+        *,
+        goal: str = "",
+        queries: Optional[list] = None,
+    ) -> dict[str, Any]:
+        """
+        Persist research insights for a skill and return the updated history.
+
+        Keeps a rolling history under knowledge:{skill_name} and the latest
+        snapshot under research:{skill_name}.
+        """
+        entry = {
+            "ts": time.time(),
+            "goal": goal,
+            "queries": list(queries or [])[:8],
+            "approach": research.get("approach"),
+            "libraries": list(research.get("libraries") or [])[:12],
+            "key_apis": list(research.get("key_apis") or [])[:12],
+            "pitfalls": list(research.get("pitfalls") or [])[:12],
+            "repair_insight": research.get("repair_insight") or "",
+            "test_idea": research.get("test_idea") or "",
+            "sources": list(research.get("sources") or [])[:12],
+            "result_count": len(research.get("results") or []),
+        }
+        key = f"knowledge:{skill_name}"
+        prior = self.get_fact(key) or []
+        if not isinstance(prior, list):
+            prior = [prior]
+        prior.append(entry)
+        prior = prior[-20:]
+        self.set_fact(key, prior, source="research")
+        self.set_fact(f"research:{skill_name}", research, source="research")
+        return {"entry": entry, "history": prior}
+
+    def get_research_knowledge(self, skill_name: str, limit: int = 8) -> list[dict[str, Any]]:
+        prior = self.get_fact(f"knowledge:{skill_name}") or []
+        if not isinstance(prior, list):
+            return [prior] if prior else []
+        return list(prior)[-limit:]
+
+    def get_latest_research(self, skill_name: str) -> Optional[dict[str, Any]]:
+        val = self.get_fact(f"research:{skill_name}")
+        return val if isinstance(val, dict) else None
 
     def close(self) -> None:
         with self._lock:

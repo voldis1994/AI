@@ -426,6 +426,9 @@ class Brain:
             "error listing the missing keys — do not fabricate them.\n"
             "Use only stdlib + declared dependencies. Be concrete and correct. "
             "Do not pretend success — set ok=False on failure.\n"
+            "FORBIDDEN: do not leave a TODO/stub body and do not return "
+            "'Skill body not implemented yet'. You MUST implement a real run() from the "
+            "RESEARCH / knowledge_history / DIAGNOSIS provided.\n"
             "If a DIAGNOSIS is provided and fault_layer is skill_code, implement the fix. "
             "Do not repeat failed approaches listed below."
         )
@@ -434,6 +437,11 @@ class Brain:
             f"Description: {description}",
             f"Research: {json.dumps(research, ensure_ascii=False)[:6000]}",
         ]
+        if research.get("knowledge_history"):
+            parts.append(
+                "SAVED KNOWLEDGE HISTORY (reuse these insights):\n"
+                + json.dumps(research["knowledge_history"], ensure_ascii=False, default=str)[:4000]
+            )
         if diagnosis:
             parts.append(
                 "DIAGNOSIS (follow this):\n"
