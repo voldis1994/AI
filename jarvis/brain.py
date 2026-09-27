@@ -1,26 +1,27 @@
 """
-JARVIS Brain — multi-model Ollama interface via ModelRouter.
+JARVIS Brain — multi-model Ollama interface via concurrent ModelPool.
 
-Work kind → FAST / REASONING / CODING → best available model.
+Work kind → direct FAST / REASONING / CODING worker (independent resources).
 Never invents "DONE" — verification is external (Python checks, not LLM trust).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import logging
 import time
 from typing import Any, Callable, Optional
 
-from jarvis.model_config import DEFAULT_HOST, DEFAULT_MODEL
-from jarvis.model_router import ModelRouter
+from jarvis.model_config import DEFAULT_HOST, DEFAULT_MODEL, KEEP_ALIVE_ACTIVE
+from jarvis.model_router import ModelPool, ModelRouter, RequestWorkContext
 from jarvis.perf import get_active_tracker
 
 logger = logging.getLogger("jarvis.brain")
 
 # Re-export for callers that import from jarvis.brain
-__all__ = ["Brain", "DEFAULT_MODEL", "DEFAULT_HOST"]
+__all__ = ["Brain", "DEFAULT_MODEL", "DEFAULT_HOST", "ModelPool", "ModelRouter"]
 
 # Shorter than historical 180s — hung Ollama must not dominate repair loops.
 DEFAULT_CHAT_TIMEOUT = 90.0
@@ -77,13 +78,34 @@ class Brain:
         self.router = router or ModelRouter(
             list_models=self._list_model_names,
             on_log=self._route_log,
+            host=self.host,
         )
         # Keep router logger in sync if Brain logger changes later
         self.router.set_logger(self._route_log)
+        self.pool: ModelPool = self.router  # alias — router IS the pool
+        self._pool_ready = False
 
     def set_logger(self, on_log: Callable[[str], None]) -> None:
         self.on_log = on_log or (lambda _m: None)
         self.router.set_logger(self._route_log)
+
+    def ensure_pool_ready(self, *, warm: bool = True) -> dict[str, Any]:
+        """
+        Initialize Ollama connection and warm models that fit GPU/RAM.
+        Called at Orchestrator boot — tiers become independent ready workers.
+        """
+        if self._force_single_model:
+            self._pool_ready = True
+            return {"online": False, "forced_single": True}
+        report = self.pool.initialize(warm=warm)
+        self._pool_ready = True
+        return report
+
+    def begin_request_pool(self, request_id: str = "") -> RequestWorkContext:
+        return self.pool.begin_request(request_id)
+
+    def end_request_pool(self) -> Optional[dict[str, Any]]:
+        return self.pool.end_request()
 
     def _route_log(self, msg: str) -> None:
         try:
@@ -125,12 +147,17 @@ class Brain:
         return self.router.status()
 
     def model_catalog_summary(self) -> str:
-        """Short multi-model summary for GUI/CLI."""
+        """Short multi-model pool summary for GUI/CLI (ready/warm marks)."""
         detail = self.router.status_detail()
         parts = []
         for tier, info in (detail.get("tiers") or {}).items():
             resolved = info.get("resolved") or info.get("primary")
-            mark = "✓" if info.get("online") else "·"
+            if info.get("warm"):
+                mark = "♨"  # warm in memory
+            elif info.get("online") or info.get("ready"):
+                mark = "✓"
+            else:
+                mark = "·"
             parts.append(f"{tier}:{resolved}{mark}")
         return " | ".join(parts)
 
@@ -181,13 +208,12 @@ class Brain:
         model: Optional[str] = None,
     ) -> str:
         """
-        Chat completion via ModelRouter.
+        Chat via concurrent model pool.
 
-        work/tier select FAST|REASONING|CODING. On insufficient FAST output,
-        optionally escalate once to REASONING.
-
-        escalate_error_only: when True with allow_escalate, only escalate on
-        empty / [BRAIN ERROR] (not weak JSON) — prefer offline Python fallbacks.
+        work/tier selects the worker directly (FAST|REASONING|CODING) — never
+        walks a mandatory pipeline. Escalation runs only when the prior result
+        is truly insufficient. Same work is not re-executed on another model
+        within the request context unless escalating after insufficiency.
         """
         full: list[dict[str, str]] = []
         if system:
@@ -197,20 +223,53 @@ class Brain:
         if self._force_single_model and not model:
             model = self.model
 
-        decision = self.router.route(
-            work=work or ("forced" if model else "chat"),
+        work_key_name = work or ("forced" if model else "chat")
+        prompt_fp = self._prompt_fingerprint(full)
+        ctx = self.pool.current_request()
+        dedupe_key = RequestWorkContext.work_key(
+            work_key_name, prompt_fp, tier or ""
+        )
+        if ctx is not None:
+            cached = ctx.get(dedupe_key)
+            if cached is not None and not ModelRouter.result_insufficient(
+                cached,
+                expect_json=expect_json,
+                expect_code=expect_code,
+                error_only=escalate_error_only,
+            ):
+                self.on_log(
+                    f"MODEL DEDUPE: reuse {work_key_name} "
+                    f"(skip re-run on another model)"
+                )
+                return cached
+
+        decision = self.pool.acquire(
+            work=work_key_name,
             tier=tier,
             force_model=model,
+            ensure_warm=not self._force_single_model,
         )
         t0 = time.perf_counter()
-        text = self._chat_on_model(full, temperature, decision.model)
+        self.pool.mark_in_flight(decision.model, +1)
+        try:
+            text = self._chat_on_model(
+                full,
+                temperature,
+                decision.model,
+                keep_alive=self.pool.keep_alive_for(decision.model),
+            )
+        finally:
+            self.pool.mark_in_flight(decision.model, -1)
         self._record_model_timing(
             work=work or decision.work,
             tier=decision.tier,
             model=decision.model,
             ms=(time.perf_counter() - t0) * 1000.0,
             ok=not str(text).startswith("[BRAIN ERROR]"),
+            warm=decision.warm,
         )
+        if ctx is not None:
+            ctx.put(dedupe_key, text, decision)
 
         if allow_escalate and ModelRouter.result_insufficient(
             text,
@@ -225,12 +284,29 @@ class Brain:
                 except Exception:
                     pass
                 return text
-            esc = self.router.escalate(decision.tier, work=work or decision.work)
+            # Clear insufficient cache so escalate may run once
+            if ctx is not None:
+                with ctx._lock:
+                    ctx.results.pop(dedupe_key, None)
+            esc = self.pool.escalate(
+                decision.tier,
+                work=work or decision.work,
+                prior_key=dedupe_key,
+            )
             if esc is not None and (
                 esc.model != decision.model or esc.tier != decision.tier
             ):
                 t1 = time.perf_counter()
-                text2 = self._chat_on_model(full, temperature, esc.model)
+                self.pool.mark_in_flight(esc.model, +1)
+                try:
+                    text2 = self._chat_on_model(
+                        full,
+                        temperature,
+                        esc.model,
+                        keep_alive=self.pool.keep_alive_for(esc.model),
+                    )
+                finally:
+                    self.pool.mark_in_flight(esc.model, -1)
                 self._record_model_timing(
                     work=work or decision.work,
                     tier=esc.tier,
@@ -239,6 +315,8 @@ class Brain:
                     ok=not str(text2).startswith("[BRAIN ERROR]"),
                     escalated=True,
                 )
+                if ctx is not None:
+                    ctx.put(dedupe_key, text2, esc)
                 if not ModelRouter.result_insufficient(
                     text2,
                     expect_json=expect_json,
@@ -246,16 +324,23 @@ class Brain:
                     error_only=escalate_error_only,
                 ):
                     return text2
-                # Prefer non-empty escalated text over empty first try
                 if text2.strip() and (
                     not text.strip() or text.startswith("[BRAIN ERROR]")
                 ):
                     return text2
             elif esc is not None and esc.tier == decision.tier:
-                # CODING retry path — same tier, caller should add failure context;
-                # still re-hit once if first output was empty/error.
+                # CODING same-tier retry with failure context
                 t1 = time.perf_counter()
-                text2 = self._chat_on_model(full, temperature, esc.model)
+                self.pool.mark_in_flight(esc.model, +1)
+                try:
+                    text2 = self._chat_on_model(
+                        full,
+                        temperature,
+                        esc.model,
+                        keep_alive=self.pool.keep_alive_for(esc.model),
+                    )
+                finally:
+                    self.pool.mark_in_flight(esc.model, -1)
                 self._record_model_timing(
                     work=work or decision.work,
                     tier=esc.tier,
@@ -265,8 +350,41 @@ class Brain:
                     retry=True,
                 )
                 if text2.strip() and not text2.startswith("[BRAIN ERROR]"):
+                    if ctx is not None:
+                        ctx.put(dedupe_key, text2, esc)
                     return text2
         return text
+
+    @staticmethod
+    def _prompt_fingerprint(messages: list[dict[str, str]]) -> str:
+        blob = json.dumps(messages, ensure_ascii=False, default=str)[:2000]
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+    def parallel_generate(
+        self,
+        jobs: list[dict[str, Any]],
+    ) -> list[str]:
+        """
+        Run independent generate jobs concurrently on the pool.
+
+        Each job: {prompt, system?, temperature?, work?, tier?, ...}
+        Dependent pipeline stages must NOT use this.
+        """
+        def _run(job: dict[str, Any]) -> str:
+            return self.generate(
+                str(job.get("prompt") or ""),
+                system=job.get("system"),
+                temperature=float(job.get("temperature") or 0.3),
+                work=str(job.get("work") or ""),
+                tier=job.get("tier"),
+                allow_escalate=bool(job.get("allow_escalate", False)),
+                expect_json=bool(job.get("expect_json", False)),
+                expect_code=bool(job.get("expect_code", False)),
+                escalate_error_only=bool(job.get("escalate_error_only", False)),
+                model=job.get("model"),
+            )
+
+        return list(self.pool.run_parallel(jobs, _run))
 
     @staticmethod
     def _record_model_timing(
@@ -293,15 +411,23 @@ class Brain:
         messages: list[dict[str, str]],
         temperature: float,
         model: str,
+        *,
+        keep_alive: Any = None,
     ) -> str:
+        ka = KEEP_ALIVE_ACTIVE if keep_alive is None else keep_alive
         client = self._get_client()
         if client is not None:
             try:
-                resp = client.chat(
-                    model=model,
-                    messages=messages,
-                    options={"temperature": temperature},
-                )
+                kwargs: dict[str, Any] = {
+                    "model": model,
+                    "messages": messages,
+                    "options": {"temperature": temperature},
+                }
+                # ollama-python accepts keep_alive on chat
+                try:
+                    resp = client.chat(**kwargs, keep_alive=ka)
+                except TypeError:
+                    resp = client.chat(**kwargs)
                 content = resp.get("message", {}).get("content", "")
                 return (content or "").strip()
             except Exception as exc:
@@ -313,17 +439,22 @@ class Brain:
                     except Exception:
                         pass
                     return f"[BRAIN ERROR] Ollama unreachable: {exc}"
-                return self._http_chat(messages, temperature, model=model)
+                return self._http_chat(
+                    messages, temperature, model=model, keep_alive=ka
+                )
 
-        return self._http_chat(messages, temperature, model=model)
+        return self._http_chat(messages, temperature, model=model, keep_alive=ka)
 
     def _http_chat(
         self,
         messages: list[dict[str, str]],
         temperature: float,
         model: Optional[str] = None,
+        *,
+        keep_alive: Any = None,
     ) -> str:
         use_model = model or self.model
+        ka = KEEP_ALIVE_ACTIVE if keep_alive is None else keep_alive
         try:
             import urllib.request
 
@@ -332,6 +463,7 @@ class Brain:
                     "model": use_model,
                     "messages": messages,
                     "stream": False,
+                    "keep_alive": ka,
                     "options": {"temperature": temperature},
                 }
             ).encode("utf-8")
