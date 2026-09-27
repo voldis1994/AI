@@ -774,6 +774,96 @@ class Brain:
             "reason": "Could not parse verification response",
         })
 
+    def judge_learning_coverage(
+        self,
+        user_request: str,
+        knowledge: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Semantically judge whether acquired knowledge answers the USER REQUEST.
+
+        Do NOT require exact keyword/token matches — judge meaning and goal coverage.
+        """
+        system = (
+            "You verify LEARNING results for JARVIS. "
+            "Semantically compare the USER REQUEST to the acquired knowledge. "
+            "Reply ONLY with JSON:\n"
+            "{\n"
+            '  "covers_goal": true|false,\n'
+            '  "confidence": 0.0-1.0,\n'
+            '  "reason": "why it does or does not answer the user goal",\n'
+            '  "missing_aspects": ["semantic gaps, not keywords"],\n'
+            '  "requires_practical_result": true|false,\n'
+            '  "practical_ok": true|false|null,\n'
+            '  "practical_feedback": "..."\n'
+            "}\n"
+            "Rules:\n"
+            "- covers_goal=true only if the knowledge would let the user achieve "
+            "their learning goal (concepts, explanation, practice as asked).\n"
+            "- Do NOT require exact keyword overlap; paraphrases and synonyms count.\n"
+            "- If the user also asked for a concrete answer / worked result / "
+            "computation / demonstration, set requires_practical_result=true and "
+            "judge practical_result inside knowledge.\n"
+            "- If practical result is required but missing or wrong, covers_goal=false.\n"
+            "- No topic hardcoding; stay grounded in THIS request + knowledge."
+        )
+        prompt = (
+            f"USER REQUEST:\n{user_request}\n\n"
+            f"KNOWLEDGE:\n{json.dumps(knowledge, ensure_ascii=False, default=str)[:9000]}"
+        )
+        raw = self.generate(prompt, system=system, temperature=0.1)
+        fallback = {
+            "covers_goal": False,
+            "confidence": 0.0,
+            "reason": "Could not parse learning judgment",
+            "missing_aspects": ["goal_coverage"],
+            "requires_practical_result": False,
+            "practical_ok": None,
+            "practical_feedback": "",
+        }
+        result = self._parse_json(raw, fallback)
+        result["covers_goal"] = bool(result.get("covers_goal"))
+        try:
+            result["confidence"] = float(result.get("confidence") or 0.0)
+        except Exception:
+            result["confidence"] = 0.0
+        if not isinstance(result.get("missing_aspects"), list):
+            result["missing_aspects"] = []
+        return result
+
+    def produce_learning_answer(
+        self,
+        user_request: str,
+        knowledge: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Produce a concrete answer / practical result from acquired knowledge."""
+        system = (
+            "Using the acquired learning knowledge, produce the concrete answer "
+            "or practical result the USER REQUEST asks for. "
+            "Reply ONLY with JSON:\n"
+            '{"answer":"...","result":<string|number|object|null>,'
+            '"explanation":"brief why this satisfies the request"}\n'
+            "Rules:\n"
+            "- If the request includes a computable expression or concrete question, "
+            "put the final value in result and explain briefly.\n"
+            "- Stay grounded in the knowledge + request. Do not invent unrelated topics.\n"
+            "- No skill code or file creation."
+        )
+        prompt = (
+            f"USER REQUEST:\n{user_request}\n\n"
+            f"KNOWLEDGE:\n{json.dumps(knowledge, ensure_ascii=False, default=str)[:8000]}"
+        )
+        raw = self.generate(prompt, system=system, temperature=0.15)
+        parsed = self._parse_json(raw, {
+            "answer": "",
+            "result": None,
+            "explanation": "",
+        })
+        if not isinstance(parsed, dict):
+            return {"answer": "", "result": None, "explanation": "", "source": "brain"}
+        parsed["source"] = "brain"
+        return parsed
+
     # ── Utilities ───────────────────────────────────────────────────────
 
     @staticmethod
