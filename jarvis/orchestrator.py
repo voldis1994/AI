@@ -33,7 +33,7 @@ from jarvis.context_builder import ContextBuilder
 from jarvis.task_goal import TaskGoal
 from jarvis.intent import IntentClassifier
 from jarvis import learning_verify as learn_v
-from jarvis.recovery import ProgressAwareRecovery, MAX_RECOVERY_ATTEMPTS
+from jarvis.recovery import ProgressAwareRecovery
 
 logger = logging.getLogger("jarvis.orchestrator")
 
