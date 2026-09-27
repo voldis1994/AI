@@ -504,6 +504,60 @@ class Memory:
         val = self.get_fact(f"research:{skill_name}")
         return val if isinstance(val, dict) else None
 
+    # ── Topic knowledge (learning requests — NOT tied to a skill) ───────
+
+    def save_topic_knowledge(
+        self,
+        topic: str,
+        research: dict[str, Any],
+        *,
+        goal: str = "",
+        queries: Optional[list] = None,
+        summary: str = "",
+        verified: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Persist knowledge for a learning topic (independent of any skill).
+
+        Keys: knowledge:topic:{slug} (history) and topic:{slug} (latest).
+        """
+        from jarvis.intent import IntentClassifier
+
+        slug = IntentClassifier.topic_slug(topic or goal or "topic")
+        entry = {
+            "ts": time.time(),
+            "topic": topic or slug,
+            "goal": goal,
+            "queries": list(queries or [])[:8],
+            "summary": (summary or research.get("approach") or "")[:4000],
+            "approach": research.get("approach"),
+            "libraries": list(research.get("libraries") or [])[:12],
+            "key_apis": list(research.get("key_apis") or [])[:20],
+            "pitfalls": list(research.get("pitfalls") or [])[:12],
+            "test_idea": research.get("test_idea") or "",
+            "sources": list(research.get("sources") or [])[:12],
+            "result_count": len(research.get("results") or []),
+            "verified": bool(verified),
+        }
+        key = f"knowledge:topic:{slug}"
+        prior = self.get_fact(key) or []
+        if not isinstance(prior, list):
+            prior = [prior]
+        prior.append(entry)
+        prior = prior[-20:]
+        self.set_fact(key, prior, source="learning")
+        self.set_fact(f"topic:{slug}", entry, source="learning")
+        return {"topic": slug, "entry": entry, "history": prior}
+
+    def get_topic_knowledge(self, topic: str, limit: int = 8) -> list[dict[str, Any]]:
+        from jarvis.intent import IntentClassifier
+
+        slug = IntentClassifier.topic_slug(topic)
+        prior = self.get_fact(f"knowledge:topic:{slug}") or []
+        if not isinstance(prior, list):
+            return [prior] if prior else []
+        return list(prior)[-limit:]
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

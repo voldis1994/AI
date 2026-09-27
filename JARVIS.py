@@ -1757,6 +1757,91 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
+    # 4f) E2E: learning request must NOT inherit prior skill (e.g. create_file)
+    print("  — e2e learning intent isolated from prior ACTIVE skills —")
+    try:
+        from jarvis.intent import IntentClassifier
+
+        # Unit: universal classification (no skill-name hardcoding)
+        assert IntentClassifier.classify_offline(
+            "Learn algorithms and create practical tests to verify knowledge"
+        )["intent"] == "learning"
+        assert IntentClassifier.classify_offline(
+            "Iemācies tēmu un izveido praktiskus testus zināšanu pārbaudei"
+        )["intent"] == "learning"
+        assert IntentClassifier.classify_offline(
+            'Create file notes.txt containing "hello"'
+        )["intent"] == "task"
+        assert IntentClassifier.classify_offline("What is recursion?")["intent"] == "conversation"
+        assert IntentClassifier.normalize(
+            {"intent": "task", "needs_capability": True},
+            "Research how caching works",
+        )["intent"] == "learning"
+
+        learn_root = root / "data" / "_e2e_learning_intent"
+        if learn_root.exists():
+            shutil.rmtree(learn_root)
+        learn_root.mkdir(parents=True)
+
+        class OfflineBrain(Brain):
+            def model_status(self) -> str:
+                return "OFFLINE"
+
+            def is_available(self) -> bool:
+                return False
+
+        logs_l: list[str] = []
+        phases_l: list[str] = []
+        orch_l = Orchestrator(
+            root=learn_root,
+            brain=OfflineBrain(),
+            on_log=lambda m: logs_l.append(m),
+            on_status=lambda s: phases_l.append(s),
+        )
+        # Tempt inheritance: ACTIVE unrelated skill already present
+        bait = learn_root / "skills" / "create_file.py"
+        bait.parent.mkdir(parents=True, exist_ok=True)
+        bait.write_text(
+            "SKILL_META={'name':'create_file','description':'create file',"
+            "'capabilities':['create file'],'dependencies':[],'version':27}\n"
+            "def run(context):\n"
+            "    return {'ok': True, 'result': {}, 'error': None, 'evidence': 'x'}\n",
+            encoding="utf-8",
+        )
+        orch_l.registry.register_candidate(
+            "create_file",
+            "create file",
+            str(bait),
+            ["create file"],
+            version=27,
+            protect_active=False,
+        )
+        orch_l.registry.set_status("create_file", "ACTIVE")
+        assert orch_l.registry.get_skill("create_file")["status"] == "ACTIVE"
+
+        req_l = "Learn network basics and create practical tests to verify knowledge"
+        result_l = orch_l.handle_user_message(req_l)
+        assert result_l.get("type") == "learning", result_l
+        assert result_l.get("success"), result_l
+        assert result_l.get("topic"), result_l
+        assert "BUILD_SKILL" not in phases_l, phases_l
+        assert "REPAIR" not in phases_l, phases_l
+        assert not any("generating skill" in m for m in logs_l), logs_l[-30:]
+        assert not any("KNOWLEDGE SAVED: create_file" in m for m in logs_l), logs_l[-30:]
+        assert any("topic:" in m or "LEARNING" in m for m in logs_l), logs_l[-30:]
+        # Topic knowledge saved; skill-bound research for create_file untouched
+        assert orch_l.memory.get_topic_knowledge(result_l["topic"])
+        assert not orch_l.memory.get_research_knowledge("create_file")
+        # create_file must remain untouched at same version
+        assert orch_l.registry.get_skill("create_file")["version"] == 27
+        orch_l.close()
+        print("  OK learning isolated — no skill inherit / no BUILD_SKILL")
+    except Exception as exc:
+        msg = f"E2E_LEARNING_INTENT: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
     # 5) Orchestrator boots + conversation logs must not echo USER/JARVIS replies
     try:
         echoed: list[str] = []
