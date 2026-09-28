@@ -2269,12 +2269,9 @@ class Orchestrator:
             )
             task_goal = task_goal.with_args(args)
             failed_approaches = self.memory.get_failed_approaches(skill_name)
-            layer = TaskGoal.normalize_fault_layer(
-                diagnosis.get("fault_layer") or "skill_code"
-            )
-            diagnosis["fault_layer"] = layer
-            diagnosis["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(layer)
-            # Rewrite skill ONLY when fault_layer is skill_code
+            diagnosis = TaskGoal.apply_rewrite_gate(diagnosis)
+            layer = diagnosis["fault_layer"]
+            # Rewrite skill ONLY when fault_layer is skill_code (evidence-based)
             skip_rebuild = not diagnosis.get("rewrite_skill", False)
             if existing and existing.get("status") == "ACTIVE":
                 protect_active_path = existing.get("file_path")
@@ -2351,7 +2348,7 @@ class Orchestrator:
                     previous_code=last_code,
                     error_log=last_error,
                     protect_active_path=protect_active_path,
-                    diagnosis=diagnosis if (diagnosis or {}).get("rewrite_skill", True) else None,
+                    diagnosis=diagnosis if (diagnosis or {}).get("rewrite_skill", False) else None,
                     failed_approaches=failed_approaches,
                     test_plan=(diagnosis or {}).get("test_plan") if diagnosis else None,
                     user_request=task_goal.user_request,
@@ -2376,7 +2373,7 @@ class Orchestrator:
                 if (
                     built.get("ok")
                     and last_code
-                    and (diagnosis or {}).get("rewrite_skill", True)
+                    and (diagnosis or {}).get("rewrite_skill", False)
                 ):
                     new_fp = Observer.fingerprint_code(str(built.get("code") or ""))
                     old_fp = Observer.fingerprint_code(str(last_code or ""))
@@ -2737,11 +2734,8 @@ class Orchestrator:
             )
             task_goal = task_goal.with_args(args)
             failed_approaches = self.memory.get_failed_approaches(skill_name)
-            layer = TaskGoal.normalize_fault_layer(
-                diagnosis.get("fault_layer") or "skill_code"
-            )
-            diagnosis["fault_layer"] = layer
-            diagnosis["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(layer)
+            diagnosis = TaskGoal.apply_rewrite_gate(diagnosis)
+            layer = diagnosis["fault_layer"]
             # Only rewrite skill when the fault is skill_code → CODING next
             skip_rebuild = not diagnosis.get("rewrite_skill", False)
             if diagnosis.get("prefer_coding") and layer == "skill_code":
@@ -2990,15 +2984,20 @@ class Orchestrator:
             "context_mapping", "environment", "goal_parsing",
         }
         layer_clear = diagnosis.get("fault_layer") in clear_layers
-        ambiguous_skill = (
+        # Evidence-backed VERIFY content mismatch — keep deterministic skill_code
+        evidence_skill = (
             diagnosis.get("fault_layer") == "skill_code"
-            and diagnosis.get("approach") not in ("honor_user_request",)
+            and diagnosis.get("approach") in ("honor_user_request",)
         )
-        if (
-            self.brain.is_available()
-            and not layer_clear
-            and ambiguous_skill
-        ):
+        # Ask brain when attribution is unknown OR skill_code lacks strong evidence
+        needs_brain = (
+            diagnosis.get("fault_layer") == "unknown"
+            or (
+                diagnosis.get("fault_layer") == "skill_code"
+                and not evidence_skill
+            )
+        )
+        if self.brain.is_available() and not layer_clear and needs_brain:
             try:
                 diagnosis = self.brain.diagnose(
                     observation,
@@ -3014,7 +3013,7 @@ class Orchestrator:
             except Exception as exc:
                 self._log(f"DIAGNOSE brain failed ({exc}); using deterministic")
                 diagnosis = self._deterministic_diagnose(observation, task_goal)
-        elif layer_clear:
+        elif layer_clear or evidence_skill:
             self._log(
                 f"DIAGNOSE: deterministic layer={diagnosis.get('fault_layer')} "
                 f"(skipped 30B)"
@@ -3024,12 +3023,7 @@ class Orchestrator:
         diagnosis = ContextBuilder.enrich_diagnosis_args(
             diagnosis, observation, goal, user_request=task_goal.user_request
         )
-        diagnosis["fault_layer"] = TaskGoal.normalize_fault_layer(
-            diagnosis.get("fault_layer")
-        )
-        diagnosis["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(
-            diagnosis["fault_layer"]
-        )
+        diagnosis = TaskGoal.apply_rewrite_gate(diagnosis)
 
         # If diagnosis repeats a failed approach fingerprint — force divergence
         # (but never force-rewrite context_mapping / non-skill layers)
@@ -3078,10 +3072,8 @@ class Orchestrator:
             if isinstance(f.get("observation"), dict)
         ]
         similar_count = Observer.count_similar_errors(observation, prior_obs)
-        layer_now = TaskGoal.normalize_fault_layer(
-            diagnosis.get("fault_layer") or "skill_code"
-        )
-        diagnosis["fault_layer"] = layer_now
+        diagnosis = TaskGoal.apply_rewrite_gate(diagnosis)
+        layer_now = diagnosis["fault_layer"]
         diagnosis["error_fingerprint"] = observation.get("error_fingerprint")
         diagnosis["similar_failure_count"] = similar_count
 
@@ -3178,6 +3170,14 @@ class Orchestrator:
             self._log(
                 f"[{task_id}] STAGNATION: signature={fail_sig} — "
                 f"force new CODING approach (no identical cycle)"
+            )
+        elif decision.force_new_approach and layer_now != "skill_code":
+            # Stagnation on non-skill layers must NOT promote unknown→skill_code
+            diagnosis["rewrite_skill"] = False
+            diagnosis["approach_changed"] = True
+            self._log(
+                f"[{task_id}] STAGNATION: signature={fail_sig} layer={layer_now} — "
+                f"no skill rewrite without skill_code evidence"
             )
 
         if decision.stop:
@@ -3627,6 +3627,17 @@ class Orchestrator:
         env_fault = any(
             t in err_l for t in ("modulenotfound", "no module named", "importerror")
         )
+        tb = str(observation.get("traceback") or "")
+        skill_runtime = phase in ("TEST", "RETEST", "EXECUTE") and (
+            bool(tb.strip())
+            or any(
+                t in err_l
+                for t in (
+                    "runtime error", "syntaxerror", "nameerror",
+                    "attributeerror", "typeerror", "indentationerror",
+                )
+            )
+        )
         if no_constraints and empty_args:
             layer = "goal_parsing"
             approach = "goal_parsing_repair"
@@ -3642,17 +3653,28 @@ class Orchestrator:
             layer = "environment"
             approach = "fix_environment"
             change = "Install / fix missing dependencies"
-        elif goal_mismatch or content_fail:
+        elif goal_mismatch or content_fail or skill_runtime:
+            # Evidence-backed skill_code only (VERIFY content / skill traceback)
             layer = "skill_code"
-            approach = "honor_user_request"
+            approach = (
+                "honor_user_request"
+                if (goal_mismatch or content_fail)
+                else f"offline_alt_v{int(observation.get('version') or 0) + 1}"
+            )
             change = (
                 "Rewrite skill to satisfy original TaskGoal "
                 "(no default/placeholder artifacts; honor content requirements)"
+                if (goal_mismatch or content_fail)
+                else "Revise skill logic based on stderr/traceback evidence"
             )
         else:
-            layer = "skill_code"
-            approach = f"offline_alt_v{int(observation.get('version') or 0) + 1}"
-            change = "Rebuild with a different strategy using observation data"
+            # Insufficient evidence — never invent skill_code / rewrite
+            layer = "unknown"
+            approach = "investigate_fault"
+            change = (
+                "Insufficient evidence for skill_code — observe further; "
+                "do not rewrite skill"
+            )
         layer = TaskGoal.normalize_fault_layer(layer)
         rewrite = TaskGoal.rewrite_skill_for_layer(layer)
         diagnosis = {

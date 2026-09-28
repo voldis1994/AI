@@ -970,8 +970,11 @@ class Brain:
             "Reply ONLY with JSON:\n"
             "{\n"
             '  "root_cause": "...",\n'
-            '  "fault_layer": "goal_parsing"|"context_mapping"|"skill_code"|"execution"|"environment"|"verifier",\n'
+            '  "fault_layer": "goal_parsing"|"context_mapping"|"skill_code"|"execution"|"environment"|"verifier"|"unknown",\n'
             '  "rewrite_skill": true|false,\n'
+            "IMPORTANT: use fault_layer=skill_code and rewrite_skill=true ONLY with clear "
+            "evidence the skill body is wrong. If unsure, use fault_layer=unknown and "
+            "rewrite_skill=false — never invent skill_code.\n"
             '  "what_to_change": "...",\n'
             '  "approach": "short label of the NEW strategy to try",\n'
             '  "approach_changed": true|false,\n'
@@ -1093,7 +1096,8 @@ class Brain:
         elif goal_mismatch:
             fb_layer = "skill_code"
         else:
-            fb_layer = "skill_code"
+            # No clear evidence — do not invent skill_code
+            fb_layer = "unknown"
         fb_layer = TaskGoal.normalize_fault_layer(fb_layer)
         fallback = {
             "root_cause": str(observation.get("exception") or "unknown")[:500],
@@ -1115,7 +1119,11 @@ class Brain:
                             else (
                                 "Fix execution/harness context passing"
                                 if fb_layer == "execution"
-                                else "Revise skill logic based on stderr/traceback"
+                                else (
+                                    "Insufficient evidence — do not rewrite skill"
+                                    if fb_layer == "unknown"
+                                    else "Revise skill logic based on stderr/traceback"
+                                )
                             )
                         )
                     )
@@ -1130,7 +1138,11 @@ class Brain:
                     else (
                         "honor_user_request"
                         if goal_mismatch
-                        else f"alt_approach_v{(observation.get('version') or 0) + 1}"
+                        else (
+                            "investigate_fault"
+                            if fb_layer == "unknown"
+                            else f"alt_approach_v{(observation.get('version') or 0) + 1}"
+                        )
                     )
                 )
             ),
@@ -1152,16 +1164,16 @@ class Brain:
             "diagnosis": str(observation.get("exception") or "failure")[:500],
         }
         result = self._parse_json(raw, fallback)
-        # Normalize fault_layer (canonical + legacy aliases)
+        # Normalize fault_layer — unknown/unrecognized stay unknown (not skill_code)
         layer = TaskGoal.normalize_fault_layer(
             result.get("fault_layer") or fallback["fault_layer"]
         )
-        # Force skill rewrite when VERIFY proves goal mismatch / defaults
+        # Force skill rewrite ONLY when VERIFY proves goal mismatch / defaults
         # with already-grounded args (not a context mapping problem).
         if goal_mismatch:
             layer = "skill_code"
         result["fault_layer"] = layer
-        result["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(layer)
+        result = TaskGoal.apply_rewrite_gate(result)
         if not isinstance(result.get("suggested_args"), dict):
             result["suggested_args"] = {}
         if not isinstance(result.get("missing_args"), list):
@@ -1179,13 +1191,10 @@ class Brain:
             str(observation.get("goal") or ""),
             user_request=request,
         )
-        layer = TaskGoal.normalize_fault_layer(
-            result.get("fault_layer") or layer
-        )
         if goal_mismatch and layer not in ("context_mapping", "goal_parsing"):
             layer = "skill_code"
-        result["fault_layer"] = layer
-        result["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(layer)
+            result["fault_layer"] = layer
+        result = TaskGoal.apply_rewrite_gate(result)
 
         # Enforce approach change when fingerprint collided with failed list
         failed_fps = {

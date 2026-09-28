@@ -53,6 +53,7 @@ _STOP = {
 }
 
 # Canonical DIAGNOSE layers (legacy aliases accepted + normalized).
+# "unknown" = unrecognized / insufficient evidence — NEVER treated as skill_code.
 FAULT_LAYERS = frozenset({
     "goal_parsing",
     "context_mapping",
@@ -60,11 +61,17 @@ FAULT_LAYERS = frozenset({
     "execution",
     "environment",
     "verifier",
+    "unknown",
 })
 _LEGACY_LAYER = {
     "context_args": "context_mapping",
     "test_harness": "execution",
     "dependency": "environment",
+    "unknown": "unknown",
+    "unrecognized": "unknown",
+    "none": "unknown",
+    "null": "unknown",
+    "": "unknown",
 }
 
 # Action verbs used only to label high-level actions (not as args).
@@ -151,16 +158,44 @@ class TaskGoal:
 
     @staticmethod
     def normalize_fault_layer(layer: Any) -> str:
-        raw = str(layer or "skill_code").strip().lower()
+        """
+        Map diagnosis fault_layer to a canonical value.
+
+        Missing / UNKNOWN / unrecognized layers stay ``unknown``.
+        They must NEVER silently become ``skill_code`` (no rewrite without evidence).
+        """
+        if layer is None:
+            return "unknown"
+        raw = str(layer).strip().lower()
+        if not raw or raw in ("none", "null", "unknown", "unrecognized", "?"):
+            return "unknown"
         raw = _LEGACY_LAYER.get(raw, raw)
         if raw not in FAULT_LAYERS:
-            return "skill_code"
+            return "unknown"
         return raw
 
     @classmethod
     def rewrite_skill_for_layer(cls, layer: Any) -> bool:
-        """Skill rewrite is allowed ONLY when the fault is skill_code."""
+        """
+        Skill rewrite allowed ONLY for an explicit skill_code attribution.
+
+        unknown / unrecognized / other layers → False (never auto-rewrite).
+        """
         return cls.normalize_fault_layer(layer) == "skill_code"
+
+    @classmethod
+    def apply_rewrite_gate(cls, diagnosis: Optional[dict[str, Any]]) -> dict[str, Any]:
+        """
+        Normalize fault_layer; rewrite_skill=True only for skill_code.
+
+        Diagnosers must attribute skill_code only with evidence. unknown /
+        unrecognized layers never unlock a skill rewrite.
+        """
+        out = dict(diagnosis or {})
+        layer = cls.normalize_fault_layer(out.get("fault_layer"))
+        out["fault_layer"] = layer
+        out["rewrite_skill"] = layer == "skill_code"
+        return out
 
     # ── Grounding helpers (universal) ───────────────────────────────────
 
