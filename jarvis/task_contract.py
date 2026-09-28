@@ -1824,7 +1824,7 @@ class TaskContract:
         regenerate: bool = True,
     ) -> list[str]:
         """
-        Keep only TaskGoal-grounded queries; regenerate from TaskContract on total drift.
+        Keep only TaskContract-grounded queries; regenerate from TaskContract on total drift.
         """
         raw = [str(q).strip() for q in (queries or []) if str(q).strip()]
         kept = [q for q in raw if self.query_is_grounded(q)]

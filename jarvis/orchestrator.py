@@ -1763,8 +1763,8 @@ class Orchestrator:
                 "Plan created",
                 {
                     **plan,
-                    "task_goal_subject": contract.subject,
-                    "task_goal_content_source": list(contract.content_source),
+                    "contract_subject": contract.subject,
+                    "contract_content_source": list(contract.content_source),
                 },
             )
             self._log(
