@@ -138,10 +138,29 @@ def derive_required_outcomes(
     out: list[str] = []
     cons = constraints or {}
     hint = requirements_hint or {}
+    arts = [str(a) for a in (artifacts or ()) if str(a).strip()]
+    beh = list(behaviors or ())
+    http = list(cons.get("http") or [])
 
     def _add(kind: str) -> None:
         if kind and kind not in out:
             out.append(kind)
+
+    # Practical learning results (e.g. compute 12+5 during LEARN) are verified
+    # inside the learning stage — they must not force a parallel skill lifecycle
+    # when there is no artifact/network side effect.
+    practical_learning_beh = bool(
+        hint.get("needs_learning")
+        and not arts
+        and not http
+        and not cons.get("files")
+        and beh
+        and all(
+            isinstance(b, dict)
+            and str(b.get("kind") or "").startswith("skill_result_")
+            for b in beh
+        )
+    )
 
     # Explicit draft / semantic outcomes (already grounded upstream)
     for raw in draft_outcomes or ():
@@ -154,31 +173,29 @@ def derive_required_outcomes(
         elif s.startswith("artifact"):
             _add(OUTCOME_ARTIFACT)
         elif s.startswith("behavior") or s.startswith("skill_"):
-            _add(OUTCOME_EXECUTION)
+            if not practical_learning_beh:
+                _add(OUTCOME_EXECUTION)
         elif s.startswith("http") or s.startswith("content"):
-            _add(OUTCOME_ARTIFACT if artifacts else OUTCOME_SIDE_EFFECT)
+            _add(OUTCOME_ARTIFACT if arts else OUTCOME_SIDE_EFFECT)
         elif s.startswith("learning") or s.startswith("knowledge"):
             _add(OUTCOME_LEARNING)
 
-    arts = [str(a) for a in (artifacts or ()) if str(a).strip()]
     if arts or cons.get("files") or cons.get("directories"):
         _add(OUTCOME_ARTIFACT)
         _add(OUTCOME_EXECUTION)
         _add(OUTCOME_TEST)
         _add(OUTCOME_CAPABILITY)
 
-    beh = list(behaviors or ())
-    if beh:
+    if beh and not practical_learning_beh:
         _add(OUTCOME_EXECUTION)
         _add(OUTCOME_TEST)
         _add(OUTCOME_CAPABILITY)
 
-    http = cons.get("http") or []
     if http or any(
         str(s).startswith("network") for s in (side_effects or ())
     ):
         _add(OUTCOME_SIDE_EFFECT)
-        if not arts:
+        if not arts and not practical_learning_beh:
             _add(OUTCOME_EXECUTION)
             _add(OUTCOME_CAPABILITY)
 
@@ -241,7 +258,8 @@ def derive_required_outcomes(
         elif low.startswith("http_"):
             _add(OUTCOME_SIDE_EFFECT)
         elif low.startswith("skill_") or low.startswith("behavior"):
-            _add(OUTCOME_EXECUTION)
+            if not practical_learning_beh:
+                _add(OUTCOME_EXECUTION)
         elif "knowledge" in low or low.startswith("learning"):
             _add(OUTCOME_LEARNING)
         elif low.startswith("final_output"):

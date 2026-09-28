@@ -930,22 +930,27 @@ def run(context: dict) -> dict:
         assert any(
             s.startswith("skill_result_equals:4") for s in tg_arith.acceptance_criteria
         ), tg_arith.acceptance_criteria
-        # Truly unverifiable request → needs_refine (must not continue empty)
+        # Soft prose alone → conversation outcome (not a capability BUILD).
+        # Capability hint without concrete criteria → needs_refine / BUILD refuse.
         tg_soft = TaskContract.from_request("Be helpful please")
-        assert tg_soft.needs_refine(), tg_soft.acceptance_criteria
-        assert tg_soft.acceptance_criteria == ("needs_refine",)
-        tg_soft_r = TaskContract.refine(tg_soft)
-        assert tg_soft_r.needs_refine()
-        assert tg_soft_r.acceptance_criteria == ("needs_refine",)
+        assert tg_soft.requires("conversation"), tg_soft.required_outcomes
+        assert not tg_soft.needs_refine(), tg_soft.acceptance_criteria
+        tg_soft_cap = TaskContract.understand("Be helpful please").with_requirements_hint(
+            {"intent": "task", "needs_capability": True}
+        )
+        tg_soft_cap = TaskContract.validate(tg_soft_cap)
+        assert tg_soft_cap.needs_refine() or not tg_soft_cap.is_verifiable(), (
+            tg_soft_cap.to_dict()
+        )
         soft_res = soft_v.verify(
-            tg_soft_r.original_request,
+            tg_soft_cap.original_request,
             {
                 "ok": True,
                 "result": {"says": "sure"},
                 "evidence": "I was helpful",
                 "returncode": 0,
             },
-            contract=tg_soft_r,
+            contract=tg_soft_cap,
         )
         assert not soft_res.get("verified"), soft_res
         assert "needs_refine" in (soft_res.get("reason") or "") or any(
@@ -4724,14 +4729,16 @@ def run(context: dict) -> dict:
         assert canonicalize_layer("implementation") == LAYER_TOOL
         assert LAYER_CAPABILITY and LAYER_KNOWLEDGE and LAYER_EXPERIENCE
         assert "commit=" in _fp_line()
-        # Soft prose alone is conversation — BUILD refuse needs capability outcomes
-        # without concrete criteria (needs_capability hint without artifacts).
-        soft_c = _TGSC.from_request("Be helpful please")
+        # Soft prose alone is conversation. Capability hint without concrete
+        # criteria → needs_refine; BUILD must refuse (hint before VALIDATE).
+        soft_c = _TGSC.understand("Be helpful please")
         assert soft_c.requires("conversation") or soft_c.intent == "conversation"
         soft_cap = soft_c.with_requirements_hint(
             {"intent": "task", "needs_capability": True}
         )
+        assert soft_cap.requires_capability_stages(), soft_cap.required_outcomes
         soft_cap = _TGSC.validate(soft_cap)
+        assert soft_cap.needs_refine() or not soft_cap.is_verifiable(), soft_cap.to_dict()
         try:
             _assert_build(soft_cap)
             raise AssertionError("BUILD must refuse unverifiable capability contract")
