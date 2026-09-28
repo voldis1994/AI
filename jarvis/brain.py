@@ -39,6 +39,19 @@ _CONN_FAIL_MARKERS = (
     "ollama unreachable",
 )
 
+# Ollama llama-server / runner hard crashes (Windows 0xe06d7363 etc.)
+_RUNNER_CRASH_MARKERS = (
+    "llama-server",
+    "0xe06d7363",
+    "runner process has terminated",
+    "process has terminated",
+    "exit status 0xe0",
+    "forcibly closed by the remote host",
+    "wsarecv",
+    "eof",
+    "broken pipe",
+)
+
 
 def _is_connection_failure(exc: Any) -> bool:
     if isinstance(
@@ -55,6 +68,19 @@ def _is_connection_failure(exc: Any) -> bool:
     msg = str(exc).lower()
     # urllib wraps OSError / URLError — match message markers
     return any(m in msg for m in _CONN_FAIL_MARKERS)
+
+
+def _is_runner_crash(exc: Any) -> bool:
+    """True when Ollama's llama-server/runner died (not a simple offline)."""
+    msg = str(exc or "").lower()
+    if not msg:
+        return False
+    if any(m in msg for m in _RUNNER_CRASH_MARKERS):
+        return True
+    # HTTP 500 from Ollama often wraps runner death
+    if "500" in msg and ("llama" in msg or "runner" in msg or "terminated" in msg):
+        return True
+    return False
 
 
 class Brain:
@@ -268,6 +294,47 @@ class Brain:
             ok=not str(text).startswith("[BRAIN ERROR]"),
             warm=decision.warm,
         )
+        # Runner crash (llama-server 0xe06d7363 etc.): skip model, retry next installed
+        if (
+            not self._force_single_model
+            and str(text).startswith("[BRAIN ERROR]")
+            and _is_runner_crash(text)
+        ):
+            try:
+                self.pool.mark_model_failed(decision.model, str(text)[:160])
+            except Exception:
+                pass
+            retry = self.pool.acquire(
+                work=work_key_name,
+                tier=decision.tier,
+                ensure_warm=True,
+            )
+            if retry.model != decision.model:
+                self.on_log(
+                    f"MODEL RETRY: {decision.tier} {decision.model} crashed → "
+                    f"{retry.model}"
+                )
+                t_r = time.perf_counter()
+                self.pool.mark_in_flight(retry.model, +1)
+                try:
+                    text_r = self._chat_on_model(
+                        full,
+                        temperature,
+                        retry.model,
+                        keep_alive=self.pool.keep_alive_for(retry.model),
+                    )
+                finally:
+                    self.pool.mark_in_flight(retry.model, -1)
+                self._record_model_timing(
+                    work=work or decision.work,
+                    tier=retry.tier,
+                    model=retry.model,
+                    ms=(time.perf_counter() - t_r) * 1000.0,
+                    ok=not str(text_r).startswith("[BRAIN ERROR]"),
+                    retried_after_crash=True,
+                )
+                decision = retry
+                text = text_r
         if ctx is not None:
             ctx.put(dedupe_key, text, decision)
 
@@ -278,6 +345,7 @@ class Brain:
             error_only=escalate_error_only,
         ):
             # Connection failures: do not burn another 30B / HTTP timeout
+            # (runner crashes already retried above with a different model)
             if text.startswith("[BRAIN ERROR]") and _is_connection_failure(text):
                 try:
                     self.router.invalidate_cache()

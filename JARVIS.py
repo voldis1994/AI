@@ -3187,6 +3187,8 @@ def run(context: dict) -> dict:
         assert TIER_MODELS[TIER_CODING]["primary"] == "qwen3-coder:30b"
         assert "qwen2.5-coder:7b" in models_for_tier(TIER_CODING)
         assert "qwen2.5-coder:7b" in models_for_tier(TIER_FAST)
+        assert "qwen3:8b" in models_for_tier(TIER_FAST)
+        assert "qwen3:8b" in models_for_tier(TIER_REASONING)
 
         route_logs: list[str] = []
         preloaded: list[str] = []
@@ -3251,7 +3253,30 @@ def run(context: dict) -> dict:
         d_code2 = pool.acquire(work="code_repair", ensure_warm=False)
         assert d_code2.tier == TIER_CODING and d_code2.model == "qwen3-coder:30b"
 
+        # Auto-select from what the user actually pulled (8b + coder 7b, no 30b)
+        installed = ["qwen3:8b", "qwen2.5-coder:7b"]
+        pool.clear_model_failures()
+        pool.invalidate_cache()
+        pool.initialize(warm=False)
+        route_logs.clear()
+        d8_fast = pool.acquire(work="intent", ensure_warm=False)
+        assert d8_fast.model == "qwen3:8b", d8_fast
+        d8_reason = pool.acquire(work="diagnose", ensure_warm=False)
+        assert d8_reason.model == "qwen3:8b", d8_reason
+        d8_code = pool.acquire(work="skill_code", ensure_warm=False)
+        assert d8_code.model == "qwen2.5-coder:7b", d8_code
+        # Crashed primary → skip and pick next installed
+        pool.mark_model_failed("qwen3:8b", "llama-server 0xe06d7363")
+        pool.invalidate_cache()
+        d_skip = pool.acquire(work="diagnose", ensure_warm=False)
+        assert d_skip.model == "qwen2.5-coder:7b", d_skip
+        assert any("MODEL SKIP:" in m for m in route_logs), route_logs
+        pool.clear_model_failures()
+
         # Escalation only when prior insufficient
+        installed = ["qwen3:4b", "qwen3:30b", "qwen3-coder:30b", "qwen2.5-coder:7b"]
+        pool.invalidate_cache()
+        pool.initialize(warm=False)
         route_logs.clear()
         esc = pool.escalate(TIER_FAST, work="intent")
         assert esc is not None and esc.tier == TIER_REASONING
