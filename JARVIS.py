@@ -35,10 +35,28 @@ except ModuleNotFoundError:  # pragma: no cover
     tk = None  # type: ignore
     scrolledtext = None  # type: ignore
 
-# Ensure project root is on sys.path
+# Ensure project root is on sys.path — APPEND, never insert(0).
+# insert(0) lets a local folder/file named ``ollama`` (or other deps) shadow
+# the installed site-packages module and yields: No module named 'ollama'.
 ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+_root_s = str(ROOT)
+if _root_s in sys.path:
+    try:
+        sys.path.remove(_root_s)
+    except ValueError:
+        pass
+sys.path.append(_root_s)
+# Warn if a local path would still shadow the real Ollama Python package
+_shadow = ROOT / "ollama"
+if _shadow.exists():
+    import warnings
+
+    warnings.warn(
+        f"Local path {_shadow} may shadow the installed 'ollama' package — "
+        "rename/remove it if imports fail.",
+        RuntimeWarning,
+        stacklevel=1,
+    )
 
 (ROOT / "data").mkdir(exist_ok=True)
 (ROOT / "skills").mkdir(exist_ok=True)
@@ -2053,6 +2071,98 @@ def run(context: dict) -> dict:
         print("  OK learning isolated — no skill inherit / no BUILD_SKILL")
     except Exception as exc:
         msg = f"E2E_LEARNING_INTENT: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 4g0) E2E: learn topic A then topic B — must NOT reuse A's MEMORY / gap-fill A
+    print("  — e2e learning topic isolation (A then B, no sticky MEMORY) —")
+    try:
+        from jarvis.intent import IntentClassifier as _ICTopic
+        from jarvis.task_contract import TaskContract as _TCIso
+
+        iso_root = root / "data" / "_e2e_learning_topic_iso"
+        if iso_root.exists():
+            shutil.rmtree(iso_root)
+        iso_root.mkdir(parents=True)
+
+        class _IsoBrain(Brain):
+            def model_status(self) -> str:
+                return "OFFLINE"
+
+            def is_available(self) -> bool:
+                return False
+
+        # Unicode / Latvian topics must stay distinct MEMORY keys
+        mt_v = _TCIso.from_request("iemācies vīns").memory_topic()
+        mt_o = _TCIso.from_request("iemācies optiku un refrakciju").memory_topic()
+        assert mt_v != mt_o, (mt_v, mt_o)
+        assert "vīn" in mt_v or "vins" in mt_v.replace("ī", "i"), mt_v
+        assert "optik" in mt_o or "refrak" in mt_o, mt_o
+        assert _ICTopic.topic_slug("vīns") == "vīns"
+
+        logs_a: list[str] = []
+        orch_a = Orchestrator(
+            root=iso_root,
+            brain=_IsoBrain(),
+            on_log=lambda m: logs_a.append(m),
+        )
+        req_a = "Learn thermodynamics basics and create practical tests to verify knowledge"
+        res_a = orch_a.handle_user_message(req_a)
+        assert res_a.get("success"), res_a
+        topic_a = str(res_a.get("topic") or "")
+        assert topic_a, res_a
+        slug_a = _ICTopic.topic_slug(topic_a)
+        assert "thermodynamic" in slug_a, slug_a
+        assert orch_a.memory.get_topic_knowledge(topic_a), topic_a
+        orch_a.close()
+
+        logs_b: list[str] = []
+        orch_b = Orchestrator(
+            root=iso_root,  # same MEMORY DB as A
+            brain=_IsoBrain(),
+            on_log=lambda m: logs_b.append(m),
+        )
+        req_b = "Learn optics refraction basics and create practical tests to verify knowledge"
+        res_b = orch_b.handle_user_message(req_b)
+        assert res_b.get("success"), res_b
+        topic_b = str(res_b.get("topic") or "")
+        assert topic_b, res_b
+        slug_b = _ICTopic.topic_slug(topic_b)
+        assert slug_a != slug_b, (slug_a, slug_b)
+        assert "optic" in slug_b or "refract" in slug_b, slug_b
+        # Must not skip research by reusing A's verified blob for B
+        assert not any(
+            "MEMORY USED: verified knowledge for topic:" in m
+            and "skip full research" in m
+            and ("thermodynamic" in m.lower() or slug_a[:12] in m)
+            for m in logs_b
+        ), [m for m in logs_b if "MEMORY" in m]
+        # Exact-only retrieval — related hints OK, but verified seed must be B
+        assert any("exact_only=True" in m for m in logs_b), [
+            m for m in logs_b if "MEMORY RETRIEVAL" in m
+        ]
+        assert any(
+            "verified=0" in m or "entries=0" in m
+            for m in logs_b
+            if "MEMORY RETRIEVAL" in m
+        ), [m for m in logs_b if "MEMORY RETRIEVAL" in m]
+        # B's saved knowledge must not be dominated by A's topic string
+        hist_b = orch_b.memory.get_topic_knowledge(topic_b, limit=3)
+        assert hist_b, topic_b
+        blob_b = " ".join(
+            str(hist_b[-1].get(k) or "")
+            for k in ("topic", "summary", "goal")
+        ).lower()
+        assert "optic" in blob_b or "refract" in blob_b or "optics" in topic_b.lower(), (
+            topic_b,
+            blob_b[:200],
+        )
+        assert "thermodynamic" not in blob_b, blob_b[:200]
+        orch_b.close()
+        print("  OK learning topic isolation — A≠B; no sticky MEMORY reuse")
+    except Exception as exc:
+        msg = f"E2E_LEARNING_TOPIC_ISO: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)

@@ -672,6 +672,16 @@ class Memory:
             ).fetchall()
         return [str(r["key"]) for r in rows]
 
+    @staticmethod
+    def entry_topic_slug(entry: dict[str, Any]) -> str:
+        """Canonical slug for a stored knowledge entry's topic field."""
+        from jarvis.intent import IntentClassifier
+
+        if not isinstance(entry, dict):
+            return ""
+        raw = str(entry.get("topic") or "").strip()
+        return IntentClassifier.topic_slug(raw) if raw else ""
+
     def retrieve_relevant_knowledge(
         self,
         query: str,
@@ -679,19 +689,22 @@ class Memory:
         topic: str = "",
         limit: int = 6,
         verified_only: bool = False,
+        exact_topic_only: bool = False,
     ) -> dict[str, Any]:
         """
         MEMORY RETRIEVAL — find prior topic knowledge relevant to this request.
 
-        Scores exact topic slug first, then related topics via soft_relatedness.
-        Returns entries newest-first within score tiers.
+        Scores exact topic slug first. Cross-topic soft hits are optional hints
+        only — LEARN must pass ``exact_topic_only=True`` so a prior subject
+        cannot seed gap-fill / skip-research for a new request.
         """
         from jarvis import learning_verify as lv
         from jarvis.intent import IntentClassifier
 
         q = (query or "").strip()
         topic_slug = IntentClassifier.topic_slug(topic or q or "topic")
-        hits: list[tuple[float, dict[str, Any]]] = []
+        exact_hits: list[tuple[float, dict[str, Any]]] = []
+        related_hits: list[tuple[float, dict[str, Any]]] = []
 
         # 1) Exact topic history
         for e in self.get_topic_knowledge(topic_slug, limit=12):
@@ -707,56 +720,84 @@ class Memory:
                 ]
             )
             rel = lv.soft_relatedness(q, blob) if q else 0.5
-            hits.append((1.0 + rel, dict(e)))
+            row = dict(e)
+            row["_topic_match"] = "exact"
+            exact_hits.append((1.0 + rel, row))
 
-        # 2) Other topic stores (related subjects)
-        for key in self.list_topic_knowledge_keys():
-            if key == f"knowledge:topic:{topic_slug}":
-                continue
-            prior = self.get_fact(key) or []
-            if not isinstance(prior, list):
-                prior = [prior] if prior else []
-            for e in prior[-6:]:
-                if not isinstance(e, dict):
+        # 2) Other topic stores — never used as LEARN verified seed
+        if not exact_topic_only:
+            for key in self.list_topic_knowledge_keys():
+                if key == f"knowledge:topic:{topic_slug}":
                     continue
-                if verified_only and not e.get("verified"):
-                    continue
-                blob = " ".join(
-                    [
-                        str(e.get("topic") or ""),
-                        str(e.get("summary") or ""),
-                        str(e.get("goal") or ""),
-                        " ".join(str(x) for x in (e.get("concepts") or [])[:8]),
-                    ]
-                )
-                rel = lv.soft_relatedness(q, blob) if q else 0.0
-                if rel < 0.18:
-                    continue
-                hits.append((rel, dict(e)))
+                prior = self.get_fact(key) or []
+                if not isinstance(prior, list):
+                    prior = [prior] if prior else []
+                for e in prior[-6:]:
+                    if not isinstance(e, dict):
+                        continue
+                    if verified_only and not e.get("verified"):
+                        continue
+                    # Require strong overlap — weak 0.18 shared "learn/basics"
+                    # was the topic-A→topic-B stickiness bug.
+                    blob = " ".join(
+                        [
+                            str(e.get("topic") or ""),
+                            str(e.get("summary") or ""),
+                            str(e.get("goal") or ""),
+                            " ".join(str(x) for x in (e.get("concepts") or [])[:8]),
+                        ]
+                    )
+                    rel = lv.soft_relatedness(q, blob) if q else 0.0
+                    if rel < 0.42:
+                        continue
+                    row = dict(e)
+                    row["_topic_match"] = "related"
+                    related_hits.append((rel, row))
 
-        hits.sort(key=lambda x: -x[0])
-        # Dedupe by (topic, summary prefix)
-        out: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for score, e in hits:
-            sig = f"{e.get('topic')}|{str(e.get('summary') or '')[:80]}"
-            if sig in seen:
-                continue
-            seen.add(sig)
-            e = dict(e)
-            e["_retrieval_score"] = round(float(score), 4)
-            out.append(e)
-            if len(out) >= limit:
-                break
+        exact_hits.sort(key=lambda x: -x[0])
+        related_hits.sort(key=lambda x: -x[0])
 
-        verified = [e for e in out if e.get("verified")]
+        def _dedupe(rows: list[tuple[float, dict[str, Any]]], cap: int) -> list[dict]:
+            out: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for score, e in rows:
+                sig = f"{e.get('topic')}|{str(e.get('summary') or '')[:80]}"
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                e = dict(e)
+                e["_retrieval_score"] = round(float(score), 4)
+                out.append(e)
+                if len(out) >= cap:
+                    break
+            return out
+
+        exact_entries = _dedupe(exact_hits, limit)
+        related_entries = _dedupe(related_hits, limit)
+        # Primary ``entries`` / ``verified`` = exact topic only (safe for LEARN)
+        entries = list(exact_entries)
+        if not exact_topic_only:
+            for e in related_entries:
+                if len(entries) >= limit:
+                    break
+                sig = f"{e.get('topic')}|{str(e.get('summary') or '')[:80]}"
+                if any(
+                    f"{x.get('topic')}|{str(x.get('summary') or '')[:80]}" == sig
+                    for x in entries
+                ):
+                    continue
+                entries.append(e)
+
+        verified = [e for e in exact_entries if e.get("verified")]
         return {
             "query": q,
             "topic": topic_slug,
-            "entries": out,
+            "entries": entries,
             "verified": verified,
-            "count": len(out),
+            "related": related_entries,
+            "count": len(entries),
             "verified_count": len(verified),
+            "exact_topic_only": bool(exact_topic_only),
         }
 
     def close(self) -> None:
