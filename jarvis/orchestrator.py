@@ -502,14 +502,15 @@ class Orchestrator:
         user_request = (original_request or goal or "").strip()
         task_goal = TaskGoal.from_request(user_request, goal=goal)
         goal = task_goal.goal
-        topic = IntentClassifier.topic_slug(goal)
+        # Subject/topic from TaskGoal — never invent a disambiguated sense
+        topic = task_goal.memory_topic()
         learn_key = f"learning:{topic}"
         request_id = uuid.uuid4().hex[:12]
         task_id = self.ledger.start_task(goal)
         self._status("REQUEST")
         self._log(
             f"[{task_id}] REQUEST (learning): {task_goal.user_request} "
-            f"request_id={request_id}"
+            f"subject={task_goal.subject!r} request_id={request_id}"
         )
         self.ledger.log(
             task_id,
@@ -524,7 +525,7 @@ class Orchestrator:
         )
 
         try:
-            # ── MEMORY RETRIEVAL (before any SEARCH) ────────────────────
+            # ── MEMORY RETRIEVAL by TaskGoal.subject (before any SEARCH) ─
             self._status("MEMORY")
             retrieved = self.memory.retrieve_relevant_knowledge(
                 task_goal.user_request,
@@ -534,6 +535,8 @@ class Orchestrator:
             )
             self._log(
                 f"MEMORY RETRIEVAL: topic={topic} "
+                f"subject={task_goal.subject!r} "
+                f"content_source={list(task_goal.content_source)!r} "
                 f"entries={retrieved.get('count', 0)} "
                 f"verified={retrieved.get('verified_count', 0)} "
                 f"request_id={request_id}"
@@ -1553,28 +1556,40 @@ class Orchestrator:
         self._log_request_items(task_id, task_goal)
 
         try:
-            # MEMORY first — reuse verified knowledge before PLAN/RESEARCH
+            # MEMORY first — retrieve by TaskGoal.subject/topic before PLAN/RESEARCH
             self.perf.begin("MEMORY")
             self._status("MEMORY")
+            mem_topic = task_goal.memory_topic()
             mem_pack = (
                 self.memory.retrieve_relevant_knowledge(
-                    task_goal.user_request, limit=6
+                    task_goal.user_request,
+                    topic=mem_topic,
+                    limit=6,
                 )
                 if hasattr(self.memory, "retrieve_relevant_knowledge")
-                else {"entries": [], "verified": []}
+                else {"entries": [], "verified": [], "topic": mem_topic}
             )
             mem_hits = list(
                 (mem_pack or {}).get("entries")
                 or (mem_pack or {}).get("verified")
                 or []
             )
+            mem_verified = list((mem_pack or {}).get("verified") or [])
             self._request_cache["memory_hits"] = mem_pack
             if mem_hits:
                 self._log(
-                    f"[{task_id}] MEMORY: {len(mem_hits)} relevant knowledge hit(s) "
+                    f"[{task_id}] MEMORY: topic={mem_topic!r} "
+                    f"hits={len(mem_hits)} verified={len(mem_verified)} "
+                    f"subject={task_goal.subject!r} "
                     f"— prefer reuse before research"
                 )
-            self.perf.end("MEMORY", hits=len(mem_hits))
+            elif task_goal.prefers_memory_first():
+                self._log(
+                    f"[{task_id}] MEMORY: subject={task_goal.subject!r} "
+                    f"content_source={list(task_goal.content_source)!r} "
+                    f"— no prior hits; RESEARCH only for gaps"
+                )
+            self.perf.end("MEMORY", hits=len(mem_hits), topic=mem_topic)
 
             # PLAN (FAST / offline — never burn REASONING for skeleton)
             self.perf.begin("PLAN")
@@ -1623,9 +1638,32 @@ class Orchestrator:
                             plan = merged
                     except Exception as exc:
                         self._log(f"[{task_id}] PLAN: FAST refine failed ({exc})")
+                # Ground research queries against full TaskGoal (reject drift)
+                plan["research_queries"] = task_goal.ground_research_queries(
+                    plan.get("research_queries") or []
+                )
+                # MEMORY-first: skip entry research when verified subject knowledge exists
+                if task_goal.prefers_memory_first() and mem_verified:
+                    plan["needs_research"] = False
+                    plan["memory_satisfied"] = True
+                elif mem_verified and not plan.get("needs_research", True):
+                    plan["memory_satisfied"] = True
                 self._request_cache[cache_key] = dict(plan)
-            self.ledger.log(task_id, "PLAN", "Plan created", plan)
-            self._log(f"[{task_id}] PLAN: {plan.get('steps')}")
+            self.ledger.log(
+                task_id,
+                "PLAN",
+                "Plan created",
+                {
+                    **plan,
+                    "task_goal_subject": task_goal.subject,
+                    "task_goal_content_source": list(task_goal.content_source),
+                },
+            )
+            self._log(
+                f"[{task_id}] PLAN: {plan.get('steps')} "
+                f"| subject={task_goal.subject!r} "
+                f"queries={plan.get('research_queries')!r}"
+            )
             self.perf.end("PLAN")
 
             # CONTEXT: map TaskGoal → skill input schema (no invented defaults)
@@ -1658,7 +1696,9 @@ class Orchestrator:
                     "constraints": task_goal.constraints,
                     "actions": list(task_goal.actions),
                     "artifacts": list(task_goal.artifacts),
+                    "subject": task_goal.subject,
                     "content_requirements": list(task_goal.content_requirements),
+                    "content_source": list(task_goal.content_source),
                     "success_criteria": list(task_goal.success_criteria),
                 },
             )
@@ -2160,16 +2200,36 @@ class Orchestrator:
             "sources": [],
             "results": [],
         }
+        # MEMORY hits from run_cycle — RESEARCH only for missing information
+        mem_pack = self._request_cache.get("memory_hits") or {}
+        mem_verified = list((mem_pack or {}).get("verified") or [])
+        memory_covers = bool(
+            plan.get("memory_satisfied")
+            or (task_goal.prefers_memory_first() and mem_verified)
+            or (mem_verified and not plan.get("needs_research", True))
+        )
         need_entry_research = (
             not repair_of
             and not verify_failure
             and not prior_knowledge
             and not prior_research
+            and not memory_covers
             and bool(plan.get("needs_research", True))
         )
+        if memory_covers and mem_verified and not prior_knowledge:
+            research["approach"] = "memory_first"
+            research["knowledge_history"] = list(mem_verified)[:8]
+            research["memory_hits"] = list(mem_pack.get("entries") or [])[:8]
+            self._log(
+                f"[{task_id}] MEMORY→RESEARCH skip: subject={task_goal.subject!r} "
+                f"verified={len(mem_verified)} — RESEARCH only for gaps"
+            )
         if need_entry_research:
+            grounded_q = task_goal.ground_research_queries(
+                plan.get("research_queries") or [goal]
+            )
             research = self._do_research(
-                task_id, skill_name, goal, plan.get("research_queries") or [goal],
+                task_id, skill_name, goal, grounded_q,
                 task_goal=task_goal,
             )
             recovery.research_count += 1
@@ -2837,6 +2897,15 @@ class Orchestrator:
             queries = [str(queries)]
         if task_goal is None:
             task_goal = TaskGoal.from_request(goal, goal=goal)
+        # Reject / regenerate queries that drift from TaskGoal subject/source
+        before = [str(q).strip() for q in queries if str(q).strip()]
+        queries = task_goal.ground_research_queries(before)
+        if before and queries != before:
+            self._log(
+                f"[{task_id}] RESEARCH grounding: rejected drift "
+                f"in={before!r} → grounded={queries!r} "
+                f"subject={task_goal.subject!r}"
+            )
         # Skill mode: brain notes only when Ollama is ONLINE (no offline hang)
         research = self.research.research(
             queries,
@@ -3255,11 +3324,14 @@ class Orchestrator:
                     f"{goal} — fill knowledge: {m}"
                     for m in (missing_knowledge or ["fundamentals"])[:3]
                 ]
+            # Ground against TaskGoal — never let a single term rewrite the subject
+            queries = task_goal.ground_research_queries(queries)
             diagnosis["research_queries"] = queries[:6]
             diagnosis["adaptive_research"] = True
             self._log(
                 f"[{task_id}] KNOWLEDGE-GAP RESEARCH: sig={fail_sig} "
-                f"missing={missing_knowledge!r} queries={len(queries)}"
+                f"missing={missing_knowledge!r} queries={len(queries)} "
+                f"subject={task_goal.subject!r}"
             )
             new_research = self._do_research(
                 task_id, skill_name, goal, list(queries), task_goal=task_goal
@@ -3890,9 +3962,11 @@ class Orchestrator:
             "needs_new_skill": not bool(matched),
             "skill_name": Brain._slug(goal)[:40] or "new_skill",
             "skill_description": goal,
-            "research_queries": [goal],
+            "research_queries": tg.default_research_queries(),
             "args": draft_args,
             "required_args": list(draft_args.keys()),
+            "subject": tg.subject,
+            "content_source": list(tg.content_source),
         }
 
     def _list_workspace_artifacts(self, limit: int = 40) -> list[dict[str, Any]]:

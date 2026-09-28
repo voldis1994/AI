@@ -703,6 +703,87 @@ def run(context: dict) -> dict:
             "out_tool.py" in a for a in tg_path.artifacts
         ), tg_path.artifacts
 
+        # Universal request grounding — polysemous words must not rewrite TaskGoal
+        from jarvis.task_goal import SUBJECT_AMBIGUOUS, SUBJECT_UNKNOWN
+
+        poly_req = (
+            'Create habitat_notes.md about python wetland habitat '
+            'containing "PYTHON_OK"'
+        )
+        tg_poly = TaskGoal.from_request(poly_req)
+        assert tg_poly.user_request == poly_req  # immutable source of truth
+        assert "create" in tg_poly.actions
+        assert any("habitat_notes.md" in a for a in tg_poly.artifacts), tg_poly.artifacts
+        assert "python" in tg_poly.subject.lower()
+        assert "wetland" in tg_poly.subject.lower()
+        assert "PYTHON_OK" in tg_poly.content_requirements
+        assert tg_poly.content_source == () or "memory" not in tg_poly.content_source
+        # Drifted queries (programming sense of "python") must be rejected
+        assert tg_poly.query_is_grounded("python wetland habitat ecology") is True
+        assert tg_poly.query_is_grounded(
+            "pip install python package programming language"
+        ) is False
+        grounded_q = tg_poly.ground_research_queries(
+            ["pip install python", "java JDK tutorial", "wetland habitat survey"]
+        )
+        assert grounded_q, grounded_q
+        assert not any("pip" in q.lower() for q in grounded_q), grounded_q
+        assert not any("jdk" in q.lower() for q in grounded_q), grounded_q
+        assert any(
+            "wetland" in q.lower() or "habitat" in q.lower() for q in grounded_q
+        ), grounded_q
+
+        java_req = (
+            "Write summary.txt about java island geography from "
+            "https://example.com/java-isle containing \"JAVA_OK\""
+        )
+        tg_java = TaskGoal.from_request(java_req)
+        assert "java" in tg_java.subject.lower() and "island" in tg_java.subject.lower()
+        assert any(
+            "example.com/java-isle" in s for s in tg_java.content_source
+        ), tg_java.content_source
+        assert all(
+            "example.com" not in a for a in tg_java.artifacts
+        ), tg_java.artifacts
+        assert tg_java.query_is_grounded("java programming language JDK") is False
+        assert tg_java.query_is_grounded("java island geography") is True
+
+        mem_req = (
+            "Using previously learned knowledge about orange citrus, "
+            'create citrus.txt containing "ORANGE_OK"'
+        )
+        tg_mem = TaskGoal.from_request(mem_req)
+        assert "orange" in tg_mem.subject.lower() and "citrus" in tg_mem.subject.lower()
+        assert "memory" in {s.lower() for s in tg_mem.content_source}
+        assert tg_mem.prefers_memory_first() is True
+        assert "citrus.txt" in tg_mem.artifacts
+
+        # Ambiguity: do not invent a sense for a bare leftover token
+        tg_bare = TaskGoal.from_request('Create bank.txt containing "X"')
+        assert tg_bare.subject in (SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+        tg_bank = TaskGoal.from_request(
+            'Learn about bank river erosion and write notes.txt containing "BANK_OK"'
+        )
+        assert "bank" in tg_bank.subject.lower() and "river" in tg_bank.subject.lower()
+        assert tg_bank.query_is_grounded("bank interest rates finance loan") is False
+        assert tg_bank.query_is_grounded("bank river erosion sediment") is True
+
+        # Lifecycle snapshot: action+artifact+subject+content_source preserved
+        life = tg_java.to_dict()
+        for key in (
+            "actions", "artifacts", "subject", "content_source",
+            "content_requirements", "success_criteria", "user_request",
+        ):
+            assert key in life, life.keys()
+        assert life["user_request"] == java_req
+        assert life["subject"] == tg_java.subject
+        assert life["content_source"] == list(tg_java.content_source)
+        # with_args must not drop subject / content_source
+        tg_java2 = tg_java.with_args({"path": "summary.txt", "content": "JAVA_OK"})
+        assert tg_java2.subject == tg_java.subject
+        assert tg_java2.content_source == tg_java.content_source
+        assert tg_java2.user_request == java_req
+
         args_root = root / "data" / "_e2e_args"
         if args_root.exists():
             shutil.rmtree(args_root)
@@ -3938,6 +4019,274 @@ def run(context):
         print("  OK fault attribution — unknown ≠ skill_code; evidence allows rewrite")
     except Exception as exc:
         msg = f"E2E_FAULT_ATTR: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # Universal request grounding lifecycle (polysemy + MEMORY-first)
+    print("  — e2e request grounding (subject/source across MEMORY→VERIFY) —")
+    try:
+        from jarvis.orchestrator import Orchestrator as _OrchGround
+        from jarvis.task_goal import TaskGoal as _TGGround
+
+        gr_root = root / "data" / "_e2e_request_grounding"
+        if gr_root.exists():
+            shutil.rmtree(gr_root)
+        gr_root.mkdir(parents=True)
+        research_calls: list[list[str]] = []
+
+        class GroundingBrain(Brain):
+            def __init__(self) -> None:
+                super().__init__()
+                self.builds = 0
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": ["create", "file"],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                # Deliberately drifted research_queries (programming sense)
+                return {
+                    "steps": ["memory", "build", "execute", "verify"],
+                    "can_reuse": [],
+                    "missing": [goal],
+                    "needs_research": True,
+                    "needs_new_skill": True,
+                    "skill_name": "grounding_poly_skill",
+                    "skill_description": goal,
+                    "research_queries": [
+                        "pip install python package",
+                        "python programming language tutorial",
+                        "java JDK install",
+                    ],
+                    "args": {
+                        "dest": "habitat_notes.md",
+                        "body": "PYTHON_OK",
+                    },
+                    "required_args": ["dest", "body"],
+                }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                return {"dest": "habitat_notes.md", "body": "PYTHON_OK"}
+
+            def write_skill_code(
+                self,
+                skill_name,
+                description,
+                research,
+                previous_code=None,
+                error_log=None,
+                diagnosis=None,
+                failed_approaches=None,
+                test_plan=None,
+                **kwargs,
+            ) -> str:
+                self.builds += 1
+                # BUILD context must keep TaskGoal subject (not pip/JDK drift)
+                tg = kwargs.get("task_goal") or {}
+                blob = str(tg).lower()
+                ur = str(kwargs.get("user_request") or description or "").lower()
+                assert (
+                    "wetland" in blob or "habitat" in blob
+                    or "wetland" in ur or "habitat" in ur
+                ), (tg, ur[:200])
+                assert "pip install" not in blob and "jdk" not in blob
+                return f'''
+from pathlib import Path
+SKILL_META = {{
+    "name": "{skill_name}",
+    "description": {description!r},
+    "capabilities": ["write_file"],
+    "dependencies": [],
+    "version": {self.builds},
+    "required_args": ["dest", "body"],
+}}
+def run(context: dict) -> dict:
+    args = context.get("args") or {{}}
+    workspace = Path(context.get("workspace") or ".")
+    dest = str(args.get("dest") or "out.txt")
+    path = workspace / dest
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(args.get("body") or "") + "\\n", encoding="utf-8")
+    return {{
+        "ok": True,
+        "result": {{"path": str(path), "contains": str(args.get("body") or "")}},
+        "error": None,
+        "evidence": f"wrote {{path}}",
+    }}
+'''
+
+            def diagnose(self, observation, failed_approaches=None, prior_solutions=None):
+                return {
+                    "root_cause": "n/a",
+                    "fault_layer": "unknown",
+                    "rewrite_skill": False,
+                    "what_to_change": "",
+                    "approach": "write",
+                    "approach_changed": False,
+                    "needs_research": False,
+                    "missing_knowledge": [],
+                    "research_queries": [],
+                    "needs_new_deps": [],
+                    "missing_args": [],
+                    "required_args": ["dest", "body"],
+                    "suggested_args": {
+                        "dest": "habitat_notes.md",
+                        "body": "PYTHON_OK",
+                    },
+                    "test_plan": "execute",
+                    "expected_artifacts": ["habitat_notes.md"],
+                    "is_unfixable": False,
+                    "diagnosis": "ok",
+                }
+
+            def verify_claim(self, goal, result, evidence) -> dict:
+                return {"achieved": True, "confidence": 0.9, "reason": "ok"}
+
+            def converse(self, user_text, history=None) -> str:
+                return "ok"
+
+        brain_gr = GroundingBrain()
+        logs_gr: list[str] = []
+        orch_gr = _OrchGround(
+            root=gr_root,
+            brain=brain_gr,
+            on_log=lambda m: logs_gr.append(m),
+        )
+
+        # Seed MEMORY with verified knowledge for the subject (not programming)
+        mem_topic = _TGGround.from_request(
+            "about python wetland habitat"
+        ).memory_topic()
+        orch_gr.memory.save_topic_knowledge(
+            mem_topic,
+            {
+                "approach": "habitat_facts",
+                "concepts": ["python", "wetland", "habitat", "snake"],
+                "summary": "Wetland habitat facts about python snakes in marshes",
+                "key_apis": ["python", "wetland", "habitat"],
+            },
+            goal="python wetland habitat",
+            summary="Wetland habitat facts about python snakes in marshes",
+            verified=True,
+        )
+
+        # Patch research to record queries (must be grounded / not pip/JDK)
+        def _tracking_research(queries, **kwargs):
+            research_calls.append(list(queries or []))
+            return {
+                "approach": "grounded",
+                "libraries": [],
+                "key_apis": [],
+                "pitfalls": [],
+                "test_idea": "",
+                "raw": "wetland habitat",
+                "sources": [],
+                "results": [],
+            }
+
+        orch_gr.research.research = _tracking_research  # type: ignore
+
+        goal_gr = (
+            'Create habitat_notes.md about python wetland habitat '
+            'containing "PYTHON_OK"'
+        )
+        # Unit: TaskGoal fields survive before cycle
+        tg0 = _TGGround.from_request(goal_gr)
+        assert "wetland" in tg0.subject.lower()
+        snap = {
+            "action": tg0.action,
+            "artifact": list(tg0.artifacts),
+            "subject": tg0.subject,
+            "content_source": list(tg0.content_source),
+        }
+
+        result_gr = orch_gr.run_cycle(goal_gr)
+        assert result_gr.get("success"), result_gr
+
+        # MEMORY retrieved by TaskGoal subject/topic
+        assert any("MEMORY" in m for m in logs_gr), logs_gr[:30]
+        assert any(
+            "subject=" in m.lower() or "wetland" in m.lower() or "habitat" in m.lower()
+            for m in logs_gr
+            if "MEMORY" in m or "PLAN" in m
+        ), logs_gr[:40]
+
+        # RESEARCH queries (if any) must not drift to pip/JDK
+        for qs in research_calls:
+            joined = " ".join(qs).lower()
+            assert "pip" not in joined, qs
+            assert "jdk" not in joined, qs
+            assert "programming language" not in joined, qs
+
+        # Artifact created + VERIFY vs original TaskGoal
+        marker = gr_root / "workspace_runtime" / "habitat_notes.md"
+        assert marker.exists(), list(
+            (gr_root / "workspace_runtime").rglob("*")
+        ) if (gr_root / "workspace_runtime").exists() else "no ws"
+        assert "PYTHON_OK" in marker.read_text(encoding="utf-8")
+        assert any(
+            "VERIFIER RESULT: PASS" in m or "VERIFY: PASS" in m for m in logs_gr
+        ), logs_gr[-40:]
+
+        # Subject preserved across REQUEST → … → VERIFY
+        assert snap["subject"] == tg0.subject
+        assert snap["artifact"] == list(tg0.artifacts)
+        assert snap["action"] == tg0.action
+
+        # Direct choke-point: _do_research grounds drifted queries
+        research_calls.clear()
+        grounded_direct = orch_gr._do_research(
+            "t_ground",
+            "grounding_poly_skill",
+            goal_gr,
+            ["pip install python", "java JDK", "random unrelated"],
+            task_goal=tg0,
+        )
+        assert research_calls, "expected research invocation"
+        last_q = research_calls[-1]
+        assert last_q, last_q
+        assert not any("pip" in q.lower() for q in last_q), last_q
+        assert any(
+            "wetland" in q.lower() or "habitat" in q.lower() or "python" in q.lower()
+            for q in last_q
+        ), last_q
+        assert grounded_direct.get("approach") == "grounded"
+        assert any("RESEARCH grounding" in m for m in logs_gr), logs_gr[-20:]
+
+        # MEMORY-first content_source preserved (action+artifact+subject+source)
+        mem_goal = (
+            "Using previously learned knowledge about python wetland habitat, "
+            'create mem_habitat.txt containing "MEM_OK"'
+        )
+        tg_mem = _TGGround.from_request(mem_goal)
+        assert tg_mem.prefers_memory_first()
+        assert "memory" in {s.lower() for s in tg_mem.content_source}
+        dmem = tg_mem.to_dict()
+        assert dmem["subject"] == tg_mem.subject
+        assert "memory" in dmem["content_source"]
+        assert any("mem_habitat.txt" in a for a in dmem["artifacts"])
+        assert dmem["user_request"] == mem_goal
+
+        orch_gr.close()
+        print(
+            "  OK request grounding — subject/source preserved; "
+            "drifted RESEARCH rejected"
+        )
+    except Exception as exc:
+        msg = f"E2E_REQUEST_GROUNDING: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)

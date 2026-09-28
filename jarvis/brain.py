@@ -599,7 +599,13 @@ class Brain:
             "(filenames, text, urls, numbers, etc.). "
             "Arg names should match what a Python skill would read from context['args'].\n"
             "- NEVER invent one arg key per word in the request. Use a small schema "
-            "(typically path/content/url-style keys), not sentence tokens."
+            "(typically path/content/url-style keys), not sentence tokens.\n"
+            "- research_queries MUST stay grounded in the full goal "
+            "(action + artifact + subject/topic + content_source). "
+            "Do not let a single ambiguous word rewrite the topic "
+            "(e.g. do not turn a habitat subject into a package-install query).\n"
+            "- If the subject/topic is unclear, keep queries close to the full request; "
+            "do not invent a disambiguated meaning."
         )
         prompt = f"GOAL:\n{goal}\n\nKNOWN CAPABILITIES:\n{caps}"
         raw = self.generate(

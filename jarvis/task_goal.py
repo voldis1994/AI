@@ -4,9 +4,10 @@ Immutable TaskGoal — preserves the original USER REQUEST for the full cycle.
 VERIFY and context mapping always ground against this object so learning/repair
 cannot drift away from what the user asked for.
 
-Structured fields (actions / artifacts / content requirements / success criteria)
-are derived from the request + grounded schema args — never by splitting the
-sentence into dozens of word-args.
+Structured fields (action / target / subject / content_requirements /
+content_source / constraints / success_criteria) are derived from the request
++ grounded schema args — never by inventing a disambiguated sense for a
+polysemous word, and never by splitting the sentence into dozens of word-args.
 """
 
 from __future__ import annotations
@@ -52,6 +53,25 @@ _STOP = {
     "python", "code", "script", "program",
 }
 
+# Lean stop set for SUBJECT extraction — keep domain words (python/java/…)
+# so polysemous surface tokens remain part of the topic.
+_SUBJECT_STOP = {
+    "a", "an", "the", "and", "or", "to", "for", "with", "from", "into",
+    "in", "on", "at", "of", "by", "is", "are", "be", "as", "it", "this",
+    "that", "create", "write", "make", "build", "run", "file", "files",
+    "containing", "contains", "named", "called", "please", "jarvis",
+    "text", "content", "contents", "data", "value", "values",
+    "about", "regarding", "concerning", "summary", "summarize", "notes",
+    "note", "using", "based", "according", "source", "learn", "learned",
+    "knowledge", "previously", "already", "prior", "memory",
+    "izveido", "uzraksti", "failu", "faila", "ar", "saturu", "satur",
+    "nosaukumu", "tekstu", "teksts", "lūdzu", "ludzu", "ka", "kā",
+    "par", "paradi", "parādi", "man", "lai", "un", "vai", "bet",
+    "jo", "ja", "ko", "kas", "kur", "kad", "tik", "tai", "tos", "tas",
+    "šo", "so", "ti", "tu", "es", "mēs", "mes", "jūs", "jus",
+    "example", "examples", "demo", "show", "how", "works", "working",
+}
+
 # Canonical DIAGNOSE layers (legacy aliases accepted + normalized).
 # "unknown" = unrecognized / insufficient evidence — NEVER treated as skill_code.
 FAULT_LAYERS = frozenset({
@@ -78,8 +98,36 @@ _LEGACY_LAYER = {
 _ACTION_VERBS = re.compile(
     r"(?i)\b(create|write|make|build|run|fetch|download|install|learn|"
     r"research|execute|test|verify|izveido|uzraksti|palaid|iemācies|"
-    r"iemacies|paradi|parādi)\b"
+    r"iemacies|paradi|parādi|summarize|summary|note|notes)\b"
 )
+
+# Topic cues — capture the surface subject without inventing a sense.
+_ABOUT_CUE = re.compile(
+    r"(?i)\b(?:about|regarding|concerning|on\s+the\s+topic\s+of|"
+    r"par(?:\s+tēmu)?|par\s+tematu)\s+"
+    r"(.+?)(?=\s+(?:containing|contains|with\s+text|ar\s+tekstu|saturu|"
+    r"from|using|via|based\s+on|create|write|make|build|"
+    r"izveido|uzraksti)\b|[,\"']|$)"
+)
+
+# Explicit content origins grounded in the request (never invented).
+# Prefer URL / memory / path-like tokens — not bare adverbs after "using".
+_SOURCE_CUE = re.compile(
+    r"(?i)\b(?:from|via|based\s+on|according\s+to|source)\s+"
+    r"[\"']?((?:https?://\S+)|(?:memory|prior\s+knowledge)|"
+    r"[A-Za-z0-9_./\\-]{2,}\.[A-Za-z0-9]{1,12}|[A-Za-z0-9_./\\-]{3,})[\"']?"
+)
+
+_MEMORY_CUE = re.compile(
+    r"(?i)\b(?:previously\s+learned|already\s+(?:know|learned|researched)|"
+    r"from\s+(?:memory|prior\s+knowledge)|what\s+you\s+(?:know|learned|"
+    r"researched)|prior\s+knowledge|saved\s+knowledge|"
+    r"apgūtaj\w*|iemācīt\w*|no\s+atmiņ\w*)\b"
+)
+
+# Sentinel subject values — never invent a disambiguated meaning.
+SUBJECT_UNKNOWN = "unknown"
+SUBJECT_AMBIGUOUS = "ambiguous"
 
 
 @dataclass(frozen=True)
@@ -87,10 +135,11 @@ class TaskGoal:
     """
     Frozen goal for one user task.
 
-    user_request — exact original text (never mutated)
+    user_request — exact original text (never mutated; immutable source of truth)
     goal         — planner/intent summary (may be shorter; VERIFY prefers user_request)
     constraints  — structured expectations derived only from the request (+ grounded args)
-    actions / artifacts / content_requirements / success_criteria — structured views
+    actions / artifacts / subject / content_requirements / content_source /
+    success_criteria — structured views for PLAN / MEMORY / RESEARCH / BUILD
     """
 
     user_request: str
@@ -98,8 +147,25 @@ class TaskGoal:
     constraints: dict[str, Any] = field(default_factory=dict)
     actions: tuple[str, ...] = ()
     artifacts: tuple[str, ...] = ()
+    subject: str = SUBJECT_UNKNOWN
     content_requirements: tuple[str, ...] = ()
+    content_source: tuple[str, ...] = ()
     success_criteria: tuple[str, ...] = ()
+
+    @property
+    def topic(self) -> str:
+        """Alias for subject — MEMORY retrieval key surface."""
+        return self.subject
+
+    @property
+    def action(self) -> str:
+        """Primary action label (first derived verb)."""
+        return self.actions[0] if self.actions else "execute"
+
+    @property
+    def target(self) -> tuple[str, ...]:
+        """Alias for artifacts (output targets)."""
+        return self.artifacts
 
     @classmethod
     def from_request(
@@ -113,13 +179,19 @@ class TaskGoal:
         g = (goal or req).strip() or req
         grounded_args = cls.sanitize_args(args or {}, req, skill_meta=skill_meta)
         constraints = cls.derive_constraints(req, grounded_args)
+        artifacts = cls._derive_artifacts(constraints)
+        content_reqs = cls._derive_content_requirements(constraints)
+        content_source = cls._derive_content_source(req, constraints)
+        subject = cls._derive_subject(req, artifacts, content_reqs, content_source)
         return cls(
             user_request=req,
             goal=g,
             constraints=constraints,
             actions=cls._derive_actions(req),
-            artifacts=cls._derive_artifacts(constraints),
-            content_requirements=cls._derive_content_requirements(constraints),
+            artifacts=artifacts,
+            subject=subject,
+            content_requirements=content_reqs,
+            content_source=content_source,
             success_criteria=cls._derive_success_criteria(constraints),
         )
 
@@ -133,13 +205,26 @@ class TaskGoal:
             args or {}, self.user_request, skill_meta=skill_meta
         )
         constraints = self.derive_constraints(self.user_request, grounded)
+        artifacts = self._derive_artifacts(constraints)
+        content_reqs = self._derive_content_requirements(constraints)
+        # Preserve request-derived subject/source; refresh source with new URLs.
+        content_source = self._derive_content_source(self.user_request, constraints)
+        # Subject is request-grounded — only re-derive if previously unknown.
+        if self.subject in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS):
+            subject = self._derive_subject(
+                self.user_request, artifacts, content_reqs, content_source
+            )
+        else:
+            subject = self.subject
         return TaskGoal(
             user_request=self.user_request,
             goal=self.goal,
             constraints=constraints,
             actions=self.actions or self._derive_actions(self.user_request),
-            artifacts=self._derive_artifacts(constraints),
-            content_requirements=self._derive_content_requirements(constraints),
+            artifacts=artifacts,
+            subject=subject,
+            content_requirements=content_reqs,
+            content_source=content_source or self.content_source,
             success_criteria=self._derive_success_criteria(constraints),
         )
 
@@ -149,8 +234,13 @@ class TaskGoal:
             "goal": self.goal,
             "constraints": self.constraints,
             "actions": list(self.actions),
+            "action": self.action,
             "artifacts": list(self.artifacts),
+            "target": list(self.artifacts),
+            "subject": self.subject,
+            "topic": self.subject,
             "content_requirements": list(self.content_requirements),
+            "content_source": list(self.content_source),
             "success_criteria": list(self.success_criteria),
         }
 
@@ -420,7 +510,13 @@ class TaskGoal:
                 if sv not in text_vals and sv not in path_vals and len(sv) >= 2:
                     text_vals.append(sv)
 
-        # 2) Quoted strings from the request (highest-confidence literals)
+        # 2) Bare URLs in the request (content_source; never path artifacts)
+        for m in re.finditer(r"https?://\S+", request or ""):
+            u = m.group(0).rstrip(".,);]\"'")
+            if u and not cls.is_invented_default(u, request):
+                expect["http"].append({"url": u})
+
+        # 3) Quoted strings from the request (highest-confidence literals)
         for a, b in re.findall(r"\"([^\"]+)\"|'([^']+)'", request or ""):
             tok = (a or b).strip()
             if not tok or cls.is_invented_default(tok, request):
@@ -434,7 +530,11 @@ class TaskGoal:
                 if tok not in text_vals:
                     text_vals.append(tok)
 
-        # 3) Bare filenames with extensions in the request (not every word)
+        # 4) Bare filenames with extensions in the request (not every word)
+        #    Skip tokens that are substrings of a captured URL host/path.
+        url_blobs = " ".join(
+            str((h or {}).get("url") or "") for h in expect["http"]
+        ).lower()
         for m in re.finditer(
             r"(?<![A-Za-z0-9_\"'])([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,12})\b",
             request or "",
@@ -442,29 +542,48 @@ class TaskGoal:
             tok = m.group(1)
             if cls.is_invented_default(tok, request):
                 continue
+            if cls.looks_like_url(tok):
+                continue
+            if tok.lower() in url_blobs or any(
+                tok.lower() in str((h or {}).get("url") or "").lower()
+                for h in expect["http"]
+            ):
+                continue
             if tok not in path_vals:
                 path_vals.append(tok)
 
-        # 4) key=value pairs in the request
+        # 5) key=value pairs in the request (never split https:// into key=value)
         for km in re.finditer(
             r"(?P<k>[A-Za-z_][\w]*)\s*[:=]\s*(?P<v>\"[^\"]*\"|'[^']*'|[^\s,;]+)",
             request or "",
         ):
+            key = (km.group("k") or "").lower()
+            if key in ("http", "https"):
+                continue
             raw = km.group("v")
             if (raw.startswith('"') and raw.endswith('"')) or (
                 raw.startswith("'") and raw.endswith("'")
             ):
                 raw = raw[1:-1]
+            # URL fragment left after https: split — treat as URL, not path
+            if raw.startswith("//") and key in ("http", "https"):
+                continue
+            if raw.startswith("//"):
+                continue
             if cls.is_invented_default(raw, request):
                 continue
-            if cls.looks_like_path(raw) and raw not in path_vals:
+            if cls.looks_like_url(raw):
+                expect["http"].append({"url": raw})
+            elif cls.looks_like_path(raw) and raw not in path_vals:
+                if raw.lower() in url_blobs:
+                    continue
                 path_vals.append(raw)
             elif cls.looks_like_content(raw) and raw not in text_vals:
                 text_vals.append(raw)
             elif raw not in text_vals and raw not in path_vals:
                 text_vals.append(raw)
 
-        # 5) Content after explicit cue words (NOT every sentence token).
+        # 6) Content after explicit cue words (NOT every sentence token).
         #    Prevents "ti"/"Python"/… must_contain pollution while still
         #    capturing payloads like: containing HELLO / ar tekstu DARBOJAS.
         if not text_vals:
@@ -483,7 +602,7 @@ class TaskGoal:
                     text_vals.append(tok)
                     break
 
-        # 6) If we have a path but still no payload, take at most ONE remaining
+        # 7) If we have a path but still no payload, take at most ONE remaining
         #    significant token (≥3 chars) that is not a stopword/path.
         if path_vals and not text_vals:
             leftovers: list[str] = []
@@ -551,10 +670,7 @@ class TaskGoal:
             p = str((d or {}).get("path") or "").strip()
             if p and p not in arts:
                 arts.append(p)
-        for h in constraints.get("http") or []:
-            u = str((h or {}).get("url") or "").strip()
-            if u and u not in arts:
-                arts.append(u)
+        # URLs are content_source, not output artifacts, unless also a file target.
         return tuple(arts)
 
     @staticmethod
@@ -570,6 +686,115 @@ class TaskGoal:
         return tuple(reqs)
 
     @classmethod
+    def _derive_content_source(
+        cls, request: str, constraints: dict[str, Any]
+    ) -> tuple[str, ...]:
+        """
+        Origins of content grounded in the request only.
+
+        URLs, explicit from/using/via cues, and memory references.
+        Empty when the request does not name a source — never invent one.
+        """
+        sources: list[str] = []
+        for h in constraints.get("http") or []:
+            u = str((h or {}).get("url") or "").strip()
+            if u and u not in sources:
+                sources.append(u)
+        for m in re.finditer(r"https?://\S+", request or ""):
+            u = m.group(0).rstrip(".,);]")
+            if u and u not in sources:
+                sources.append(u)
+        for m in _SOURCE_CUE.finditer(request or ""):
+            tok = (m.group(1) or "").strip()
+            if not tok:
+                continue
+            low = tok.lower()
+            if low in ("memory", "prior knowledge"):
+                tok = "memory"
+            elif low in _SUBJECT_STOP or low in _STOP:
+                continue
+            if tok not in sources and not cls.is_invented_default(tok, request):
+                sources.append(tok)
+        if _MEMORY_CUE.search(request or "") and "memory" not in sources:
+            sources.append("memory")
+        return tuple(sources[:8])
+
+    @classmethod
+    def _derive_subject(
+        cls,
+        request: str,
+        artifacts: tuple[str, ...] | list[str],
+        content_requirements: tuple[str, ...] | list[str],
+        content_source: tuple[str, ...] | list[str],
+    ) -> str:
+        """
+        Surface subject/topic from the request — never a guessed sense.
+
+        Prefer explicit about/regarding cues; otherwise leftover content tokens
+        after stripping actions, artifacts, payloads, and sources.
+        Ambiguous single-token leftovers stay ``ambiguous``; empty → ``unknown``.
+        """
+        req = request or ""
+        # 1) Explicit topic cue — keep surface phrase (do not disambiguate)
+        m = _ABOUT_CUE.search(req)
+        if m:
+            phrase = " ".join((m.group(1) or "").split()).strip(" .,;:-")
+            # Strip trailing artifact mentions accidentally captured
+            for art in artifacts:
+                if art and art in phrase:
+                    phrase = phrase.replace(art, " ")
+            cleaned: list[str] = []
+            for tok in re.findall(r"[A-Za-z0-9_]{3,}", phrase):
+                low = tok.lower()
+                if low in _SUBJECT_STOP:
+                    continue
+                if cls.looks_like_path(tok):
+                    continue
+                if tok not in cleaned:
+                    cleaned.append(tok)
+            if len(cleaned) >= 2:
+                return " ".join(cleaned[:10])
+            if len(cleaned) == 1:
+                return SUBJECT_AMBIGUOUS
+            # fall through if cue yielded nothing useful
+
+        exclude: set[str] = set()
+        for art in artifacts:
+            exclude.add(str(art).lower())
+            exclude.add(Path(str(art)).stem.lower())
+            for part in re.findall(r"[A-Za-z0-9_]{2,}", str(art)):
+                exclude.add(part.lower())
+        for c in content_requirements:
+            exclude.add(str(c).lower())
+            for part in re.findall(r"[A-Za-z0-9_]{2,}", str(c)):
+                exclude.add(part.lower())
+        for src in content_source:
+            exclude.add(str(src).lower())
+            for part in re.findall(r"[A-Za-z0-9_]{2,}", str(src)):
+                if part.lower() not in ("http", "https", "www"):
+                    exclude.add(part.lower())
+        exclude.update(path_segment_tokens(req, artifacts))
+        for a in cls._derive_actions(req):
+            exclude.add(a.lower())
+
+        tokens: list[str] = []
+        for tok in re.findall(r"[A-Za-z0-9_]{3,}", req):
+            low = tok.lower()
+            if low in _SUBJECT_STOP or low in exclude:
+                continue
+            if cls.looks_like_path(tok) or cls.looks_like_url(tok):
+                continue
+            if tok not in tokens:
+                tokens.append(tok)
+
+        if not tokens:
+            return SUBJECT_UNKNOWN
+        # Single leftover token with no supporting context → do not invent sense
+        if len(tokens) == 1:
+            return SUBJECT_AMBIGUOUS
+        return " ".join(tokens[:10])
+
+    @classmethod
     def _derive_success_criteria(cls, constraints: dict[str, Any]) -> tuple[str, ...]:
         crit: list[str] = []
         for p in cls._derive_artifacts(constraints):
@@ -579,3 +804,168 @@ class TaskGoal:
         if not crit:
             crit.append("skill_ok_and_verified")
         return tuple(crit[:16])
+
+    # ── Query / MEMORY grounding ────────────────────────────────────────
+
+    def grounding_bundle(self) -> str:
+        """Text used to score research queries and memory relevance."""
+        parts = [
+            self.subject
+            if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+            else "",
+            " ".join(self.content_source),
+            " ".join(self.artifacts),
+            " ".join(self.content_requirements),
+            self.user_request,
+        ]
+        return " ".join(p for p in parts if p).strip()
+
+    def memory_topic(self) -> str:
+        """Slug for MEMORY retrieval — subject first, never invent a sense."""
+        from jarvis.intent import IntentClassifier
+
+        if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS):
+            return IntentClassifier.topic_slug(self.subject)
+        return IntentClassifier.topic_slug(self.user_request)
+
+    def prefers_memory_first(self) -> bool:
+        """True when the request points at prior/learned knowledge as source."""
+        if "memory" in {s.lower() for s in self.content_source}:
+            return True
+        return bool(_MEMORY_CUE.search(self.user_request or ""))
+
+    def subject_tokens(self) -> set[str]:
+        anchor = (
+            self.subject
+            if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+            else ""
+        )
+        if not anchor:
+            return set()
+        return {
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9_]{3,}", anchor)
+            if t.lower() not in _SUBJECT_STOP
+        }
+
+    def query_is_grounded(self, query: str) -> bool:
+        """
+        True when a research query stays semantically tied to this TaskGoal.
+
+        Rejects queries that share only a single short token with a multi-token
+        subject (classic polysemy drift) while inventing an unrelated domain.
+        Soft relatedness alone is not enough when subject-token overlap is weak.
+        """
+        q = (query or "").strip()
+        if not q:
+            return False
+        # Whole query literally present in request/subject
+        if q in (self.user_request or "") or (
+            self.subject
+            and self.subject not in (SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+            and q in self.subject
+        ):
+            return True
+
+        subj = (
+            self.subject
+            if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+            else ""
+        )
+        for src in self.content_source:
+            src_l = str(src).lower()
+            if src_l == "memory":
+                continue
+            if src and src_l in q.lower():
+                return True
+
+        subj_tokens = self.subject_tokens()
+        q_tokens = {
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9_]{3,}", q)
+            if t.lower() not in _SUBJECT_STOP
+        }
+        overlap = subj_tokens & q_tokens
+
+        # Multi-token subject: require ≥2 subject tokens in the query.
+        # A single shared token is classic polysemy drift (python→pip, java→JDK).
+        if len(subj_tokens) >= 2:
+            if len(overlap) < 2:
+                return False
+            try:
+                from jarvis.learning_verify import soft_relatedness
+
+                return soft_relatedness(subj or self.grounding_bundle(), q) >= 0.18
+            except Exception:
+                return True
+
+        if overlap:
+            return True
+
+        # unknown/ambiguous subject — require request-token overlap (not actions)
+        req_tokens = {
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9_]{3,}", self.user_request or "")
+            if t.lower() not in _SUBJECT_STOP
+        }
+        actions = {a.lower() for a in self.actions}
+        art_stems = {Path(a).stem.lower() for a in self.artifacts}
+        useful = {
+            t for t in (req_tokens & q_tokens)
+            if t not in actions and t not in art_stems
+        }
+        if len(useful) >= 2:
+            return True
+        return False
+
+    def default_research_queries(self) -> list[str]:
+        """Regenerate queries strictly from TaskGoal fields (no invented sense)."""
+        out: list[str] = []
+        subj = (
+            self.subject
+            if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+            else ""
+        )
+        if subj:
+            out.append(subj)
+            if self.content_requirements:
+                out.append(f"{subj} {' '.join(self.content_requirements[:2])}")
+        for src in self.content_source[:2]:
+            if str(src).lower() == "memory":
+                continue
+            if subj:
+                out.append(f"{subj} {src}")
+            else:
+                out.append(str(src))
+        if not out:
+            # Fall back to full immutable request — never invent a topic
+            out = [self.user_request]
+        # Dedupe
+        seen: list[str] = []
+        for q in out:
+            q = " ".join(str(q).split())
+            if q and q not in seen:
+                seen.append(q)
+        return seen[:6]
+
+    def ground_research_queries(
+        self,
+        queries: Optional[list] = None,
+        *,
+        regenerate: bool = True,
+    ) -> list[str]:
+        """
+        Keep only TaskGoal-grounded queries; regenerate from TaskGoal on total drift.
+        """
+        raw = [str(q).strip() for q in (queries or []) if str(q).strip()]
+        kept = [q for q in raw if self.query_is_grounded(q)]
+        # Preserve order, unique
+        out: list[str] = []
+        for q in kept:
+            if q not in out:
+                out.append(q)
+        if out:
+            return out[:6]
+        if regenerate:
+            return self.default_research_queries()
+        return []
