@@ -1,5 +1,13 @@
 """
-JARVIS capability registry — tracks skills and their lifecycle status.
+ImplementationRegistry — TOOL / IMPLEMENTATION lifecycle.
+
+Stores versioned executable tools (skill .py files) and enforces trust:
+only ACTIVE implementations may serve EXECUTE. Archive + pending-candidate
+protect rollback/versioning.
+
+Ontology: this registry owns TOOL/IMPLEMENTATION rows. Competence domains and
+CAPABILITY classes live in CompetenceRegistry. KNOWLEDGE/EXPERIENCE attach via
+Memory. USER REQUEST truth is TaskContract only.
 
 Statuses:
   CANDIDATE → TESTING → ACTIVE
@@ -28,8 +36,8 @@ VALID_STATUSES = (
 )
 
 
-class CapabilityRegistry:
-    """Maps capabilities → skills and enforces trust rules (only ACTIVE is trusted)."""
+class ImplementationRegistry:
+    """Maps tools/implementations and enforces trust rules (only ACTIVE is trusted)."""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)

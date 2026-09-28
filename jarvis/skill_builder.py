@@ -54,7 +54,7 @@ class SkillBuilder:
         test_plan: Optional[str] = None,
         *,
         user_request: Optional[str] = None,
-        task_goal: Optional[dict[str, Any]] = None,
+        contract: Optional[dict[str, Any]] = None,
         grounded_args: Optional[dict[str, Any]] = None,
         artifacts: Optional[list] = None,
         missing_requirements: Optional[list] = None,
@@ -64,7 +64,7 @@ class SkillBuilder:
         Build a skill from research + optional diagnosis.
 
         Universal — no task-specific hardcoding. Never accepts an unimplemented stub.
-        On repair, CODING always receives USER REQUEST / TaskGoal / args / artifacts /
+        On repair, CODING always receives USER REQUEST / TaskContract / args / artifacts /
         verifier errors / failed approaches (never an identical blind rewrite).
         """
         name = self._safe_name(skill_name)
@@ -76,7 +76,7 @@ class SkillBuilder:
         if research.get("knowledge_history"):
             research_for_brain["knowledge_history"] = research["knowledge_history"][:5]
         if user_request:
-            research_for_brain["user_request"] = user_request
+            research_for_brain["original_request"] = user_request
 
         # Do not feed the unimplemented stub back as "previous code"
         if previous_code and self.is_unimplemented_stub(previous_code):
@@ -94,8 +94,9 @@ class SkillBuilder:
             diagnosis=diagnosis,
             failed_approaches=failed_approaches,
             test_plan=test_plan or (diagnosis or {}).get("test_plan"),
-            user_request=user_request,
-            task_goal=task_goal,
+            original_request=user_request,
+            user_request=user_request,  # filtered out if brain signature lacks it
+            contract=contract,
             grounded_args=grounded_args,
             artifacts=artifacts,
             missing_requirements=missing_requirements,
@@ -276,7 +277,7 @@ class SkillBuilder:
         from jarvis.request_items import sanitize_libraries
 
         user_req = str(
-            user_request or research.get("user_request") or description or ""
+            user_request or research.get("original_request") or description or ""
         )
         deps = sanitize_libraries(
             list(research.get("libraries") or [])[:8],
@@ -294,7 +295,7 @@ class SkillBuilder:
                         required.append(str(x))
         # Drop path-stem polluted required_args
         try:
-            from jarvis.task_goal import TaskGoal as _TG
+            from jarvis.task_contract import TaskContract as _TG
 
             required = [
                 x for x in required
@@ -509,7 +510,7 @@ def run(context: dict) -> dict:
             caps = research.get("key_apis") or [description]
             deps = sanitize_libraries(
                 list(research.get("libraries") or []),
-                str(research.get("user_request") or description or ""),
+                str(research.get("original_request") or description or ""),
             )
             meta_block = (
                 f"\nSKILL_META = {{\n"
@@ -528,7 +529,7 @@ def run(context: dict) -> dict:
                 description=description,
                 research=research,
                 version=version,
-                user_request=str(research.get("user_request") or "") or None,
+                user_request=str(research.get("original_request") or "") or None,
             )
         return code
 

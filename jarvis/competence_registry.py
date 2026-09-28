@@ -1,14 +1,14 @@
 """
 Competence registry — hierarchical SKILL / CAPABILITY / TOOL index.
 
-Executable TOOL code continues to live in CapabilityRegistry (skills table)
+Executable TOOL code continues to live in ImplementationRegistry (skills table)
 and on-disk .py files. This registry adds:
   - competence tree (auto-branching)
   - tool → competence/capability mapping
   - migration of legacy task-specific skills → tools under domains
   - VERIFIED knowledge/experience hooks (via Memory keys)
 
-Does not replace TaskGoal, verifier, recovery, rollback, or model routing.
+Does not replace TaskContract, verifier, recovery, rollback, or model routing.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from jarvis.capability_match import evaluate_capability
-from jarvis.capability_registry import CapabilityRegistry
+from jarvis.implementation_registry import ImplementationRegistry
 from jarvis.competence import (
     LAYER_CAPABILITY,
     LAYER_SKILL,
@@ -33,16 +33,16 @@ from jarvis.competence import (
     preferred_tool_name,
     slugify,
 )
-from jarvis.task_goal import TaskGoal
+from jarvis.task_contract import TaskContract
 
 
 class CompetenceRegistry:
-    """Hierarchical competence index layered on CapabilityRegistry."""
+    """Hierarchical competence index layered on ImplementationRegistry."""
 
     def __init__(
         self,
         db_path: str | Path,
-        skills: CapabilityRegistry,
+        skills: ImplementationRegistry,
     ) -> None:
         self.db_path = Path(db_path)
         self.skills = skills
@@ -298,7 +298,7 @@ class CompetenceRegistry:
         competence_ids: Optional[list[str]] = None,
         only_active: bool = True,
     ) -> list[dict[str, Any]]:
-        """Resolve TOOL index → CapabilityRegistry skill records."""
+        """Resolve TOOL index → ImplementationRegistry skill records."""
         tools = self.list_tools()
         if competence_ids:
             allowed = set(competence_ids)
@@ -334,9 +334,9 @@ class CompetenceRegistry:
 
     # ── Planning ────────────────────────────────────────────────────────
 
-    def plan_for_goal(self, task_goal: TaskGoal) -> CompetencePlan:
+    def plan_for_goal(self, contract: TaskContract) -> CompetencePlan:
         """
-        Classify TaskGoal → ensure branches → find reusable VERIFIED tools.
+        Classify TaskContract → ensure branches → find reusable VERIFIED tools.
 
         Decision:
           REUSE_COMPOSE — one or more compatible ACTIVE tools
@@ -344,7 +344,7 @@ class CompetenceRegistry:
           OPEN_BRANCH   — need new skill/capability nodes + tool
           BUILD_TOOL    — fallback gap fill
         """
-        clf = classify_task_competences(task_goal)
+        clf = classify_task_competences(contract)
         skill_ids = list(clf["skill_ids"])
         capability_ids = list(clf["capability_ids"])
         created = self.ensure_path(skill_ids, capability_ids)
@@ -360,7 +360,7 @@ class CompetenceRegistry:
         matched: list[dict[str, Any]] = []
         reasons: list[str] = []
         for sk in candidates:
-            report = evaluate_capability(sk, task_goal)
+            report = evaluate_capability(sk, contract)
             if report.get("compatible"):
                 row = dict(sk)
                 row["_match"] = report
@@ -371,7 +371,7 @@ class CompetenceRegistry:
                 )
 
         matched.sort(key=lambda x: -float((x.get("_match") or {}).get("score") or 0))
-        tool_name = preferred_tool_name(task_goal, clf)
+        tool_name = preferred_tool_name(contract, clf)
 
         # Existing tool with same preferred name → prefer EXTEND/REUSE over new slug
         existing_preferred = self.skills.get_skill(tool_name)
@@ -409,7 +409,7 @@ class CompetenceRegistry:
                     open_branches.append(cid)
 
         return CompetencePlan(
-            task_goal=task_goal.to_dict(),
+            contract=contract.to_dict(),
             skill_ids=skill_ids,
             capability_ids=capability_ids,
             tools=matched,
@@ -423,12 +423,12 @@ class CompetenceRegistry:
     def bind_built_tool(
         self,
         skill_name: str,
-        task_goal: TaskGoal,
+        contract: TaskContract,
         *,
         verified: bool = False,
     ) -> dict[str, Any]:
         """After BUILD/PROMOTE — attach tool to classified competence (not a new skill domain)."""
-        clf = classify_task_competences(task_goal)
+        clf = classify_task_competences(contract)
         self.ensure_path(clf["skill_ids"], clf["capability_ids"])
         primary = clf["primary_skill"]
         cap = (clf["capabilities"] or ["act.unknown"])[0]
@@ -438,9 +438,9 @@ class CompetenceRegistry:
             capability=cap,
             verified=verified,
             meta={
-                "subject": task_goal.subject,
-                "actions": list(task_goal.actions),
-                "artifacts": list(task_goal.artifacts),
+                "subject": contract.subject,
+                "actions": list(contract.actions),
+                "artifacts": list(contract.artifacts),
                 "layer": LAYER_TOOL,
             },
         )
@@ -466,11 +466,11 @@ class CompetenceRegistry:
             if self.get_tool(name):
                 skipped += 1
                 continue
-            # Build a synthetic TaskGoal from skill meta for classification
+            # Build a synthetic TaskContract from skill meta for classification
             caps = list(sk.get("capabilities") or [])
             desc = str(sk.get("description") or name)
             # Prefer capability tags to pick domain; fallback to description
-            pseudo = TaskGoal.from_request(desc, goal=desc)
+            pseudo = TaskContract.from_request(desc, goal=desc)
             clf = classify_task_competences(pseudo)
             # If skill already declares io-like capabilities, honor them
             primary = clf["primary_skill"]

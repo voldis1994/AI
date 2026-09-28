@@ -1,9 +1,9 @@
 """
-Universal TaskGoal ↔ skill capability compatibility.
+Universal TaskContract ↔ skill capability compatibility.
 
 Semantic / keyword overlap alone is never enough to REUSE or REPAIR a skill.
 Selection is based on actions, artifacts, constraints, content requirements
-and success criteria derived from the TaskGoal.
+and success criteria derived from the TaskContract.
 """
 
 from __future__ import annotations
@@ -13,9 +13,9 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from jarvis.task_goal import TaskGoal
+from jarvis.task_contract import TaskContract
 
-# Tokens that never prove a skill matches a specific TaskGoal.
+# Tokens that never prove a skill matches a specific TaskContract.
 _GENERIC = frozenset(
     {
         "create", "write", "make", "build", "file", "files", "skill", "skills",
@@ -144,17 +144,17 @@ def _skill_domain_tokens(skill: dict[str, Any], meta: Optional[dict] = None) -> 
     return toks
 
 
-def _goal_domain_tokens(task_goal: TaskGoal) -> set[str]:
-    toks = _tokens(task_goal.user_request)
-    toks |= _tokens(task_goal.goal)
-    toks |= _path_tokens(list(task_goal.artifacts))
-    for c in task_goal.content_requirements:
+def _goal_domain_tokens(contract: TaskContract) -> set[str]:
+    toks = _tokens(contract.original_request)
+    toks |= _tokens(contract.goal)
+    toks |= _path_tokens(list(contract.artifacts))
+    for c in contract.content_requirements:
         # short content cues still matter as domain markers when long enough
         toks |= _tokens(str(c))
-    for a in task_goal.actions:
+    for a in contract.actions:
         if a not in _GENERIC and len(a) >= 4:
             toks.add(a.lower())
-    for crit in task_goal.success_criteria:
+    for crit in contract.acceptance_criteria:
         if ":" in crit:
             toks |= _path_tokens([crit.split(":", 1)[1]])
             toks |= _tokens(crit.split(":", 1)[1])
@@ -163,28 +163,28 @@ def _goal_domain_tokens(task_goal: TaskGoal) -> set[str]:
 
 def evaluate_capability(
     skill: dict[str, Any],
-    task_goal: TaskGoal,
+    contract: TaskContract,
 ) -> dict[str, Any]:
     """
-    Score whether ``skill`` can fulfill ``task_goal``.
+    Score whether ``skill`` can fulfill ``contract``.
 
     Returns:
       skill, score (0..1), compatible (bool), reason (str), signals (dict)
     """
     name = str((skill or {}).get("name") or "")
-    if not skill or not task_goal:
+    if not skill or not contract:
         return {
             "skill": name,
             "score": 0.0,
             "compatible": False,
-            "reason": "missing skill or TaskGoal",
+            "reason": "missing skill or TaskContract",
             "signals": {},
         }
 
     meta = _read_skill_meta(skill)
     skill_toks = _skill_domain_tokens(skill, meta)
-    goal_toks = _goal_domain_tokens(task_goal)
-    goal_arts = _path_tokens(list(task_goal.artifacts))
+    goal_toks = _goal_domain_tokens(contract)
+    goal_arts = _path_tokens(list(contract.artifacts))
     # Artifacts claimed by skill meta / description paths
     blob = _skill_text_blob(skill)
     skill_art_candidates: list[str] = list(
@@ -202,7 +202,7 @@ def evaluate_capability(
     skill_arts = _path_tokens(skill_art_candidates)
 
     # Action overlap
-    actions = {a.lower() for a in (task_goal.actions or ()) if a}
+    actions = {a.lower() for a in (contract.actions or ()) if a}
     skill_action_hay = set(_tokens(blob)) | {
         p for p in re.split(r"[_\-\s]+", name.lower()) if p
     }
@@ -212,7 +212,7 @@ def evaluate_capability(
     else:
         action_score = 0.3
 
-    # Artifact overlap — critical when TaskGoal demands concrete artifacts
+    # Artifact overlap — critical when TaskContract demands concrete artifacts
     if goal_arts:
         if skill_arts:
             art_hits = len(goal_arts & skill_arts)
@@ -238,9 +238,9 @@ def evaluate_capability(
 
     # Content requirements: if skill description hard-codes unrelated content cue
     content_score = 0.5
-    if task_goal.content_requirements:
+    if contract.content_requirements:
         content_hits = 0
-        for c in task_goal.content_requirements:
+        for c in contract.content_requirements:
             cl = str(c).lower()
             if len(cl) >= 4 and cl in blob.lower():
                 content_hits += 1
@@ -248,7 +248,7 @@ def evaluate_capability(
                 # token overlap with content
                 if _tokens(cl) & skill_toks:
                     content_hits += 1
-        content_score = content_hits / max(1, len(task_goal.content_requirements))
+        content_score = content_hits / max(1, len(contract.content_requirements))
 
     # Weighted score — artifacts + domain dominate; actions support
     score = (
@@ -270,10 +270,10 @@ def evaluate_capability(
             compatible = False
             reasons.append("domain tokens disjoint; semantic/language overlap only")
 
-    # Veto: TaskGoal asks for artifacts the skill never relates to
+    # Veto: TaskContract asks for artifacts the skill never relates to
     if goal_arts and art_score < 0.34 and domain_score < 0.5:
         compatible = False
-        reasons.append("TaskGoal artifacts not covered by skill")
+        reasons.append("TaskContract artifacts not covered by skill")
 
     # Veto: name similarity alone / weak score
     if score < _COMPAT_SCORE:
@@ -292,7 +292,7 @@ def evaluate_capability(
         reasons.append("no strong action/artifact/domain signal")
 
     if compatible and not reasons:
-        reasons.append("actions/artifacts/domain align with TaskGoal")
+        reasons.append("actions/artifacts/domain align with TaskContract")
 
     return {
         "skill": name,
@@ -306,7 +306,7 @@ def evaluate_capability(
             "content_score": round(content_score, 3),
             "skill_tokens": sorted(skill_toks)[:12],
             "goal_tokens": sorted(goal_toks)[:12],
-            "goal_artifacts": list(task_goal.artifacts)[:8],
+            "goal_artifacts": list(contract.artifacts)[:8],
         },
     }
 
@@ -314,17 +314,17 @@ def evaluate_capability(
 def verify_implies_capability_mismatch(
     verification: dict[str, Any],
     skill: dict[str, Any],
-    task_goal: TaskGoal,
+    contract: TaskContract,
 ) -> bool:
     """
     If VERIFY failed because required artifacts/content were not produced,
     re-check capability fit before REPAIR. Incompatible → BUILD_NEW.
     """
-    match = evaluate_capability(skill, task_goal)
+    match = evaluate_capability(skill, contract)
     if not match["compatible"]:
         return True
     # Compatible skill with missing artifacts → execution/repair problem, not mismatch.
-    # Only escalate when domain signals show the skill was never for this TaskGoal.
+    # Only escalate when domain signals show the skill was never for this TaskContract.
     signals = match.get("signals") or {}
     domain = float(signals.get("domain_score") or 0.0)
     art = float(signals.get("artifact_score") or 0.0)

@@ -1,14 +1,14 @@
 """
 JARVIS orchestrator — the autonomous learning cycle.
 
-REQUEST → MEMORY → PLAN → COMPETENCE classify → check capabilities/tools →
-research (gaps) → learn → build/reuse/extend TOOL under competence →
-install deps → TEST tool (process) → EXECUTE original task →
-collect artifacts → VERIFY against original TaskGoal → DONE.
+REQUEST → UNDERSTAND → VALIDATE → MEMORY → CAPABILITY → PLAN →
+RESEARCH (if needed) → BUILD (if needed) → TEST → EXECUTE → OBSERVE →
+VERIFY → REMEMBER → DONE.
 
-Hierarchy: SKILL (domain) → CAPABILITY → TOOL (executable) + KNOWLEDGE/EXPERIENCE.
-TEST PASS is never task success. DONE requires EXECUTE then VERIFY PASS.
-On VERIFY FAIL: repair with full TaskGoal context (never unchanged approach).
+Single truth: immutable TaskContract. Hierarchy:
+  SKILL/COMPETENCE → CAPABILITY → TOOL/IMPLEMENTATION + KNOWLEDGE/EXPERIENCE.
+TEST PASS is never task success. DONE/ACTIVE require independent VERIFY.
+On VERIFY FAIL: recovery repairs only the diagnosed fault layer.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any, Callable, Optional
 from jarvis.brain import Brain
 from jarvis.memory import Memory
 from jarvis.ledger import Ledger
-from jarvis.capability_registry import CapabilityRegistry
+from jarvis.implementation_registry import ImplementationRegistry
 from jarvis.competence import format_competence_log, preferred_tool_name
 from jarvis.competence_registry import CompetenceRegistry
 from jarvis.research import ResearchSystem
@@ -35,7 +35,7 @@ from jarvis.verifier import Verifier
 from jarvis.skill_loader import SkillLoader
 from jarvis.observer import Observer
 from jarvis.context_builder import ContextBuilder
-from jarvis.task_goal import TaskGoal
+from jarvis.task_contract import TaskContract
 from jarvis.intent import IntentClassifier
 from jarvis import learning_verify as learn_v
 from jarvis.knowledge_artifact import (
@@ -46,6 +46,16 @@ from jarvis.knowledge_artifact import (
 from jarvis.recovery import ProgressAwareRecovery
 from jarvis.calibration import AutoCalibration
 from jarvis.perf import PerfTracker, set_active_tracker
+from jarvis.invariants import (
+    InvariantError,
+    assert_active_requires_independent_verify,
+    assert_build_allowed,
+    assert_done_requires_verify,
+    assert_locked_truth,
+    assert_requests_isolated,
+    prior_request_isolation,
+)
+from jarvis.runtime_fingerprint import fingerprint_line
 from jarvis.capability_match import (
     evaluate_capability,
     format_decision_log,
@@ -106,6 +116,7 @@ class Orchestrator:
         self.on_event = on_event or (lambda _k, _p: None)
         # Isolates the in-flight USER REQUEST (never share final_result across turns)
         self._active_request_id: Optional[str] = None
+        self._prev_request_id: Optional[str] = None
 
         db = self.data_dir / "jarvis.db"
         self.brain = brain or Brain(on_log=self._log)
@@ -114,7 +125,7 @@ class Orchestrator:
             self.brain.set_logger(self._log)
         self.memory = Memory(db)
         self.ledger = Ledger(db)
-        self.registry = CapabilityRegistry(db)
+        self.registry = ImplementationRegistry(db)
         # Hierarchical SKILL / CAPABILITY / TOOL index (tools keep .py lifecycle)
         self.competences = CompetenceRegistry(db, self.registry)
         try:
@@ -187,6 +198,11 @@ class Orchestrator:
             f"{self.calibration.window_success_rate():.2f} "
             f"approaches={len(self.calibration.approaches)}"
         )
+        # Startup runtime fingerprint (commit / build) — always visible in logs
+        try:
+            self._log(fingerprint_line())
+        except Exception as exc:
+            self._log(f"JARVIS RUNTIME fingerprint unavailable ({exc})")
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -208,8 +224,21 @@ class Orchestrator:
                 "request_id": request_id,
             }
 
+        # Hard isolation — never reuse a prior request_id / result bundle
+        try:
+            assert_requests_isolated(self._prev_request_id, request_id)
+        except InvariantError as inv:
+            self._log(f"INVARIANT: {inv}")
+            request_id = uuid.uuid4().hex[:12]
+            assert_requests_isolated(self._prev_request_id, request_id)
+        if not prior_request_isolation(self._prev_request_id, request_id):
+            raise InvariantError(
+                f"request isolation failed prev={self._prev_request_id} new={request_id}"
+            )
+
         # Per-request state — do not read/write cross-request result caches
         self._active_request_id = request_id
+        self._verified_exec_bundle = None
         self._request_cache = {}
         self.perf = PerfTracker(request_id)
         set_active_tracker(self.perf)
@@ -487,11 +516,14 @@ class Orchestrator:
             out["success"] = success
         if extra:
             out.update(extra)
+        # Record prior id for isolation checks on the next request
+        self._prev_request_id = request_id
         # Clear active id only if we still own the turn
         if getattr(self, "_active_request_id", None) == request_id:
             self._active_request_id = None
             set_active_tracker(None)
             self._request_cache = {}
+            self._verified_exec_bundle = None
             if hasattr(self.brain, "end_request_pool"):
                 try:
                     pool_ctx = self.brain.end_request_pool()
@@ -515,24 +547,24 @@ class Orchestrator:
         before new research. Does not build/repair skills.
         """
         user_request = (original_request or goal or "").strip()
-        task_goal = TaskGoal.from_request(user_request, goal=goal)
-        goal = task_goal.goal
-        # Subject/topic from TaskGoal — never invent a disambiguated sense
-        topic = task_goal.memory_topic()
+        contract = TaskContract.from_request(user_request, goal=goal)
+        goal = contract.goal
+        # Subject/topic from TaskContract — never invent a disambiguated sense
+        topic = contract.memory_topic()
         learn_key = f"learning:{topic}"
         request_id = uuid.uuid4().hex[:12]
         task_id = self.ledger.start_task(goal)
         self._status("REQUEST")
         self._log(
-            f"[{task_id}] REQUEST (learning): {task_goal.user_request} "
-            f"subject={task_goal.subject!r} request_id={request_id}"
+            f"[{task_id}] REQUEST (learning): {contract.original_request} "
+            f"subject={contract.subject!r} request_id={request_id}"
         )
         self.ledger.log(
             task_id,
             "REQUEST",
-            "Learning TaskGoal frozen (KnowledgeArtifact path)",
+            "Learning TaskContract frozen (KnowledgeArtifact path)",
             {
-                **task_goal.to_dict(),
+                **contract.to_dict(),
                 "topic": topic,
                 "intent": "learning",
                 "request_id": request_id,
@@ -540,18 +572,18 @@ class Orchestrator:
         )
 
         try:
-            # ── MEMORY RETRIEVAL by TaskGoal.subject (before any SEARCH) ─
+            # ── MEMORY RETRIEVAL by TaskContract.subject (before any SEARCH) ─
             self._status("MEMORY")
             retrieved = self.memory.retrieve_relevant_knowledge(
-                task_goal.user_request,
+                contract.original_request,
                 topic=topic,
                 limit=8,
                 verified_only=False,
             )
             self._log(
                 f"MEMORY RETRIEVAL: topic={topic} "
-                f"subject={task_goal.subject!r} "
-                f"content_source={list(task_goal.content_source)!r} "
+                f"subject={contract.subject!r} "
+                f"content_source={list(contract.content_source)!r} "
                 f"entries={retrieved.get('count', 0)} "
                 f"verified={retrieved.get('verified_count', 0)} "
                 f"request_id={request_id}"
@@ -569,7 +601,7 @@ class Orchestrator:
             artifact = KnowledgeArtifact(
                 request_id=request_id,
                 topic=topic,
-                user_request=task_goal.user_request,
+                original_request=contract.original_request,
             )
             research: dict[str, Any] = {}
             # Prefer verified knowledge BEFORE any new research
@@ -577,9 +609,9 @@ class Orchestrator:
                 artifact = KnowledgeArtifact.from_dict(verified_prior[-1])
                 artifact.request_id = request_id
                 artifact.topic = topic
-                artifact.user_request = task_goal.user_request
+                artifact.original_request = contract.original_request
                 artifact.practical_result = self._produce_learning_practical(
-                    task_goal.user_request, artifact.research_compat()
+                    contract.original_request, artifact.research_compat()
                 )
                 research = self._research_from_artifact(artifact)
                 self._log(
@@ -587,7 +619,7 @@ class Orchestrator:
                     f"(skip full research) request_id={request_id}"
                 )
                 verification = self._verify_learning_knowledge(
-                    task_goal, research, verified_prior[-1]
+                    contract, research, verified_prior[-1]
                 )
                 if verification.get("verified"):
                     self.calibration.observe_verify(
@@ -613,7 +645,7 @@ class Orchestrator:
                 # Verified blob exists but gaps vs THIS request → search only missing
                 missing_from_mem = list(
                     verification.get("missing_knowledge")
-                    or artifact.missing_fields(task_goal.user_request)
+                    or artifact.missing_fields(contract.original_request)
                 )
                 self._log(
                     f"MEMORY USED: partial — verified base kept; "
@@ -627,7 +659,7 @@ class Orchestrator:
             queries = self._initial_learning_queries(goal)
             if gap_fill_seed and missing_from_mem:
                 queries = gap_fill_queries(
-                    task_goal.user_request, missing_from_mem
+                    contract.original_request, missing_from_mem
                 )[:6]
             current_approach = "knowledge_artifact_synthesis"
             # Prefer historically successful learning approaches when known
@@ -712,7 +744,7 @@ class Orchestrator:
                 # Deterministic KnowledgeArtifact synthesis from EXTRACTED pages
                 # (SEARCH snippets alone must not become knowledge)
                 artifact = self._synthesize_learning_artifact(
-                    user_request=task_goal.user_request,
+                    original_request=contract.original_request,
                     topic=topic,
                     request_id=request_id,
                     research=fresh,
@@ -734,7 +766,7 @@ class Orchestrator:
                     )
                 # Practical result on the clean artifact (offline first)
                 artifact.practical_result = self._produce_learning_practical(
-                    task_goal.user_request, artifact.research_compat()
+                    contract.original_request, artifact.research_compat()
                 )
                 research = self._research_from_artifact(artifact)
                 # Keep scrape metadata out of VERIFY path but retain for ledger
@@ -779,7 +811,7 @@ class Orchestrator:
                 # VERIFY: USER REQUEST ↔ KnowledgeArtifact only
                 self._status("VERIFY")
                 verification = self._verify_learning_knowledge(
-                    task_goal, research, saved.get("entry") or {}
+                    contract, research, saved.get("entry") or {}
                 )
                 self._emit_verify(verification, context="learning")
                 self.ledger.log(
@@ -798,7 +830,7 @@ class Orchestrator:
                             "examples": len(artifact.examples),
                             "has_practical": bool(artifact.practical_result),
                         },
-                        "task_goal": task_goal.to_dict(),
+                        "contract": contract.to_dict(),
                     },
                 )
                 self._log(
@@ -842,13 +874,13 @@ class Orchestrator:
                     skill_code="",
                     context={
                         "goal": goal,
-                        "user_request": task_goal.user_request,
+                        "original_request": contract.original_request,
                         "topic": topic,
                         "approach": current_approach,
                         "request_id": request_id,
                         "mode": "learning",
                         "artifact_gaps_hint": artifact.missing_fields(
-                            task_goal.user_request
+                            contract.original_request
                         ),
                     },
                     test_result={
@@ -888,7 +920,7 @@ class Orchestrator:
                 self._status("DIAGNOSE")
                 failed_approaches = self.memory.get_failed_approaches(learn_key)
                 diagnosis = self._diagnose_learning_gap(
-                    task_goal=task_goal,
+                    contract=contract,
                     observation=observation,
                     verification=verification,
                     research=research,
@@ -942,7 +974,7 @@ class Orchestrator:
 
                 # Next attempt fills ONLY missing fields (local — no full restart)
                 queries = list(diagnosis.get("research_queries") or []) or gap_fill_queries(
-                    task_goal.user_request,
+                    contract.original_request,
                     list(diagnosis.get("missing_knowledge") or ["explanations"]),
                 )
                 queries = queries[:6]
@@ -1028,7 +1060,7 @@ class Orchestrator:
     def _synthesize_learning_artifact(
         self,
         *,
-        user_request: str,
+        original_request: str,
         topic: str,
         request_id: str,
         research: dict[str, Any],
@@ -1037,7 +1069,7 @@ class Orchestrator:
     ) -> KnowledgeArtifact:
         """Hookable offline synthesis — tests may override; production stays deterministic."""
         return synthesize_offline(
-            user_request=user_request,
+            user_request=original_request,
             topic=topic,
             request_id=request_id,
             research=research,
@@ -1298,7 +1330,7 @@ class Orchestrator:
     def _diagnose_learning_gap(
         self,
         *,
-        task_goal: TaskGoal,
+        contract: TaskContract,
         observation: dict[str, Any],
         verification: dict[str, Any],
         research: dict[str, Any],
@@ -1314,7 +1346,7 @@ class Orchestrator:
         """
         # Prefer artifact-field gaps over coarse check names
         artifact_gaps = learn_v.diagnose_artifact_gaps(
-            task_goal.user_request, research, None
+            contract.original_request, research, None
         )
         missing = list(artifact_gaps)
         if not missing:
@@ -1343,7 +1375,7 @@ class Orchestrator:
                 missing.append(m)
 
         root = str(verification.get("reason") or observation.get("exception") or "")[:500]
-        queries = gap_fill_queries(task_goal.user_request, missing)
+        queries = gap_fill_queries(contract.original_request, missing)
         approach = (
             f"gap_fill_{'+'.join(str(m)[:20] for m in missing[:3]) or 'fields'}"
             f"_v{attempt + 1}"
@@ -1364,7 +1396,7 @@ class Orchestrator:
 
     def _verify_learning_knowledge(
         self,
-        task_goal: TaskGoal,
+        contract: TaskContract,
         research: dict[str, Any],
         entry: dict[str, Any],
     ) -> dict[str, Any]:
@@ -1376,7 +1408,7 @@ class Orchestrator:
         """
         checks: list[dict[str, Any]] = []
         missing: list[str] = []
-        request = task_goal.user_request
+        request = contract.original_request
 
         # Normalize to artifact payload (strip raw/results if sneaked in)
         verify_research = dict(research or {})
@@ -1550,104 +1582,115 @@ class Orchestrator:
         }
 
     def run_cycle(self, goal: str, original_request: Optional[str] = None) -> dict[str, Any]:
-        """Execute the full REQUEST→…→DONE action/skill cycle."""
-        # Immutable TaskGoal for the whole cycle — never overwrite user_request.
+        """Execute the full REQUEST→UNDERSTAND→VALIDATE→…→DONE cycle."""
         user_request = (original_request or goal or "").strip()
-        task_goal = TaskGoal.from_request(user_request, goal=goal)
-        goal = task_goal.goal  # planner summary; VERIFY always uses task_goal
-
-        task_id = self.ledger.start_task(goal)
+        task_id = self.ledger.start_task(user_request or goal or "task")
         # Fresh cycle — never carry TEST/prior EXECUTE proof into DONE
         self._verified_exec_bundle = None
+        self._request_cache = {}
         self._status("REQUEST")
-        self._log(f"[{task_id}] REQUEST: {task_goal.user_request}")
-        self.ledger.log(
-            task_id,
-            "REQUEST",
-            "TaskGoal frozen",
-            task_goal.to_dict(),
-        )
-        # Classify PATH/FILE/LIBRARY/… before any research or install
-        self._log_request_items(task_id, task_goal)
+        self._log(f"[{task_id}] REQUEST: {user_request}")
 
         try:
-            # GOAL_REFINE — never PLAN/BUILD with empty/unverifiable success_criteria
-            if task_goal.needs_goal_refine():
-                self.perf.begin("GOAL_REFINE")
-                self._status("GOAL_REFINE")
-                self._log(
-                    f"[{task_id}] GOAL_REFINE: success_criteria unverifiable — "
-                    f"refining TaskGoal from USER REQUEST before PLAN"
+            # UNDERSTAND — derive structured TaskContract (single truth source)
+            self.perf.begin("UNDERSTAND")
+            self._status("UNDERSTAND")
+            contract = TaskContract.understand(
+                user_request,
+                request_id=task_id,
+                intent="task",
+                brain=self.brain,
+            )
+            goal = contract.original_request
+            self._log(
+                f"[{task_id}] UNDERSTAND: outcomes={list(contract.desired_outcomes)[:4]} "
+                f"artifacts={list(contract.artifacts)[:4]} "
+                f"behaviors={len(contract.behaviors)} "
+                f"criteria={list(contract.acceptance_criteria)[:4]}"
+            )
+            self.ledger.log(task_id, "UNDERSTAND", "TaskContract derived", contract.to_dict())
+            self.perf.end("UNDERSTAND", verifiable=contract.is_verifiable())
+            self._log_request_items(task_id, contract)
+
+            # VALIDATE — freeze acceptance_criteria; refuse empty contracts
+            self.perf.begin("VALIDATE")
+            self._status("VALIDATE")
+            brain_for_validate = (
+                self.brain if self.brain.is_available() else None
+            )
+            if contract.needs_refine():
+                contract = TaskContract.refine(
+                    contract, brain=brain_for_validate
                 )
-                brain_for_refine = (
-                    self.brain if self.brain.is_available() else None
+            contract = TaskContract.validate(contract)
+            self._log(
+                f"[{task_id}] VALIDATE: "
+                f"{'ok' if contract.validated and contract.is_verifiable() else 'unverifiable'} "
+                f"criteria={list(contract.acceptance_criteria)[:4]}"
+            )
+            self.ledger.log(
+                task_id,
+                "VALIDATE",
+                (
+                    "validated"
+                    if contract.validated and contract.is_verifiable()
+                    else "unverifiable"
+                ),
+                contract.to_dict(),
+            )
+            self.perf.end(
+                "VALIDATE",
+                verifiable=contract.is_verifiable(),
+                validated=contract.validated,
+            )
+            if contract.needs_refine() or not contract.validated:
+                outcome = (
+                    "VALIDATE FAIL: cannot derive verifiable "
+                    "acceptance_criteria from USER REQUEST — refusing to "
+                    "continue with empty TaskContract "
+                    "(fault_layer=goal_parsing)."
                 )
-                task_goal = TaskGoal.refine(
-                    task_goal, brain=brain_for_refine
+                self._log(f"[{task_id}] {outcome}")
+                self.memory.save_experience(
+                    goal,
+                    outcome,
+                    False,
+                    details={
+                        "task_id": task_id,
+                        "fault_layer": "goal_parsing",
+                        "contract": contract.to_dict(),
+                    },
                 )
-                goal = task_goal.goal
                 self.ledger.log(
                     task_id,
-                    "GOAL_REFINE",
-                    (
-                        "refined"
-                        if task_goal.has_verifiable_constraints()
-                        else "still_unverifiable"
-                    ),
-                    task_goal.to_dict(),
-                )
-                self.perf.end(
-                    "GOAL_REFINE",
-                    verifiable=task_goal.has_verifiable_constraints(),
-                )
-                if task_goal.needs_goal_refine():
-                    outcome = (
-                        "GOAL_REFINE FAIL: cannot derive verifiable "
-                        "success_criteria from USER REQUEST — refusing to "
-                        "continue with empty constraints "
-                        "(fault_layer=goal_parsing)."
-                    )
-                    self._log(f"[{task_id}] {outcome}")
-                    self.memory.save_experience(
-                        goal,
-                        outcome,
-                        False,
-                        details={
-                            "task_id": task_id,
-                            "fault_layer": "goal_parsing",
-                            "task_goal": task_goal.to_dict(),
-                        },
-                    )
-                    self.ledger.log(
-                        task_id,
-                        "FAIL",
-                        outcome,
-                        {
-                            "fault_layer": "goal_parsing",
-                            "rewrite_skill": False,
-                            "task_goal": task_goal.to_dict(),
-                        },
-                    )
-                    self.ledger.finish(
-                        task_id, False, {"outcome": outcome, "fault_layer": "goal_parsing"}
-                    )
-                    return {
-                        "type": "task",
-                        "success": False,
-                        "task_id": task_id,
-                        "reply": outcome,
-                        "outcome": outcome,
+                    "FAIL",
+                    outcome,
+                    {
                         "fault_layer": "goal_parsing",
-                        "task_goal": task_goal.to_dict(),
-                    }
+                        "rewrite_skill": False,
+                        "contract": contract.to_dict(),
+                    },
+                )
+                self.ledger.finish(
+                    task_id, False, {"outcome": outcome, "fault_layer": "goal_parsing"}
+                )
+                return {
+                    "type": "task",
+                    "success": False,
+                    "task_id": task_id,
+                    "reply": outcome,
+                    "outcome": outcome,
+                    "fault_layer": "goal_parsing",
+                    "contract": contract.to_dict(),
+                }
 
-            # MEMORY first — retrieve by TaskGoal.subject/topic before PLAN/RESEARCH
+            # MEMORY first — retrieve by TaskContract.subject/topic before PLAN/RESEARCH
             self.perf.begin("MEMORY")
             self._status("MEMORY")
-            mem_topic = task_goal.memory_topic()
+            mem_topic = contract.memory_topic()
             mem_pack = (
                 self.memory.retrieve_relevant_knowledge(
-                    task_goal.user_request,
+                    contract.original_request,
                     topic=mem_topic,
                     limit=6,
                 )
@@ -1665,13 +1708,13 @@ class Orchestrator:
                 self._log(
                     f"[{task_id}] MEMORY: topic={mem_topic!r} "
                     f"hits={len(mem_hits)} verified={len(mem_verified)} "
-                    f"subject={task_goal.subject!r} "
+                    f"subject={contract.subject!r} "
                     f"— prefer reuse before research"
                 )
-            elif task_goal.prefers_memory_first():
+            elif contract.prefers_memory_first():
                 self._log(
-                    f"[{task_id}] MEMORY: subject={task_goal.subject!r} "
-                    f"content_source={list(task_goal.content_source)!r} "
+                    f"[{task_id}] MEMORY: subject={contract.subject!r} "
+                    f"content_source={list(contract.content_source)!r} "
                     f"— no prior hits; RESEARCH only for gaps"
                 )
             self.perf.end("MEMORY", hits=len(mem_hits), topic=mem_topic)
@@ -1680,7 +1723,7 @@ class Orchestrator:
             self.perf.begin("PLAN")
             self._status("PLAN")
             caps = self.registry.active_capabilities()
-            cache_key = f"plan:{task_goal.user_request}"
+            cache_key = f"plan:{contract.original_request}"
             if cache_key in self._request_cache:
                 plan = dict(self._request_cache[cache_key])
                 self._log(f"[{task_id}] PLAN: cache hit (reuse within request)")
@@ -1692,13 +1735,13 @@ class Orchestrator:
                         llm_plan = self.brain.plan(goal, caps)
                         if isinstance(llm_plan, dict) and llm_plan.get("steps"):
                             # Merge — keep offline grounded args if LLM invented word-keys
-                            offline_args = TaskGoal.sanitize_args(
+                            offline_args = TaskContract.sanitize_args(
                                 dict(plan.get("args") or {}),
-                                task_goal.user_request,
+                                contract.original_request,
                             )
-                            llm_args = TaskGoal.sanitize_args(
+                            llm_args = TaskContract.sanitize_args(
                                 dict(llm_plan.get("args") or {}),
-                                task_goal.user_request,
+                                contract.original_request,
                             )
                             merged = dict(plan)
                             merged.update({
@@ -1716,19 +1759,19 @@ class Orchestrator:
                             # Drop polluted required_args that are request tokens
                             merged["required_args"] = [
                                 k for k in merged["required_args"]
-                                if not TaskGoal.is_polluted_arg_key(
-                                    k, task_goal.user_request
+                                if not TaskContract.is_polluted_arg_key(
+                                    k, contract.original_request
                                 )
                             ]
                             plan = merged
                     except Exception as exc:
                         self._log(f"[{task_id}] PLAN: FAST refine failed ({exc})")
-                # Ground research queries against full TaskGoal (reject drift)
-                plan["research_queries"] = task_goal.ground_research_queries(
+                # Ground research queries against full TaskContract (reject drift)
+                plan["research_queries"] = contract.ground_research_queries(
                     plan.get("research_queries") or []
                 )
                 # MEMORY-first: skip entry research when verified subject knowledge exists
-                if task_goal.prefers_memory_first() and mem_verified:
+                if contract.prefers_memory_first() and mem_verified:
                     plan["needs_research"] = False
                     plan["memory_satisfied"] = True
                 elif mem_verified and not plan.get("needs_research", True):
@@ -1740,18 +1783,18 @@ class Orchestrator:
                 "Plan created",
                 {
                     **plan,
-                    "task_goal_subject": task_goal.subject,
-                    "task_goal_content_source": list(task_goal.content_source),
+                    "contract_subject": contract.subject,
+                    "contract_content_source": list(contract.content_source),
                 },
             )
             self._log(
                 f"[{task_id}] PLAN: {plan.get('steps')} "
-                f"| subject={task_goal.subject!r} "
+                f"| subject={contract.subject!r} "
                 f"queries={plan.get('research_queries')!r}"
             )
             self.perf.end("PLAN")
 
-            # CONTEXT: map TaskGoal → skill input schema (no invented defaults)
+            # CONTEXT: map TaskContract → skill input schema (no invented defaults)
             self.perf.begin("CONTEXT")
             task_args = {}
             if isinstance(plan.get("args"), dict):
@@ -1759,7 +1802,7 @@ class Orchestrator:
             # Filter polluted required_args before diagnosis fill
             req_args = [
                 k for k in (plan.get("required_args") or [])
-                if not TaskGoal.is_polluted_arg_key(str(k), task_goal.user_request)
+                if not TaskContract.is_polluted_arg_key(str(k), contract.original_request)
             ]
             ctx0 = self.contexts.build(
                 goal,
@@ -1767,32 +1810,32 @@ class Orchestrator:
                 mode="plan",
                 prior_args=task_args,
                 diagnosis={"required_args": req_args},
-                user_request=task_goal.user_request,
-                task_goal=task_goal,
+                user_request=contract.original_request,
+                contract=contract,
             )
             task_args = dict(ctx0.get("args") or {})
-            task_goal = task_goal.with_args(task_args)
+            contract = contract.with_args(task_args)
             self.ledger.log(
                 task_id,
                 "CONTEXT",
-                f"Mapped TaskGoal → args keys={list(task_args.keys())}",
+                f"Mapped TaskContract → args keys={list(task_args.keys())}",
                 {
                     "args": task_args,
-                    "constraints": task_goal.constraints,
-                    "actions": list(task_goal.actions),
-                    "artifacts": list(task_goal.artifacts),
-                    "subject": task_goal.subject,
-                    "content_requirements": list(task_goal.content_requirements),
-                    "content_source": list(task_goal.content_source),
-                    "success_criteria": list(task_goal.success_criteria),
+                    "constraints": contract.constraints,
+                    "actions": list(contract.actions),
+                    "artifacts": list(contract.artifacts),
+                    "subject": contract.subject,
+                    "content_requirements": list(contract.content_requirements),
+                    "content_source": list(contract.content_source),
+                    "acceptance_criteria": list(contract.acceptance_criteria),
                 },
             )
             self.perf.end("CONTEXT", arg_count=len(task_args))
 
-            # CHECK CAPABILITIES — hierarchical competences + TaskGoal-compatible tools
+            # CHECK CAPABILITIES — hierarchical competences + TaskContract-compatible tools
             self._status("CHECK_CAPABILITIES")
-            plan = self._sanitize_action_plan(plan, goal, task_goal=task_goal)
-            comp_plan = self.competences.plan_for_goal(task_goal)
+            plan = self._sanitize_action_plan(plan, goal, contract=contract)
+            comp_plan = self.competences.plan_for_goal(contract)
             self._request_cache["competence_plan"] = comp_plan.to_dict()
             self._log(format_competence_log(comp_plan))
             self.ledger.log(
@@ -1815,7 +1858,7 @@ class Orchestrator:
                     plan["skill_name"] = comp_plan.preferred_tool_name
             else:
                 matched, match_reports = self._select_compatible_skills(
-                    plan, task_goal, task_id=task_id
+                    plan, contract, task_id=task_id
                 )
                 # Steer BUILD toward competence tool name (not request-slug skill)
                 if comp_plan.needs_new_tool and comp_plan.preferred_tool_name:
@@ -1827,11 +1870,11 @@ class Orchestrator:
                     if (
                         not planned
                         or planned == Brain._slug(goal)[:40]
-                        or planned == Brain._slug(task_goal.user_request)[:40]
+                        or planned == Brain._slug(contract.original_request)[:40]
                         or (
                             existing_planned
                             and not self._skill_fits_goal(
-                                existing_planned, goal, task_goal=task_goal
+                                existing_planned, goal, contract=contract
                             )
                         )
                     ):
@@ -1878,19 +1921,19 @@ class Orchestrator:
             if matched and not plan.get("needs_new_skill"):
                 skill_record = matched[0]
                 self._log(f"[{task_id}] Reusing ACTIVE skill: {skill_record['name']}")
-                # Refresh args with skill meta hints — still grounded to TaskGoal
+                # Refresh args with skill meta hints — still grounded to TaskContract
                 task_args = self.contexts.build(
                     goal,
                     str(self.workspace),
                     mode="execute",
                     skill_meta=skill_record,
                     prior_args=task_args,
-                    user_request=task_goal.user_request,
-                    task_goal=task_goal,
+                    user_request=contract.original_request,
+                    contract=contract,
                 ).get("args") or task_args
-                task_goal = task_goal.with_args(task_args)
+                contract = contract.with_args(task_args)
                 exec_result = self._execute_trusted(
-                    task_id, skill_record, goal, args=task_args, task_goal=task_goal
+                    task_id, skill_record, goal, args=task_args, contract=contract
                 )
                 if not exec_result.get("ok"):
                     # Compatible skill failed execution → REPAIR (not BUILD_NEW)
@@ -1911,13 +1954,13 @@ class Orchestrator:
                     self._log(
                         f"[{task_id}] Skill broken — entering repair path"
                     )
-                    skill_record, task_args, task_goal = self._learn_or_repair(
+                    skill_record, task_args, contract = self._learn_or_repair(
                         task_id, goal, plan, repair_of=skill_record,
-                        task_args=task_args, task_goal=task_goal,
+                        task_args=task_args, contract=contract,
                     )
                     if skill_record and skill_record["status"] == "ACTIVE":
                         exec_result = self._exec_after_repair(
-                            task_id, skill_record, goal, task_args, task_goal
+                            task_id, skill_record, goal, task_args, contract
                         )
             else:
                 build_label = (
@@ -1935,13 +1978,13 @@ class Orchestrator:
                         ),
                     )
                 )
-                skill_record, task_args, task_goal = self._learn_or_repair(
+                skill_record, task_args, contract = self._learn_or_repair(
                     task_id, goal, plan, repair_of=None,
-                    task_args=task_args, task_goal=task_goal,
+                    task_args=task_args, contract=contract,
                 )
                 if skill_record and skill_record["status"] == "ACTIVE":
                     exec_result = self._exec_after_repair(
-                        task_id, skill_record, goal, task_args, task_goal
+                        task_id, skill_record, goal, task_args, contract
                     )
 
             # VERIFY only after EXECUTE of the original task (TEST ≠ task success)
@@ -1999,7 +2042,7 @@ class Orchestrator:
                         "skill_result": verification.get("skill_result"),
                         "verifier_result": verification.get("verifier_result"),
                         "args": task_args,
-                        "task_goal": task_goal.to_dict(),
+                        "contract": contract.to_dict(),
                         "actual_artifacts": actual_artifacts[:20],
                         "after_execute": True,
                         "reused_verified_exec_bundle": True,
@@ -2011,9 +2054,9 @@ class Orchestrator:
                     exec_result,
                     require_brain_confirm=False,
                     args=task_args,
-                    user_request=task_goal.user_request,
-                    constraints=task_goal.with_args(task_args).constraints,
-                    task_goal=task_goal,
+                    user_request=contract.original_request,
+                    constraints=contract.with_args(task_args).constraints,
+                    contract=contract,
                 )
                 self.ledger.log(
                     task_id,
@@ -2023,7 +2066,7 @@ class Orchestrator:
                         "skill_result": verification.get("skill_result"),
                         "verifier_result": verification.get("verifier_result"),
                         "args": task_args,
-                        "task_goal": task_goal.to_dict(),
+                        "contract": contract.to_dict(),
                         "actual_artifacts": actual_artifacts[:20],
                         "after_execute": True,
                     },
@@ -2045,11 +2088,11 @@ class Orchestrator:
             # VERIFY FAIL → capability mismatch? BUILD_NEW : REPAIR compatible skill
             if not verification.get("verified"):
                 repair_target = skill_record
-                if skill_record and task_goal is not None:
-                    compat = evaluate_capability(skill_record, task_goal)
+                if skill_record and contract is not None:
+                    compat = evaluate_capability(skill_record, contract)
                     self._log(format_match_log(compat))
                     mismatch = verify_implies_capability_mismatch(
-                        verification, skill_record, task_goal
+                        verification, skill_record, contract
                     )
                     if mismatch or not compat.get("compatible"):
                         self._log(
@@ -2068,7 +2111,7 @@ class Orchestrator:
                         plan["needs_research"] = True
                         plan["can_reuse"] = []
                         plan["skill_name"] = (
-                            Brain._slug(task_goal.user_request)[:40] or "new_skill"
+                            Brain._slug(contract.original_request)[:40] or "new_skill"
                         )
                         repair_target = None
                     else:
@@ -2076,7 +2119,7 @@ class Orchestrator:
                             format_decision_log(
                                 "REPAIR",
                                 skill=skill_record["name"],
-                                detail="VERIFY fail on TaskGoal-compatible skill",
+                                detail="VERIFY fail on TaskContract-compatible skill",
                             )
                         )
                 if skill_record and repair_target is not None:
@@ -2094,26 +2137,26 @@ class Orchestrator:
                         },
                     )
                 self._log(
-                    f"[{task_id}] VERIFY FAIL vs TaskGoal — "
+                    f"[{task_id}] VERIFY FAIL vs TaskContract — "
                     + (
                         "BUILD_NEW (capability mismatch)"
                         if repair_target is None
                         else "entering OBSERVE→DIAGNOSE→REPAIR→RETEST"
                     )
                 )
-                skill_record, task_args, task_goal = self._learn_or_repair(
+                skill_record, task_args, contract = self._learn_or_repair(
                     task_id,
                     goal,
                     plan,
                     repair_of=repair_target,
                     task_args=task_args,
                     verify_failure=verification if repair_target is not None else None,
-                    task_goal=task_goal,
+                    contract=contract,
                 )
                 if skill_record and skill_record.get("status") == "ACTIVE":
                     # EXECUTE+VERIFY after repair — reuse bundle only if post-EXECUTE
                     exec_result = self._exec_after_repair(
-                        task_id, skill_record, goal, task_args, task_goal
+                        task_id, skill_record, goal, task_args, contract
                     )
                     self._status("VERIFY")
                     if (
@@ -2137,9 +2180,9 @@ class Orchestrator:
                             exec_result,
                             require_brain_confirm=False,
                             args=task_args,
-                            user_request=task_goal.user_request,
-                            constraints=task_goal.with_args(task_args).constraints,
-                            task_goal=task_goal,
+                            user_request=contract.original_request,
+                            constraints=contract.with_args(task_args).constraints,
+                            contract=contract,
                         )
                     self.ledger.log(
                         task_id,
@@ -2149,7 +2192,7 @@ class Orchestrator:
                             "skill_result": verification.get("skill_result"),
                             "verifier_result": verification.get("verifier_result"),
                             "args": task_args,
-                            "task_goal": task_goal.to_dict(),
+                            "contract": contract.to_dict(),
                             "actual_artifacts": actual_artifacts[:20],
                             "after_repair": True,
                             "after_execute": True,
@@ -2195,13 +2238,35 @@ class Orchestrator:
                     "verifier_result": verification.get("verifier_result"),
                 }
 
-            # SUCCESS path — DONE only after verifier PASS
+            # SUCCESS path — DONE only after independent verifier PASS + evidence
+            try:
+                assert_done_requires_verify(
+                    verified=bool(verification.get("verified")),
+                    has_evidence=bool(
+                        verification.get("checks")
+                        or exec_result.get("result") is not None
+                        or exec_result.get("evidence")
+                    ),
+                )
+            except InvariantError as inv:
+                outcome = f"DONE refused — {inv}"
+                self._log(f"[{task_id}] INVARIANT: {outcome}")
+                self.ledger.finish(task_id, False, {"outcome": outcome})
+                return {
+                    "type": "task",
+                    "success": False,
+                    "task_id": task_id,
+                    "reply": outcome,
+                    "outcome": outcome,
+                    "verifier_result": verification.get("verifier_result"),
+                }
+            self._status("REMEMBER")
             if skill_record:
                 self.registry.mark_success(skill_record["name"])
                 try:
                     self.competences.mark_tool_verified(skill_record["name"], True)
                     self.competences.bind_built_tool(
-                        skill_record["name"], task_goal, verified=True
+                        skill_record["name"], contract, verified=True
                     )
                     for sid in (self._request_cache.get("competence_plan") or {}).get(
                         "skill_ids"
@@ -2234,10 +2299,11 @@ class Orchestrator:
                     "evidence": exec_result.get("evidence"),
                     "verification": verification,
                     "task_id": task_id,
+                    "contract": contract.to_dict(),
                     "competence": self._request_cache.get("competence_plan"),
                 },
             )
-            self.ledger.log(task_id, "SAVE_EXPERIENCE", "Experience saved")
+            self.ledger.log(task_id, "SAVE_EXPERIENCE", "Experience saved / REMEMBER")
             self.ledger.finish(
                 task_id,
                 True,
@@ -2245,10 +2311,11 @@ class Orchestrator:
                     "result": exec_result.get("result"),
                     "evidence": exec_result.get("evidence"),
                     "skill": (skill_record or {}).get("name"),
+                    "contract_id": contract.request_id,
                 },
             )
             self._status("DONE")
-            self._log(f"[{task_id}] DONE")
+            self._log(f"[{task_id}] DONE (contract={contract.request_id})")
             return {
                 "type": "task",
                 "success": True,
@@ -2258,6 +2325,7 @@ class Orchestrator:
                 "result": exec_result.get("result"),
                 "evidence": exec_result.get("evidence"),
                 "skill": (skill_record or {}).get("name"),
+                "contract": contract.to_dict(),
             }
 
         except Exception as exc:
@@ -2284,30 +2352,30 @@ class Orchestrator:
         repair_of: Optional[dict] = None,
         task_args: Optional[dict] = None,
         verify_failure: Optional[dict] = None,
-        task_goal: Optional[TaskGoal] = None,
-    ) -> tuple[Optional[dict], dict, TaskGoal]:
+        contract: Optional[TaskContract] = None,
+    ) -> tuple[Optional[dict], dict, TaskContract]:
         """
         Universal learning loop (no task-specific hardcoding):
 
         BUILD/REPAIR → TEST (process only) → EXECUTE original task →
-        collect artifacts → VERIFY vs TaskGoal → ACTIVE + verified bundle.
+        collect artifacts → VERIFY vs TaskContract → ACTIVE + verified bundle.
 
         TEST PASS never activates or marks task success. On VERIFY FAIL:
-        OBSERVE → DIAGNOSE → REPAIR with full TaskGoal context (never an
+        OBSERVE → DIAGNOSE → REPAIR with full TaskContract context (never an
         unchanged repair approach). Outer run_cycle may reuse the verified
         EXECUTE bundle for DONE, or re-enter here with verify_failure.
 
-        TaskGoal (original USER REQUEST) is immutable across the whole loop.
-        Returns (skill_record, task_args, task_goal).
+        TaskContract (original USER REQUEST) is immutable across the whole loop.
+        Returns (skill_record, task_args, contract).
         """
-        if task_goal is None:
-            task_goal = TaskGoal.from_request(goal, goal=goal)
+        if contract is None:
+            contract = TaskContract.from_request(goal, goal=goal)
         # Skill name from THIS goal — never inherit an unrelated EXISTING skill
         planned_name = str(plan.get("skill_name") or "").strip()
         if planned_name and not repair_of:
             existing_planned = self.registry.get_skill(planned_name)
             if existing_planned and not self._skill_fits_goal(
-                existing_planned, goal, task_goal=task_goal
+                existing_planned, goal, contract=contract
             ):
                 self._log(
                     f"[{task_id}] Ignoring unrelated existing skill_name="
@@ -2317,34 +2385,34 @@ class Orchestrator:
                     format_decision_log(
                         "BUILD_NEW",
                         skill=planned_name,
-                        detail="planned skill incompatible with TaskGoal",
+                        detail="planned skill incompatible with TaskContract",
                     )
                 )
                 planned_name = ""
         # TOOL name from competence+capability — avoid new skill per request slug
         competence_tool = ""
         try:
-            competence_tool = preferred_tool_name(task_goal)
+            competence_tool = preferred_tool_name(contract)
         except Exception:
             competence_tool = ""
         skill_name = (
             (repair_of or {}).get("name")
             or planned_name
             or competence_tool
-            or self.brain._slug(task_goal.user_request or goal)[:40]
+            or self.brain._slug(contract.original_request or goal)[:40]
             or "new_skill"
         )
         description = plan.get("skill_description") or goal
         version = self.registry.next_version(skill_name)
-        args: dict = TaskGoal.sanitize_args(
-            dict(task_args or {}), task_goal.user_request
+        args: dict = TaskContract.sanitize_args(
+            dict(task_args or {}), contract.original_request
         )
         if isinstance(plan.get("args"), dict):
-            args = TaskGoal.sanitize_args(
+            args = TaskContract.sanitize_args(
                 ContextBuilder.merge_args(plan.get("args"), args),
-                task_goal.user_request,
+                contract.original_request,
             )
-        task_goal = task_goal.with_args(args)
+        contract = contract.with_args(args)
 
         existing = self.registry.get_skill(skill_name)
         protect_active_path = None
@@ -2385,7 +2453,7 @@ class Orchestrator:
         mem_verified = list((mem_pack or {}).get("verified") or [])
         memory_covers = bool(
             plan.get("memory_satisfied")
-            or (task_goal.prefers_memory_first() and mem_verified)
+            or (contract.prefers_memory_first() and mem_verified)
             or (mem_verified and not plan.get("needs_research", True))
         )
         need_entry_research = (
@@ -2401,16 +2469,16 @@ class Orchestrator:
             research["knowledge_history"] = list(mem_verified)[:8]
             research["memory_hits"] = list(mem_pack.get("entries") or [])[:8]
             self._log(
-                f"[{task_id}] MEMORY→RESEARCH skip: subject={task_goal.subject!r} "
+                f"[{task_id}] MEMORY→RESEARCH skip: subject={contract.subject!r} "
                 f"verified={len(mem_verified)} — RESEARCH only for gaps"
             )
         if need_entry_research:
-            grounded_q = task_goal.ground_research_queries(
+            grounded_q = contract.ground_research_queries(
                 plan.get("research_queries") or [goal]
             )
             research = self._do_research(
                 task_id, skill_name, goal, grounded_q,
-                task_goal=task_goal,
+                contract=contract,
             )
             recovery.research_count += 1
         elif prior_research:
@@ -2461,7 +2529,7 @@ class Orchestrator:
         # Seed from a final-EXECUTE verifier failure so the first loop iteration
         # OBSERVE→DIAGNOSE that mismatch (defaults / wrong artifact vs USER REQUEST).
         if verify_failure and repair_of:
-            expected_arts = list(task_goal.artifacts)
+            expected_arts = list(contract.artifacts)
             actual_arts = self._list_workspace_artifacts()
             seed_obs = self.observer.observe_failure(
                 goal=goal,
@@ -2471,14 +2539,14 @@ class Orchestrator:
                 skill_code=previous_code,
                 context={
                     "goal": goal,
-                    "user_request": task_goal.user_request,
-                    "task_goal": task_goal.to_dict(),
+                    "original_request": contract.original_request,
+                    "contract": contract.to_dict(),
                     "args": args,
                     "workspace": str(self.workspace),
                     "expected_artifacts": expected_arts,
                     "actual_artifacts": actual_arts[:40],
-                    "content_requirements": list(task_goal.content_requirements),
-                    "success_criteria": list(task_goal.success_criteria),
+                    "content_requirements": list(contract.content_requirements),
+                    "acceptance_criteria": list(contract.acceptance_criteria),
                     "verifier_error": str(verify_failure.get("reason") or "")[:2000],
                     "previous_failures": failed_approaches[:8],
                 },
@@ -2503,13 +2571,13 @@ class Orchestrator:
                     approach_label=current_approach,
                     code=previous_code,
                     task_args=args,
-                    task_goal=task_goal,
+                    contract=contract,
                     recovery=recovery,
                 )
             )
-            task_goal = task_goal.with_args(args)
+            contract = contract.with_args(args)
             failed_approaches = self.memory.get_failed_approaches(skill_name)
-            diagnosis = TaskGoal.apply_rewrite_gate(diagnosis)
+            diagnosis = TaskContract.apply_rewrite_gate(diagnosis)
             layer = diagnosis["fault_layer"]
             # Rewrite skill ONLY when fault_layer is skill_code (evidence-based)
             skip_rebuild = not diagnosis.get("rewrite_skill", False)
@@ -2521,7 +2589,7 @@ class Orchestrator:
                     f"[{task_id}] RECOVERY STOP (seed): "
                     f"{(diagnosis.get('recovery_report') or {}).get('focus_signature')}"
                 )
-                return self.registry.get_skill(skill_name), args, task_goal
+                return self.registry.get_skill(skill_name), args, contract
 
         repair_max = int(self.calibration.repair_attempts() or MAX_REPAIR_ATTEMPTS)
         for attempt in range(1, repair_max + 1):
@@ -2532,7 +2600,7 @@ class Orchestrator:
             phase_build = "REPAIR" if is_retest else "BUILD_SKILL"
             phase_test = "RETEST" if is_retest else "TEST"
 
-            # Refresh args each attempt — always grounded to original TaskGoal
+            # Refresh args each attempt — always grounded to original TaskContract
             skill_meta_ctx = {
                 "name": skill_name,
                 "description": description,
@@ -2545,17 +2613,28 @@ class Orchestrator:
                 skill_meta=skill_meta_ctx,
                 prior_args=args,
                 diagnosis=diagnosis,
-                user_request=task_goal.user_request,
-                task_goal=task_goal,
+                user_request=contract.original_request,
+                contract=contract,
             ).get("args") or args
-            task_goal = task_goal.with_args(args, skill_meta=skill_meta_ctx)
+            prev_contract = contract
+            contract = contract.with_args(args, skill_meta=skill_meta_ctx)
+            try:
+                assert_locked_truth(prev_contract, contract)
+            except InvariantError as inv:
+                self._log(f"[{task_id}] INVARIANT inputs: {inv}")
+                raise
 
             # ── BUILD / REPAIR (skip unless fault_layer == skill_code) ───
             if not skip_rebuild or built is None or not built.get("ok"):
+                try:
+                    assert_build_allowed(contract)
+                except InvariantError as inv:
+                    self._log(f"[{task_id}] INVARIANT BUILD: {inv}")
+                    return None, args, contract
                 self._status(phase_build)
                 self.perf.begin(phase_build)
                 missing_reqs = self._missing_requirements_from_diagnosis(
-                    diagnosis, task_goal
+                    diagnosis, contract
                 )
                 artifacts_now = self._list_workspace_artifacts()
                 # Avoid identical CODING approach when calibration says avoid
@@ -2582,7 +2661,7 @@ class Orchestrator:
                     )
                 built = self.builder.build(
                     skill_name=skill_name,
-                    description=description or task_goal.user_request,
+                    description=description or contract.original_request,
                     research=research,
                     version=attempt_version,
                     previous_code=last_code,
@@ -2591,12 +2670,12 @@ class Orchestrator:
                     diagnosis=diagnosis if (diagnosis or {}).get("rewrite_skill", False) else None,
                     failed_approaches=failed_approaches,
                     test_plan=(diagnosis or {}).get("test_plan") if diagnosis else None,
-                    user_request=task_goal.user_request,
-                    task_goal=task_goal.to_dict(),
+                    user_request=contract.original_request,
+                    contract=contract.to_dict(),
                     grounded_args=args,
                     artifacts=artifacts_now,
                     missing_requirements=missing_reqs,
-                    constraints=task_goal.with_args(args).constraints,
+                    constraints=contract.with_args(args).constraints,
                 )
                 self.perf.end(phase_build)
                 if built.get("path"):
@@ -2666,7 +2745,7 @@ class Orchestrator:
                         skill_code=built.get("code"),
                         context={
                             "goal": goal,
-                            "user_request": task_goal.user_request,
+                            "original_request": contract.original_request,
                             "args": args,
                             "workspace": str(self.workspace),
                         },
@@ -2680,11 +2759,11 @@ class Orchestrator:
                             approach_label=current_approach,
                             code=built.get("code"),
                             task_args=args,
-                            task_goal=task_goal,
+                            contract=contract,
                             recovery=recovery,
                         )
                     )
-                    task_goal = task_goal.with_args(args)
+                    contract = contract.with_args(args)
                     failed_approaches = self.memory.get_failed_approaches(skill_name)
                     skip_rebuild = not diagnosis.get("rewrite_skill", False)
                     if diagnosis.get("stop_recovery"):
@@ -2699,7 +2778,7 @@ class Orchestrator:
                     or research.get("libraries")
                     or (diagnosis or {}).get("needs_new_deps")
                     or [],
-                    task_goal=task_goal,
+                    contract=contract,
                     skill_code=str(built.get("code") or ""),
                 )
                 # Persist sanitized deps back onto meta / research
@@ -2731,7 +2810,7 @@ class Orchestrator:
             # ── INSTALL DEPS (LIBRARY only — never path/file tokens) ───
             self._status("INSTALL_DEPS")
             deps_list = self._safe_deps(
-                deps_list, task_goal=task_goal,
+                deps_list, contract=contract,
                 skill_code=str((built or {}).get("code") or ""),
             )
             dep_result = self.deps.ensure(deps_list)
@@ -2745,7 +2824,7 @@ class Orchestrator:
                     skill_code=(built or {}).get("code"),
                     context={
                         "goal": goal,
-                        "user_request": task_goal.user_request,
+                        "original_request": contract.original_request,
                         "args": args,
                         "workspace": str(self.workspace),
                     },
@@ -2760,13 +2839,13 @@ class Orchestrator:
                         approach_label=current_approach,
                         code=(built or {}).get("code"),
                         task_args=args,
-                        task_goal=task_goal,
+                        contract=contract,
                         recovery=recovery,
                     )
                 )
-                task_goal = task_goal.with_args(args)
+                contract = contract.with_args(args)
                 failed_approaches = self.memory.get_failed_approaches(skill_name)
-                skip_rebuild = not TaskGoal.rewrite_skill_for_layer(
+                skip_rebuild = not TaskContract.rewrite_skill_for_layer(
                     diagnosis.get("fault_layer")
                 )
                 if diagnosis.get("stop_recovery"):
@@ -2781,7 +2860,7 @@ class Orchestrator:
             self.memory.log_skill_event(skill_name, "testing", "TESTING")
             test_context = {
                 "goal": goal,
-                "user_request": task_goal.user_request,
+                "original_request": contract.original_request,
                 "args": args,
                 "workspace": str(self.workspace),
                 "mode": "test",
@@ -2821,10 +2900,10 @@ class Orchestrator:
             actual_artifacts: list[dict[str, Any]] = []
 
             if not test_failed:
-                # TEST PASS ≠ task success — EXECUTE original task, then VERIFY TaskGoal
+                # TEST PASS ≠ task success — EXECUTE original task, then VERIFY TaskContract
                 self._log(
                     f"[{task_id}] SKILL TEST PASS — running EXECUTE of original task "
-                    f"before TaskGoal VERIFY"
+                    f"before TaskContract VERIFY"
                 )
                 self._status("EXECUTE")
                 from jarvis.skill_runner import run_skill_subprocess
@@ -2858,9 +2937,9 @@ class Orchestrator:
                     goal,
                     exec_result,
                     args=args,
-                    user_request=task_goal.user_request,
-                    constraints=task_goal.with_args(args).constraints,
-                    task_goal=task_goal,
+                    user_request=contract.original_request,
+                    constraints=contract.with_args(args).constraints,
+                    contract=contract,
                 )
                 self._emit_verify(verification, context="after_execute")
                 self.ledger.log(
@@ -2871,7 +2950,7 @@ class Orchestrator:
                         "skill_result": verification.get("skill_result"),
                         "verifier_result": verification.get("verifier_result"),
                         "args": args,
-                        "task_goal": task_goal.to_dict(),
+                        "contract": contract.to_dict(),
                         "actual_artifacts": actual_artifacts[:20],
                         "after_execute": True,
                     },
@@ -2900,7 +2979,7 @@ class Orchestrator:
                         approach=current_approach,
                         diagnosis=diagnosis,
                         description=description,
-                        task_goal=task_goal,
+                        contract=contract,
                     )
                     # Bundle is from EXECUTE+VERIFY — safe for DONE (not TEST)
                     self._verified_exec_bundle = {
@@ -2911,7 +2990,7 @@ class Orchestrator:
                         "args": dict(args or {}),
                         "actual_artifacts": actual_artifacts[:20],
                     }
-                    return skill, args, task_goal
+                    return skill, args, contract
 
             # ── OBSERVE → DIAGNOSE (TEST fail OR EXECUTE/VERIFY fail) ───
             fail_phase = (
@@ -2928,13 +3007,13 @@ class Orchestrator:
                 skill_code=(built or {}).get("code"),
                 context={
                     **test_context,
-                    "user_request": task_goal.user_request,
-                    "task_goal": task_goal.to_dict(),
-                    "expected_artifacts": list(task_goal.artifacts),
+                    "original_request": contract.original_request,
+                    "contract": contract.to_dict(),
+                    "expected_artifacts": list(contract.artifacts),
                     "actual_artifacts": actual_artifacts[:40]
                     or self._list_workspace_artifacts()[:40],
-                    "content_requirements": list(task_goal.content_requirements),
-                    "success_criteria": list(task_goal.success_criteria),
+                    "content_requirements": list(contract.content_requirements),
+                    "acceptance_criteria": list(contract.acceptance_criteria),
                     "verifier_error": str(
                         (verification or {}).get("reason")
                         or (fail_result or {}).get("error")
@@ -2969,13 +3048,13 @@ class Orchestrator:
                     approach_label=current_approach,
                     code=(built or {}).get("code"),
                     task_args=args,
-                    task_goal=task_goal,
+                    contract=contract,
                     recovery=recovery,
                 )
             )
-            task_goal = task_goal.with_args(args)
+            contract = contract.with_args(args)
             failed_approaches = self.memory.get_failed_approaches(skill_name)
-            diagnosis = TaskGoal.apply_rewrite_gate(diagnosis)
+            diagnosis = TaskContract.apply_rewrite_gate(diagnosis)
             layer = diagnosis["fault_layer"]
             # Only rewrite skill when the fault is skill_code → CODING next
             skip_rebuild = not diagnosis.get("rewrite_skill", False)
@@ -2987,7 +3066,7 @@ class Orchestrator:
             if layer == "environment" and diagnosis.get("needs_new_deps"):
                 safe = self._safe_deps(
                     diagnosis["needs_new_deps"],
-                    task_goal=task_goal,
+                    contract=contract,
                     skill_code=str((built or {}).get("code") or last_code or ""),
                 )
                 diagnosis["needs_new_deps"] = safe
@@ -2997,7 +3076,7 @@ class Orchestrator:
             if layer in ("dependency",) and diagnosis.get("needs_new_deps"):
                 safe = self._safe_deps(
                     diagnosis["needs_new_deps"],
-                    task_goal=task_goal,
+                    contract=contract,
                     skill_code=str((built or {}).get("code") or last_code or ""),
                 )
                 diagnosis["needs_new_deps"] = safe
@@ -3019,32 +3098,32 @@ class Orchestrator:
             "unresolved failure — recovery budget / stagnation",
             report,
         )
-        return self.registry.get_skill(skill_name), args, task_goal
+        return self.registry.get_skill(skill_name), args, contract
 
     def _safe_deps(
         self,
         names: Any,
         *,
-        task_goal: Optional[TaskGoal] = None,
+        contract: Optional[TaskContract] = None,
         skill_code: str = "",
     ) -> list[str]:
         """Sanitize install targets — PATH/FILE/CONTENT never become pip packages."""
-        req = (task_goal.user_request if task_goal else "") or ""
-        arts = list(task_goal.artifacts) if task_goal else []
+        req = (contract.original_request if contract else "") or ""
+        arts = list(contract.artifacts) if contract else []
         # When skill code is present, only external imports are installable
         code = skill_code if skill_code else None
-        return TaskGoal.sanitize_libraries(
+        return TaskContract.sanitize_libraries(
             list(names or []),
             req,
             artifacts=arts,
             skill_code=code,
         )
 
-    def _log_request_items(self, task_id: str, task_goal: TaskGoal) -> dict[str, list[str]]:
+    def _log_request_items(self, task_id: str, contract: TaskContract) -> dict[str, list[str]]:
         """Classify request tokens before research/install (PATH ≠ LIBRARY)."""
-        items = TaskGoal.classify_items(
-            task_goal.user_request,
-            artifacts=task_goal.artifacts,
+        items = TaskContract.classify_items(
+            contract.original_request,
+            artifacts=contract.artifacts,
         )
         by_kind: dict[str, list[str]] = {}
         for it in items:
@@ -3071,21 +3150,21 @@ class Orchestrator:
 
     def _do_research(
         self, task_id: str, skill_name: str, goal: str, queries: list,
-        task_goal: Optional[TaskGoal] = None,
+        contract: Optional[TaskContract] = None,
     ) -> dict:
         self._status("RESEARCH")
         if not isinstance(queries, list):
             queries = [str(queries)]
-        if task_goal is None:
-            task_goal = TaskGoal.from_request(goal, goal=goal)
-        # Reject / regenerate queries that drift from TaskGoal subject/source
+        if contract is None:
+            contract = TaskContract.from_request(goal, goal=goal)
+        # Reject / regenerate queries that drift from TaskContract subject/source
         before = [str(q).strip() for q in queries if str(q).strip()]
-        queries = task_goal.ground_research_queries(before)
+        queries = contract.ground_research_queries(before)
         if before and queries != before:
             self._log(
                 f"[{task_id}] RESEARCH grounding: rejected drift "
                 f"in={before!r} → grounded={queries!r} "
-                f"subject={task_goal.subject!r}"
+                f"subject={contract.subject!r}"
             )
         # Skill mode: brain notes only when Ollama is ONLINE (no offline hang)
         research = self.research.research(
@@ -3099,7 +3178,7 @@ class Orchestrator:
         # Drop path/file stems that research_notes or PyPI may have leaked
         research["libraries"] = self._safe_deps(
             research.get("libraries") or [],
-            task_goal=task_goal,
+            contract=contract,
             skill_code="",  # no skill yet — only explicit LIBRARY-safe names
         )
         self._event(
@@ -3172,7 +3251,7 @@ class Orchestrator:
         approach_label: str,
         code: Optional[str],
         task_args: Optional[dict] = None,
-        task_goal: Optional[TaskGoal] = None,
+        contract: Optional[TaskContract] = None,
         recovery: Optional[ProgressAwareRecovery] = None,
     ) -> tuple[dict, dict, str, str, Optional[str], dict]:
         """
@@ -3183,16 +3262,16 @@ class Orchestrator:
         repeat the same research/approach cycle.
         """
         self._status("OBSERVE")
-        if task_goal is None:
-            task_goal = TaskGoal.from_request(goal, goal=goal)
+        if contract is None:
+            contract = TaskContract.from_request(goal, goal=goal)
         if recovery is None:
             recovery = ProgressAwareRecovery(**self.calibration.recovery_kwargs())
         # Ensure observation carries the args + immutable USER REQUEST
         if isinstance(observation.get("context"), dict) and task_args is not None:
             observation["context"] = dict(observation["context"])
             observation["context"]["args"] = dict(task_args)
-            observation["context"]["user_request"] = task_goal.user_request
-        observation["user_request"] = task_goal.user_request
+            observation["context"]["original_request"] = contract.original_request
+        observation["original_request"] = contract.original_request
 
         # Fingerprints for stagnation / similarity (not task-specific)
         observation["error_fingerprint"] = Observer.fingerprint_error(observation)
@@ -3229,7 +3308,7 @@ class Orchestrator:
         failed = self.memory.get_failed_approaches(skill_name)
         prior_solutions = self.memory.recent_solutions(skill_name=skill_name, limit=5)
         # Deterministic heuristics first — skip 30B when fault layer is obvious
-        diagnosis = self._deterministic_diagnose(observation, task_goal)
+        diagnosis = self._deterministic_diagnose(observation, contract)
         clear_layers = {
             "context_mapping", "environment", "goal_parsing",
         }
@@ -3262,18 +3341,18 @@ class Orchestrator:
                 )
             except Exception as exc:
                 self._log(f"DIAGNOSE brain failed ({exc}); using deterministic")
-                diagnosis = self._deterministic_diagnose(observation, task_goal)
+                diagnosis = self._deterministic_diagnose(observation, contract)
         elif layer_clear or evidence_skill:
             self._log(
                 f"DIAGNOSE: deterministic layer={diagnosis.get('fault_layer')} "
                 f"(skipped 30B)"
             )
 
-        # Universal enrichment: parse missing arg names + suggest values from TaskGoal
+        # Universal enrichment: parse missing arg names + suggest values from TaskContract
         diagnosis = ContextBuilder.enrich_diagnosis_args(
-            diagnosis, observation, goal, user_request=task_goal.user_request
+            diagnosis, observation, goal, user_request=contract.original_request
         )
-        diagnosis = TaskGoal.apply_rewrite_gate(diagnosis)
+        diagnosis = TaskContract.apply_rewrite_gate(diagnosis)
 
         # If diagnosis repeats a failed approach fingerprint — force divergence
         # (but never force-rewrite context_mapping / non-skill layers)
@@ -3292,8 +3371,8 @@ class Orchestrator:
 
         # Rebuild args ONLY for true context/goal mapping faults — never for
         # VERIFY content_constraint failures (those must go to CODING repair).
-        new_args = TaskGoal.sanitize_args(
-            dict(task_args or {}), task_goal.user_request
+        new_args = TaskContract.sanitize_args(
+            dict(task_args or {}), contract.original_request
         )
         if diagnosis.get("fault_layer") in (
             "context_mapping", "goal_parsing", "context_args"
@@ -3304,8 +3383,8 @@ class Orchestrator:
                 mode="test",
                 prior_args=new_args,
                 diagnosis=diagnosis,
-                user_request=task_goal.user_request,
-                task_goal=task_goal,
+                user_request=contract.original_request,
+                contract=contract,
             ).get("args") or new_args
             self._log(
                 f"[{task_id}] CONTEXT repair: args_keys={list(new_args.keys())} "
@@ -3313,7 +3392,7 @@ class Orchestrator:
             )
         else:
             # Still drop any polluted word-keys that leaked in
-            new_args = TaskGoal.sanitize_args(new_args, task_goal.user_request)
+            new_args = TaskContract.sanitize_args(new_args, contract.original_request)
 
         # Similarity vs prior failures (current observation already persisted)
         prior_obs = [
@@ -3322,7 +3401,7 @@ class Orchestrator:
             if isinstance(f.get("observation"), dict)
         ]
         similar_count = Observer.count_similar_errors(observation, prior_obs)
-        diagnosis = TaskGoal.apply_rewrite_gate(diagnosis)
+        diagnosis = TaskContract.apply_rewrite_gate(diagnosis)
         layer_now = diagnosis["fault_layer"]
         diagnosis["error_fingerprint"] = observation.get("error_fingerprint")
         diagnosis["similar_failure_count"] = similar_count
@@ -3505,17 +3584,17 @@ class Orchestrator:
                     f"{goal} — fill knowledge: {m}"
                     for m in (missing_knowledge or ["fundamentals"])[:3]
                 ]
-            # Ground against TaskGoal — never let a single term rewrite the subject
-            queries = task_goal.ground_research_queries(queries)
+            # Ground against TaskContract — never let a single term rewrite the subject
+            queries = contract.ground_research_queries(queries)
             diagnosis["research_queries"] = queries[:6]
             diagnosis["adaptive_research"] = True
             self._log(
                 f"[{task_id}] KNOWLEDGE-GAP RESEARCH: sig={fail_sig} "
                 f"missing={missing_knowledge!r} queries={len(queries)} "
-                f"subject={task_goal.subject!r}"
+                f"subject={contract.subject!r}"
             )
             new_research = self._do_research(
-                task_id, skill_name, goal, list(queries), task_goal=task_goal
+                task_id, skill_name, goal, list(queries), contract=contract
             )
             research = self._merge_research(research, new_research)
             research["knowledge_history"] = self.memory.get_research_knowledge(
@@ -3565,7 +3644,7 @@ class Orchestrator:
         if diagnosis.get("needs_new_deps"):
             safe_deps = self._safe_deps(
                 diagnosis["needs_new_deps"],
-                task_goal=task_goal,
+                contract=contract,
                 skill_code=str(code or ""),
             )
             diagnosis["needs_new_deps"] = safe_deps
@@ -3586,10 +3665,10 @@ class Orchestrator:
         research["failure_signature"] = fail_sig
 
         missing_reqs = self._missing_requirements_from_diagnosis(
-            diagnosis, task_goal
+            diagnosis, contract
         )
         last_error = (
-            f"USER REQUEST: {task_goal.user_request}\n"
+            f"USER REQUEST: {contract.original_request}\n"
             f"ROOT CAUSE: {diagnosis.get('root_cause')}\n"
             f"FAULT_LAYER: {diagnosis.get('fault_layer')}\n"
             f"FAILURE_SIGNATURE: {fail_sig}\n"
@@ -3598,7 +3677,7 @@ class Orchestrator:
             f"MODEL_USED: {model_used}\n"
             f"RESEARCHED: {did_research}\n"
             f"RESEARCH_INSIGHT: {research.get('repair_insight') or ''}\n"
-            f"TASK_GOAL: {json.dumps(task_goal.to_dict(), default=str)[:1200]}\n"
+            f"TASK_GOAL: {json.dumps(contract.to_dict(), default=str)[:1200]}\n"
             f"GROUNDED_ARGS: {json.dumps(new_args, default=str)[:500]}\n"
             f"MISSING_REQUIREMENTS: {json.dumps(missing_reqs, default=str)[:500]}\n"
             f"ARTIFACTS: {json.dumps(observation.get('artifacts') or [], default=str)[:500]}\n"
@@ -3736,9 +3815,19 @@ class Orchestrator:
         approach: str,
         diagnosis: Optional[dict],
         description: str,
-        task_goal: Optional[TaskGoal] = None,
+        contract: Optional[TaskContract] = None,
     ) -> Optional[dict]:
         self._status("SAVE_SKILL")
+        # ACTIVE only after independent VERIFY — never from skill.self or TEST ok
+        try:
+            assert_active_requires_independent_verify(
+                verified=True,
+                skill_ok=bool((built or {}).get("ok")),
+                test_ok=True,
+            )
+        except InvariantError as inv:
+            self._log(f"[{task_id}] INVARIANT ACTIVE: {inv}")
+            return None
         promoted = self.registry.promote_candidate(
             name=skill_name,
             candidate_path=built["path"],
@@ -3777,7 +3866,7 @@ class Orchestrator:
         # Bind executable as TOOL under classified competence (not a new skill domain)
         tool_bind: dict[str, Any] = {}
         try:
-            tg = task_goal or TaskGoal.from_request(goal, goal=goal)
+            tg = contract or TaskContract.from_request(goal, goal=goal)
             tool_bind = self.competences.bind_built_tool(
                 skill_name, tg, verified=True
             )
@@ -3835,7 +3924,7 @@ class Orchestrator:
         skill: dict,
         goal: str,
         task_args: dict,
-        task_goal: TaskGoal,
+        contract: TaskContract,
     ) -> dict:
         """
         Prefer a just-completed EXECUTE+VERIFY PASS bundle from the learn loop.
@@ -3861,13 +3950,13 @@ class Orchestrator:
             )
             return out
         return self._execute_trusted(
-            task_id, skill, goal, args=task_args, task_goal=task_goal
+            task_id, skill, goal, args=task_args, contract=contract
         )
 
     @staticmethod
     def _deterministic_diagnose(
         observation: dict[str, Any],
-        task_goal: TaskGoal,
+        contract: TaskContract,
     ) -> dict[str, Any]:
         """Python fault-layer diagnosis — no LLM. Prefer over 30B when clear."""
         ctx_args = (observation.get("context") or {}).get("args") or {}
@@ -3875,7 +3964,7 @@ class Orchestrator:
             ctx_args = {}
         empty_args = not ctx_args
         invented = any(
-            TaskGoal.is_invented_default(v, task_goal.user_request)
+            TaskContract.is_invented_default(v, contract.original_request)
             for v in ctx_args.values()
         )
         err = str(observation.get("exception") or "")
@@ -3898,7 +3987,7 @@ class Orchestrator:
         # Never promote request tokens / content needles to missing_args
         parsed_missing = [
             n for n in parsed_missing
-            if not TaskGoal.is_polluted_arg_key(n, task_goal.user_request)
+            if not TaskContract.is_polluted_arg_key(n, contract.original_request)
         ]
         args_fault = (
             (empty_args or bool(parsed_missing) or invented)
@@ -3938,12 +4027,12 @@ class Orchestrator:
         if no_constraints and empty_args:
             layer = "goal_parsing"
             approach = "goal_parsing_repair"
-            change = "Re-parse immutable TaskGoal / USER REQUEST into constraints"
+            change = "Re-parse immutable TaskContract / USER REQUEST into constraints"
         elif args_fault and not goal_mismatch:
             layer = "context_mapping"
             approach = "context_mapping"
             change = (
-                "Map TaskGoal → skill args from USER REQUEST "
+                "Map TaskContract → skill args from USER REQUEST "
                 "(no invented defaults)"
             )
         elif env_fault:
@@ -3959,7 +4048,7 @@ class Orchestrator:
                 else f"offline_alt_v{int(observation.get('version') or 0) + 1}"
             )
             change = (
-                "Rewrite skill to satisfy original TaskGoal "
+                "Rewrite skill to satisfy original TaskContract "
                 "(no default/placeholder artifacts; honor content requirements)"
                 if (goal_mismatch or content_fail)
                 else "Revise skill logic based on stderr/traceback evidence"
@@ -3972,8 +4061,8 @@ class Orchestrator:
                 "Insufficient evidence for skill_code — observe further; "
                 "do not rewrite skill"
             )
-        layer = TaskGoal.normalize_fault_layer(layer)
-        rewrite = TaskGoal.rewrite_skill_for_layer(layer)
+        layer = TaskContract.normalize_fault_layer(layer)
+        rewrite = TaskContract.rewrite_skill_for_layer(layer)
         diagnosis = {
             "root_cause": str(observation.get("exception") or "unknown")[:500],
             "fault_layer": layer,
@@ -3990,9 +4079,9 @@ class Orchestrator:
             "suggested_args": {},
             "test_plan": (
                 "subprocess retest with grounded args; "
-                "VERIFY against original TaskGoal (reject defaults)"
+                "VERIFY against original TaskContract (reject defaults)"
             ),
-            "expected_artifacts": list(task_goal.artifacts),
+            "expected_artifacts": list(contract.artifacts),
             "is_unfixable": False,
             "diagnosis": str(observation.get("exception") or "failure")[:500],
         }
@@ -4007,21 +4096,21 @@ class Orchestrator:
         skill: dict,
         goal: str,
         args: Optional[dict] = None,
-        task_goal: Optional[TaskGoal] = None,
+        contract: Optional[TaskContract] = None,
     ) -> dict:
         self._status("EXECUTE")
-        if task_goal is None:
-            task_goal = TaskGoal.from_request(goal, goal=goal)
-        exec_args = TaskGoal.ground_args(dict(args or {}), task_goal.user_request)
-        # Refresh from TaskGoal + skill meta so EXECUTE matches TEST args
+        if contract is None:
+            contract = TaskContract.from_request(goal, goal=goal)
+        exec_args = TaskContract.ground_args(dict(args or {}), contract.original_request)
+        # Refresh from TaskContract + skill meta so EXECUTE matches TEST args
         exec_args = self.contexts.build(
             goal,
             str(self.workspace),
             mode="execute",
             skill_meta=skill,
             prior_args=exec_args,
-            user_request=task_goal.user_request,
-            task_goal=task_goal,
+            user_request=contract.original_request,
+            contract=contract,
         ).get("args") or exec_args
         self._log(
             f"[{task_id}] EXECUTE: {skill['name']} args_keys={list(exec_args.keys())}"
@@ -4061,11 +4150,11 @@ class Orchestrator:
         return IntentClassifier.classify_offline(text)
 
     def _sanitize_action_plan(
-        self, plan: dict, goal: str, task_goal: Optional[TaskGoal] = None
+        self, plan: dict, goal: str, contract: Optional[TaskContract] = None
     ) -> dict:
         """Drop unrelated can_reuse / skill_name inherited from prior capabilities."""
         plan = dict(plan or {})
-        tg = task_goal or TaskGoal.from_request(goal, goal=goal)
+        tg = contract or TaskContract.from_request(goal, goal=goal)
         reuse = []
         for name in plan.get("can_reuse") or []:
             sk = self.registry.get_skill(str(name))
@@ -4085,10 +4174,10 @@ class Orchestrator:
                 match = evaluate_capability(existing, tg)
                 self._log(format_match_log(match))
                 if not match.get("compatible"):
-                    plan["skill_name"] = Brain._slug(tg.user_request or goal)[:40] or "new_skill"
+                    plan["skill_name"] = Brain._slug(tg.original_request or goal)[:40] or "new_skill"
                     plan["needs_new_skill"] = True
         else:
-            plan["skill_name"] = Brain._slug(tg.user_request or goal)[:40] or "new_skill"
+            plan["skill_name"] = Brain._slug(tg.original_request or goal)[:40] or "new_skill"
         if not reuse and not plan.get("needs_new_skill"):
             # No fitting skill → must build for THIS goal
             plan["needs_new_skill"] = True
@@ -4098,11 +4187,11 @@ class Orchestrator:
     def _select_compatible_skills(
         self,
         plan: dict,
-        task_goal: TaskGoal,
+        contract: TaskContract,
         *,
         task_id: str = "",
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Rank ACTIVE skills that can fulfill this TaskGoal (not keyword bait)."""
+        """Rank ACTIVE skills that can fulfill this TaskContract (not keyword bait)."""
         reports: list[dict[str, Any]] = []
         scored: list[tuple[float, dict[str, Any]]] = []
         seen: set[str] = set()
@@ -4112,7 +4201,7 @@ class Orchestrator:
             if not name or name in seen or sk.get("status") != "ACTIVE":
                 return
             seen.add(name)
-            match = evaluate_capability(sk, task_goal)
+            match = evaluate_capability(sk, contract)
             self._log(format_match_log(match))
             reports.append(match)
             if match.get("compatible"):
@@ -4123,14 +4212,14 @@ class Orchestrator:
             if sk:
                 _consider(sk)
 
-        # Fallback candidates from registry keywords — still require TaskGoal compatibility
+        # Fallback candidates from registry keywords — still require TaskContract compatibility
         if not scored and not plan.get("needs_new_skill"):
-            keywords = plan.get("research_queries") or [task_goal.user_request]
+            keywords = plan.get("research_queries") or [contract.original_request]
             tokens: list[str] = []
             for k in keywords:
                 tokens.extend(str(k).split())
-            tokens.extend(str(task_goal.user_request).split())
-            tokens.extend(str(a) for a in task_goal.artifacts)
+            tokens.extend(str(contract.original_request).split())
+            tokens.extend(str(a) for a in contract.artifacts)
             for sk in self.registry.match_skills(tokens, only_active=True):
                 _consider(sk)
 
@@ -4148,7 +4237,7 @@ class Orchestrator:
         """Legacy name overlap helper (kept for offline fallbacks)."""
         if not name or not goal:
             return False
-        tg = TaskGoal.from_request(goal, goal=goal)
+        tg = TaskContract.from_request(goal, goal=goal)
         fake = {
             "name": name,
             "description": goal,
@@ -4159,16 +4248,16 @@ class Orchestrator:
         return bool(evaluate_capability(fake, tg).get("compatible"))
 
     def _skill_fits_goal(
-        self, skill: dict, goal: str, task_goal: Optional[TaskGoal] = None
+        self, skill: dict, goal: str, contract: Optional[TaskContract] = None
     ) -> bool:
-        """Whether skill is TaskGoal-compatible (actions/artifacts/domain)."""
+        """Whether skill is TaskContract-compatible (actions/artifacts/domain)."""
         if not skill or not goal:
             return False
-        tg = task_goal or TaskGoal.from_request(goal, goal=goal)
+        tg = contract or TaskContract.from_request(goal, goal=goal)
         return bool(evaluate_capability(skill, tg).get("compatible"))
 
     def _offline_plan(self, goal: str, caps: list[str]) -> dict:
-        tg = TaskGoal.from_request(goal, goal=goal)
+        tg = TaskContract.from_request(goal, goal=goal)
         matched = []
         for m in self.registry.match_skills(goal.split(), only_active=True):
             match = evaluate_capability(m, tg)
@@ -4176,7 +4265,7 @@ class Orchestrator:
             if match.get("compatible"):
                 matched.append(m)
         # Universal offline arg draft — no task-specific key hardcoding
-        draft_args = TaskGoal.sanitize_args(
+        draft_args = TaskContract.sanitize_args(
             ContextBuilder._offline_extract(goal), goal
         )
         tool_name = preferred_tool_name(tg)
@@ -4225,15 +4314,15 @@ class Orchestrator:
     @staticmethod
     def _missing_requirements_from_diagnosis(
         diagnosis: Optional[dict],
-        task_goal: TaskGoal,
+        contract: TaskContract,
     ) -> list[str]:
         """Human-readable missing requirements for CODING (not word-arg keys)."""
         out: list[str] = []
-        for a in task_goal.artifacts:
+        for a in contract.artifacts:
             out.append(f"artifact:{a}")
-        for c in task_goal.content_requirements:
+        for c in contract.content_requirements:
             out.append(f"content:{c}")
-        for s in task_goal.success_criteria:
+        for s in contract.acceptance_criteria:
             if s not in out:
                 out.append(s)
         if diagnosis:
