@@ -2814,6 +2814,30 @@ class Orchestrator:
             or self.brain._slug(contract.original_request or goal)[:40]
             or "new_skill"
         )
+        # Never overwrite an incompatible ACTIVE tool that shares the competence
+        # preferred name — mint a distinct TaskContract-grounded name (BUILD_NEW).
+        if not repair_of:
+            occupied = self.registry.get_skill(skill_name)
+            if occupied and not self._skill_fits_goal(
+                occupied, goal, contract=contract
+            ):
+                fresh = self._distinct_skill_name(contract, skill_name)
+                if fresh != skill_name:
+                    self._log(
+                        f"[{task_id}] BUILD_NEW under distinct name={fresh!r} "
+                        f"(avoid overwrite of incompatible {skill_name!r})"
+                    )
+                    self._log(
+                        format_decision_log(
+                            "BUILD_NEW",
+                            skill=fresh,
+                            detail=(
+                                f"competence name {skill_name!r} occupied by "
+                                "incompatible ACTIVE tool"
+                            ),
+                        )
+                    )
+                    skill_name = fresh
         description = plan.get("skill_description") or goal
         version = self.registry.next_version(skill_name)
         args: dict = TaskContract.sanitize_args(
@@ -4748,6 +4772,50 @@ class Orchestrator:
             return False
         tg = contract or TaskContract.from_request(goal, goal=goal)
         return bool(evaluate_capability(skill, tg).get("compatible"))
+
+    def _distinct_skill_name(self, contract: TaskContract, base: str) -> str:
+        """
+        Mint a BUILD_NEW name when the competence preferred tool is occupied by
+        an incompatible skill. Qualifier comes from locked artifacts/outcomes —
+        never a free-form invented topic.
+        """
+        base_slug = Brain._slug(base or "new_skill")[:32] or "new_skill"
+        qual = ""
+        for a in contract.artifacts or ():
+            stem = Path(str(a)).stem
+            if stem and len(stem) >= 2:
+                qual = Brain._slug(stem)[:20]
+                break
+        if not qual:
+            for c in contract.content_requirements or ():
+                bit = Brain._slug(str(c))[:16]
+                if bit:
+                    qual = bit
+                    break
+        if not qual:
+            for o in contract.required_outcomes or ():
+                o = str(o).lower()
+                if o in ("artifact", "execution", "side_effect", "capability"):
+                    qual = o
+                    break
+        if not qual:
+            qual = Brain._slug(contract.request_id or "task")[:12] or "task"
+        candidate = Brain._slug(f"{base_slug}_{qual}")[:48] or f"{base_slug}_new"
+        name = candidate
+        n = 2
+        while True:
+            existing = self.registry.get_skill(name)
+            if not existing:
+                return name
+            if self._skill_fits_goal(
+                existing, contract.original_request, contract=contract
+            ):
+                return name
+            name = Brain._slug(f"{candidate}_{n}")[:48]
+            n += 1
+            if n > 24:
+                rid = Brain._slug(contract.request_id or str(n))[:12]
+                return Brain._slug(f"{base_slug}_{rid}")[:48] or candidate
 
     def _offline_plan(self, contract: TaskContract, caps: list[str]) -> dict:
         """Deterministic PLAN from the pipeline TaskContract — never remint."""

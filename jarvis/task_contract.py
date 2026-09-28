@@ -84,6 +84,13 @@ _SUBJECT_STOP = {
     "jo", "ja", "ko", "kas", "kur", "kad", "tik", "tai", "tos", "tas",
     "šo", "so", "ti", "tu", "es", "mēs", "mes", "jūs", "jus",
     "example", "examples", "demo", "show", "how", "works", "working",
+    # Multilingual function words (not topical subjects)
+    "und", "mit", "dem", "der", "die", "das", "ein", "eine", "auch",
+    "con", "per", "una", "del", "della", "che", "les", "des", "une",
+    "pour", "dans", "sur", "aux", "las", "los", "por", "para", "como",
+    "que", "le", "la", "el", "il", "lo", "gli", "als", "vom", "zum",
+    "zur", "bei", "nach", "aus", "auf", "ist", "sind", "wird", "werden",
+    "reply", "response", "english", "sentences", "sentence",
 }
 
 # Canonical DIAGNOSE layers (legacy aliases accepted + normalized).
@@ -115,11 +122,18 @@ _LEGACY_LAYER = {
 # Action verbs used only to label high-level actions (not as args).
 _ACTION_VERBS = re.compile(
     r"(?i)\b(create|write|make|build|run|fetch|download|install|learn|"
-    r"research|execute|test|verify|izveido|uzraksti|palaid|iemācies|"
-    r"iemacies|paradi|parādi|summarize|summary|note|notes|"
+    r"study|research|execute|test|verify|izveido|uzraksti|palaid|"
+    r"iemācies|iemacies|apgūsti|apgūt|erforschen|studia|studiare|"
+    r"lernen|paradi|parādi|summarize|summary|note|notes|"
     r"say|print|tell|speak|announce|echo|return|compute|calculate|"
-    r"reverse|sort|saki|pasaki|izdrukā|atgriez|aprēķin)\b"
+    r"reverse|sort|saki|pasaki|izdrukā|atgriez|aprēķin|"
+    r"erstelle|crea|erzeuge)\b"
 )
+
+# Unicode-aware tokens (letters/digits/underscore) — keeps Latvian/German/… subjects intact.
+_TOKEN_3 = re.compile(r"[\w]{3,}", re.UNICODE)
+_TOKEN_2 = re.compile(r"[\w]{2,}", re.UNICODE)
+_LETTER_3 = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 
 # Communicative / output verbs → skill_output_contains (behavior, not workspace).
 _COMMUNICATIVE_RE = re.compile(
@@ -1581,7 +1595,7 @@ class TaskContract:
                 if art and art in phrase:
                     phrase = phrase.replace(art, " ")
             cleaned: list[str] = []
-            for tok in re.findall(r"[A-Za-z0-9_]{3,}", phrase):
+            for tok in _TOKEN_3.findall(phrase):
                 low = tok.lower()
                 if low in _SUBJECT_STOP:
                     continue
@@ -1599,15 +1613,15 @@ class TaskContract:
         for art in artifacts:
             exclude.add(str(art).lower())
             exclude.add(Path(str(art)).stem.lower())
-            for part in re.findall(r"[A-Za-z0-9_]{2,}", str(art)):
+            for part in _TOKEN_2.findall(str(art)):
                 exclude.add(part.lower())
         for c in content_requirements:
             exclude.add(str(c).lower())
-            for part in re.findall(r"[A-Za-z0-9_]{2,}", str(c)):
+            for part in _TOKEN_2.findall(str(c)):
                 exclude.add(part.lower())
         for src in content_source:
             exclude.add(str(src).lower())
-            for part in re.findall(r"[A-Za-z0-9_]{2,}", str(src)):
+            for part in _TOKEN_2.findall(str(src)):
                 if part.lower() not in ("http", "https", "www"):
                     exclude.add(part.lower())
         exclude.update(path_segment_tokens(req, artifacts))
@@ -1615,7 +1629,7 @@ class TaskContract:
             exclude.add(a.lower())
 
         tokens: list[str] = []
-        for tok in re.findall(r"[A-Za-z0-9_]{3,}", req):
+        for tok in _TOKEN_3.findall(req):
             low = tok.lower()
             if low in _SUBJECT_STOP or low in exclude:
                 continue
@@ -1971,7 +1985,7 @@ class TaskContract:
             return set()
         return {
             t.lower()
-            for t in re.findall(r"[A-Za-z0-9_]{3,}", anchor)
+            for t in _TOKEN_3.findall(anchor)
             if t.lower() not in _SUBJECT_STOP
         }
 
@@ -1982,10 +1996,14 @@ class TaskContract:
         Rejects queries that share only a single short token with a multi-token
         subject (classic polysemy drift) while inventing an unrelated domain.
         Soft relatedness alone is not enough when subject-token overlap is weak.
+
+        Queries that literally reuse locked artifact paths and/or content
+        requirements are grounded — those are outcome-derived, not drift.
         """
         q = (query or "").strip()
         if not q:
             return False
+        q_l = q.lower()
         # Whole query literally present in request/subject
         if q in (self.original_request or "") or (
             self.subject
@@ -1993,6 +2011,37 @@ class TaskContract:
             and q in self.subject
         ):
             return True
+
+        # Outcome-derived: locked artifact path(s) + content needle(s)
+        arts = [str(a) for a in (self.artifacts or ()) if str(a).strip()]
+        reqs = [
+            str(c) for c in (self.content_requirements or ()) if str(c).strip()
+        ]
+        art_hit = any(a.lower() in q_l for a in arts)
+        req_hit = any(c.lower() in q_l for c in reqs)
+        if art_hit and (req_hit or any(
+            k in q_l for k in ("containing", "produce", "create", "write")
+        )):
+            return True
+        if req_hit and art_hit:
+            return True
+
+        # Outcome-derived final_output / topical anchor + locked FOC fields
+        anchor = (self.topical_anchor() or "").strip()
+        foc = self.final_output_constraints or {}
+        foc_hit = False
+        if isinstance(foc, dict) and foc:
+            for k, v in foc.items():
+                if v in (None, "", [], {}):
+                    continue
+                if str(k).lower() in q_l or str(v).lower() in q_l:
+                    foc_hit = True
+                    break
+        if anchor and anchor.lower() in q_l:
+            if " " in anchor.strip() or len(anchor.split()) >= 2:
+                return True
+            if foc_hit or art_hit or req_hit:
+                return True
 
         subj = (
             self.subject
@@ -2003,13 +2052,13 @@ class TaskContract:
             src_l = str(src).lower()
             if src_l == "memory":
                 continue
-            if src and src_l in q.lower():
+            if src and src_l in q_l:
                 return True
 
         subj_tokens = self.subject_tokens()
         q_tokens = {
             t.lower()
-            for t in re.findall(r"[A-Za-z0-9_]{3,}", q)
+            for t in _TOKEN_3.findall(q)
             if t.lower() not in _SUBJECT_STOP
         }
         overlap = subj_tokens & q_tokens
@@ -2032,7 +2081,7 @@ class TaskContract:
         # unknown/ambiguous subject — require request-token overlap (not actions)
         req_tokens = {
             t.lower()
-            for t in re.findall(r"[A-Za-z0-9_]{3,}", self.original_request or "")
+            for t in _TOKEN_3.findall(self.original_request or "")
             if t.lower() not in _SUBJECT_STOP
         }
         actions = {a.lower() for a in self.actions}
@@ -2042,6 +2091,9 @@ class TaskContract:
             if t not in actions and t not in art_stems
         }
         if len(useful) >= 2:
+            return True
+        # Single distinctive topical token from the request (e.g. multilingual subject)
+        if len(useful) == 1 and (art_hit or req_hit or self.topical_anchor()):
             return True
         return False
 
@@ -2060,11 +2112,16 @@ class TaskContract:
             "make", "save", "reply", "response", "sentences", "sentence",
             "english", "latvian", "german", "french", "russian", "format",
             "please", "using", "based", "also", "just", "only",
+            # Multilingual conjunctions / prepositions (not topical)
+            "und", "mit", "dem", "der", "die", "das", "ein", "eine",
+            "con", "per", "una", "del", "della", "che", "les", "des",
+            "une", "pour", "dans", "sur", "aux", "las", "los", "por",
+            "para", "como", "que",
         }
         if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS):
             # Keep subject only when it still carries topical (non-filler) tokens
             kept = [
-                t for t in re.findall(r"[A-Za-z]{3,}", self.subject)
+                t for t in _LETTER_3.findall(self.subject)
                 if t.lower() not in exclude
             ]
             if kept:
@@ -2074,11 +2131,11 @@ class TaskContract:
         req = self.original_request or ""
         # Mask paths and quotes so extension/content tokens don't dominate
         masked = re.sub(
-            r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,12}", " ", req
+            r"[\w./\\-]+\.[A-Za-z0-9]{1,12}", " ", req, flags=re.UNICODE
         )
         masked = re.sub(r"[\"'][^\"']+[\"']", " ", masked)
         toks: list[str] = []
-        for t in re.findall(r"[A-Za-z]{3,}", masked):
+        for t in _LETTER_3.findall(masked):
             low = t.lower()
             if low in exclude or low in toks:
                 continue

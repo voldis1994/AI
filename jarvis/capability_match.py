@@ -412,12 +412,26 @@ def outcome_capability_mismatch(
     skill: Optional[dict[str, Any]],
     contract: TaskContract,
 ) -> bool:
-    """True when selected skill cannot cover locked TaskContract outcomes/artifacts."""
-    if not skill:
-        return bool(
-            set(contract.required_outcomes or ())
-            & {"artifact", "execution", "capability", "test", "side_effect"}
-        )
+    """
+    True when a selected skill cannot cover locked TaskContract outcomes/artifacts.
+
+    Requires an inspectable skill (name + some meta/path/capabilities). Without
+    that evidence, DIAGNOSE must not invent capability_mismatch — content/VERIFY
+    failures fall through to skill_code / unknown with rewrite gates.
+    """
+    if not skill or not contract:
+        return False
+    name = str(skill.get("name") or "").strip()
+    if not name:
+        return False
+    has_signals = bool(
+        skill.get("capabilities")
+        or skill.get("file_path")
+        or skill.get("pending_path")
+        or str(skill.get("description") or "").strip()
+    )
+    if not has_signals:
+        return False
     match = evaluate_capability(skill, contract)
     return not bool(match.get("compatible"))
 
