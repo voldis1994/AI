@@ -77,12 +77,19 @@ _SUBJECT_STOP = {
     "text", "content", "contents", "data", "value", "values",
     "about", "regarding", "concerning", "summary", "summarize", "notes",
     "note", "using", "based", "according", "source", "learn", "learned",
+    "learning", "study", "studying", "teach", "explain", "tutorial",
     "knowledge", "previously", "already", "prior", "memory",
+    # Learning boilerplate — must not glue every LEARN subject together
+    "basics", "fundamentals", "fundamental", "practical", "practice",
+    "tests", "test", "verify", "verification", "something", "else",
+    "topic", "subjects", "subject", "new", "another", "other",
     "izveido", "uzraksti", "failu", "faila", "ar", "saturu", "satur",
     "nosaukumu", "tekstu", "teksts", "lūdzu", "ludzu", "ka", "kā",
     "par", "paradi", "parādi", "man", "lai", "un", "vai", "bet",
     "jo", "ja", "ko", "kas", "kur", "kad", "tik", "tai", "tos", "tas",
     "šo", "so", "ti", "tu", "es", "mēs", "mes", "jūs", "jus",
+    "iemācies", "iemacies", "apgūsti", "apgūt", "pamatus", "pamati",
+    "citu", "kaut", "tematu", "temats", "jaunu",
     "example", "examples", "demo", "show", "how", "works", "working",
     # Multilingual function words (not topical subjects)
     "und", "mit", "dem", "der", "die", "das", "ein", "eine", "auch",
@@ -1962,11 +1969,44 @@ class TaskContract:
         return " ".join(p for p in parts if p).strip()
 
     def memory_topic(self) -> str:
-        """Slug for MEMORY retrieval — subject first, never invent a sense."""
+        """
+        Slug for MEMORY retrieval — subject first, never invent a sense.
+
+        When subject is unknown/ambiguous (e.g. single-noun ``iemācies vīns``),
+        slug from content tokens only — NOT the full request. Full-request
+        slugs shared learn-verb fragments across topics and caused sticky
+        MEMORY reuse when the user asked to learn something else.
+        """
         from jarvis.intent import IntentClassifier
 
         if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS):
             return IntentClassifier.topic_slug(self.subject)
+
+        exclude: set[str] = set(_SUBJECT_STOP)
+        for a in self.actions:
+            exclude.add(str(a).lower())
+        for art in self.artifacts:
+            exclude.add(str(art).lower())
+            exclude.add(Path(str(art)).stem.lower())
+        # Path/extension fragments must not become the MEMORY topic
+        exclude.update(
+            path_segment_tokens(self.original_request or "", self.artifacts)
+        )
+        _BARE_EXT = {
+            "txt", "md", "py", "json", "csv", "html", "htm", "xml", "yml",
+            "yaml", "toml", "ini", "log", "pdf", "png", "jpg", "jpeg",
+        }
+        toks: list[str] = []
+        for tok in _TOKEN_3.findall(self.original_request or ""):
+            low = tok.lower()
+            if low in exclude or low in _BARE_EXT:
+                continue
+            if self.looks_like_path(tok) or self.looks_like_url(tok):
+                continue
+            if tok not in toks:
+                toks.append(tok)
+        if toks:
+            return IntentClassifier.topic_slug(" ".join(toks[:8]))
         return IntentClassifier.topic_slug(self.original_request)
 
     def prefers_memory_first(self) -> bool:

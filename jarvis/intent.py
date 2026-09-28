@@ -254,7 +254,13 @@ class IntentClassifier:
 
     @staticmethod
     def topic_slug(text: str, limit: int = 48) -> str:
-        slug = re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")
+        """
+        Canonical MEMORY/topic key. Unicode letters kept (Latvian/German/…)
+        so ``iemācies vīns`` does not collapse to ``iem_cies_v_ns`` and collide
+        with every other learn request.
+        """
+        slug = re.sub(r"[^\w]+", "_", (text or "").lower(), flags=re.UNICODE)
+        slug = re.sub(r"_+", "_", slug).strip("_")
         return (slug or "topic")[:limit]
 
     @staticmethod
@@ -270,7 +276,7 @@ class IntentClassifier:
         except Exception:
             path_segs = set()
         out: list[str] = []
-        for tok in re.findall(r"[A-Za-z0-9_]{3,}", text or ""):
+        for tok in re.findall(r"[\w]{3,}", text or "", flags=re.UNICODE):
             low = tok.lower()
             if low in stop or low in path_segs:
                 continue

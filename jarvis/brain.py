@@ -143,13 +143,35 @@ class Brain:
 
     def _get_client(self):
         if self._client is None:
+            # Prefer the official Python client; on any failure we keep using
+            # HTTP (/api/chat) — so a missing client is noisy, not fatal.
             try:
-                import ollama
+                import importlib
+                import sys
 
-                self._client = ollama.Client(host=self.host, timeout=self.timeout)
+                mod = importlib.import_module("ollama")
             except Exception as exc:
-                logger.warning("ollama client init failed: %s", exc)
-                self._client = None
+                logger.warning(
+                    "ollama client init failed: %s (exe=%s) — using HTTP fallback",
+                    exc,
+                    getattr(sys, "executable", "?"),
+                )
+                self._client = False  # sentinel: do not retry every call
+                return None
+            try:
+                # Newer ollama-python accepts timeout=; older builds may not.
+                try:
+                    self._client = mod.Client(host=self.host, timeout=self.timeout)
+                except TypeError:
+                    self._client = mod.Client(host=self.host)
+            except Exception as exc:
+                logger.warning(
+                    "ollama.Client() failed: %s — using HTTP fallback", exc
+                )
+                self._client = False
+                return None
+        if self._client is False:
+            return None
         return self._client
 
     def is_available(self) -> bool:

@@ -603,30 +603,42 @@ class Orchestrator:
         # (continues with MEMORY → research → VERIFY loop).
 
         try:
-            # ── MEMORY RETRIEVAL by TaskContract.subject (before any SEARCH) ─
+            # ── MEMORY RETRIEVAL — EXACT topic only (never seed from topic A
+            # when the user asked to learn topic B). Soft-related hits are
+            # hints only and must not skip research / drive gap-fill.
             self._status("MEMORY")
+            from jarvis.intent import IntentClassifier as _ICLearn
+
+            topic_slug = _ICLearn.topic_slug(topic)
             retrieved = self.memory.retrieve_relevant_knowledge(
                 contract.original_request,
                 topic=topic,
                 limit=8,
                 verified_only=False,
+                exact_topic_only=True,
             )
+            related_hints = list(retrieved.get("related") or [])
             self._log(
                 f"MEMORY RETRIEVAL: topic={topic} "
                 f"subject={contract.subject!r} "
                 f"content_source={list(contract.content_source)!r} "
                 f"entries={retrieved.get('count', 0)} "
                 f"verified={retrieved.get('verified_count', 0)} "
-                f"request_id={request_id}"
+                f"related_hints={len(related_hints)} "
+                f"exact_only=True request_id={request_id}"
             )
             prior_history = list(retrieved.get("entries") or [])
             # Prefer exact-topic history order for gap diagnostics
             exact_hist = self.memory.get_topic_knowledge(topic, limit=8)
             if exact_hist:
                 prior_history = exact_hist
+            # Exact topic slug only — empty/missing entry topics never seed LEARN
             verified_prior = [
-                e for e in (retrieved.get("verified") or prior_history)
-                if isinstance(e, dict) and e.get("verified")
+                e
+                for e in (retrieved.get("verified") or prior_history)
+                if isinstance(e, dict)
+                and e.get("verified")
+                and self.memory.entry_topic_slug(e) == topic_slug
             ]
             failed_approaches = self.memory.get_failed_approaches(learn_key)
             artifact = KnowledgeArtifact(
@@ -635,7 +647,7 @@ class Orchestrator:
                 original_request=contract.original_request,
             )
             research: dict[str, Any] = {}
-            # Prefer verified knowledge BEFORE any new research
+            # Prefer verified knowledge BEFORE any new research — same topic only
             if verified_prior:
                 artifact = KnowledgeArtifact.from_dict(verified_prior[-1])
                 artifact.request_id = request_id
@@ -779,12 +791,26 @@ class Orchestrator:
 
                 # Deterministic KnowledgeArtifact synthesis from EXTRACTED pages
                 # (SEARCH snippets alone must not become knowledge)
+                prior_art = artifact if (gap_fill_only or attempt > 1) else None
+                # Never gap-fill / merge a prior artifact from a different topic
+                if prior_art is not None:
+                    prior_slug = _ICLearn.topic_slug(
+                        str(getattr(prior_art, "topic", "") or "")
+                    )
+                    if prior_slug and topic_slug and prior_slug != topic_slug:
+                        self._log(
+                            f"[{task_id}] LEARNING prior dropped — "
+                            f"topic mismatch prior={prior_slug!r} "
+                            f"current={topic_slug!r}"
+                        )
+                        prior_art = None
+                        gap_fill_only = False
                 artifact = self._synthesize_learning_artifact(
                     original_request=contract.original_request,
                     topic=topic,
                     request_id=request_id,
                     research=fresh,
-                    prior=artifact if (gap_fill_only or attempt > 1) else None,
+                    prior=prior_art,
                     missing=missing_gaps,
                 )
                 # Persist opened-source evidence (full-page extracts, not snippets)
