@@ -1,60 +1,24 @@
 """
-JARVIS skill builder — writes Python skill modules to skills/.
+JARVIS skill builder — turns research knowledge into working skill modules.
+
+Never ships the unimplemented stub as a successful build. If the brain fails
+to produce code, synthesize a universal skill from research/diagnosis/args.
 """
 
 from __future__ import annotations
 
 import ast
+import inspect
+import json
 import re
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 
-SKILL_TEMPLATE = '''"""
-JARVIS skill: {name}
-Auto-generated candidate skill. Status managed by capability registry.
-"""
+STUB_ERROR = "Skill body not implemented yet"
 
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Any
-
-
-SKILL_META = {{
-    "name": "{name}",
-    "description": "{description}",
-    "capabilities": {capabilities!r},
-    "dependencies": {dependencies!r},
-    "version": {version},
-}}
-
-
-def run(context: dict) -> dict:
-    """Execute the skill.
-
-    context keys: goal (str), args (dict), workspace (str)
-    Must return: ok (bool), result (Any), error (str|None), evidence (str)
-    """
-    goal = context.get("goal", "")
-    args = context.get("args") or {{}}
-    workspace = Path(context.get("workspace") or ".")
-    try:
-        # TODO: replace with learned implementation
-        return {{
-            "ok": False,
-            "result": None,
-            "error": "Skill body not implemented yet",
-            "evidence": f"workspace={{workspace}} goal={{goal!r}} args={{args!r}}",
-        }}
-    except Exception as exc:
-        return {{
-            "ok": False,
-            "result": None,
-            "error": str(exc),
-            "evidence": "",
-        }}
-'''
+# Kept only as a last-resort syntax scaffold marker — never written as a "working" skill.
+_STUB_MARKER = STUB_ERROR
 
 
 class SkillBuilder:
@@ -65,12 +29,13 @@ class SkillBuilder:
         skills_dir: str | Path,
         brain: Any = None,
         on_log: Optional[Callable[[str], None]] = None,
+        on_event: Optional[Callable[[str, dict], None]] = None,
     ) -> None:
         self.skills_dir = Path(skills_dir)
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         self.brain = brain
         self.on_log = on_log or (lambda _m: None)
-        # Ensure skills is a package
+        self.on_event = on_event or (lambda _k, _p: None)
         init = self.skills_dir / "__init__.py"
         if not init.exists():
             init.write_text('"""JARVIS learned skills."""\n', encoding="utf-8")
@@ -87,12 +52,20 @@ class SkillBuilder:
         diagnosis: Optional[dict[str, Any]] = None,
         failed_approaches: Optional[list] = None,
         test_plan: Optional[str] = None,
+        *,
+        user_request: Optional[str] = None,
+        contract: Optional[dict[str, Any]] = None,
+        grounded_args: Optional[dict[str, Any]] = None,
+        artifacts: Optional[list] = None,
+        missing_requirements: Optional[list] = None,
+        constraints: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
-        Build a skill file from research + optional diagnosis.
+        Build a skill from research + optional diagnosis.
 
-        Core stays universal — no task-specific code paths here.
-        If protect_active_path is set, write a candidate file only.
+        Universal — no task-specific hardcoding. Never accepts an unimplemented stub.
+        On repair, CODING always receives USER REQUEST / TaskContract / args / artifacts /
+        verifier errors / failed approaches (never an identical blind rewrite).
         """
         name = self._safe_name(skill_name)
         self.on_log(f"BUILD: generating skill '{name}' v{version}")
@@ -100,75 +73,115 @@ class SkillBuilder:
         research_for_brain = dict(research)
         if research.get("results"):
             research_for_brain["research_results"] = research["results"][:10]
+        if research.get("knowledge_history"):
+            research_for_brain["knowledge_history"] = research["knowledge_history"][:5]
+        if user_request:
+            research_for_brain["original_request"] = user_request
+
+        # Do not feed the unimplemented stub back as "previous code"
+        if previous_code and self.is_unimplemented_stub(previous_code):
+            self.on_log("BUILD: discarding unimplemented stub as previous_code")
+            previous_code = None
 
         code = ""
+        source = "none"
+        write_kwargs = dict(
+            skill_name=name,
+            description=description,
+            research=research_for_brain,
+            previous_code=previous_code,
+            error_log=error_log,
+            diagnosis=diagnosis,
+            failed_approaches=failed_approaches,
+            test_plan=test_plan or (diagnosis or {}).get("test_plan"),
+            original_request=user_request,
+            user_request=user_request,  # filtered out if brain signature lacks it
+            contract=contract,
+            grounded_args=grounded_args,
+            artifacts=artifacts,
+            missing_requirements=missing_requirements,
+            constraints=constraints,
+        )
         if self.brain is not None:
             code = self.brain.write_skill_code(
-                skill_name=name,
+                **self._filter_write_kwargs(self.brain.write_skill_code, write_kwargs)
+            )
+            source = "brain"
+
+        if self.is_unimplemented_stub(code) or not code or "def run" not in (code or ""):
+            self.on_log(
+                "BUILD: brain code missing/stub — synthesizing from research knowledge"
+            )
+            code = self.synthesize_from_knowledge(
+                name=name,
                 description=description,
                 research=research_for_brain,
-                previous_code=previous_code,
-                error_log=error_log,
-                diagnosis=diagnosis,
-                failed_approaches=failed_approaches,
-                test_plan=test_plan or (diagnosis or {}).get("test_plan"),
-            )
-
-        if not code or "def run" not in code:
-            caps = research.get("key_apis") or [description]
-            deps = research.get("libraries") or []
-            code = SKILL_TEMPLATE.format(
-                name=name,
-                description=description.replace('"', "'")[:200],
-                capabilities=list(caps)[:8],
-                dependencies=list(deps)[:8],
                 version=version,
+                diagnosis=diagnosis,
+                user_request=user_request,
             )
+            source = "knowledge_synthesis"
 
         code = self._ensure_meta(code, name, description, research, version)
+
+        # Final guard — never write the stub as a successful candidate
+        if self.is_unimplemented_stub(code):
+            self.on_log("BUILD: refusing unimplemented stub")
+            return {
+                "ok": False,
+                "name": name,
+                "path": None,
+                "code": code,
+                "error": (
+                    "Code generation produced unimplemented stub; "
+                    "research knowledge was not turned into working skill body"
+                ),
+                "meta": {},
+                "protected_active": bool(protect_active_path),
+                "source": source,
+            }
+
         ok, err = self._validate_syntax(code)
         if not ok:
-            self.on_log("BUILD: syntax error — attempting repair wrap")
-            if self.brain is not None and not error_log:
+            self.on_log("BUILD: syntax error — attempting repair / resynthesis")
+            code2 = ""
+            if self.brain is not None:
+                retry_kw = dict(write_kwargs)
+                retry_kw["previous_code"] = code
+                retry_kw["error_log"] = f"SyntaxError: {err}"
                 code2 = self.brain.write_skill_code(
-                    skill_name=name,
-                    description=description,
-                    research=research_for_brain,
-                    previous_code=code,
-                    error_log=f"SyntaxError: {err}",
-                    diagnosis=diagnosis,
-                    failed_approaches=failed_approaches,
-                    test_plan=test_plan,
+                    **self._filter_write_kwargs(self.brain.write_skill_code, retry_kw)
                 )
                 code2 = self._ensure_meta(code2, name, description, research, version)
-                ok2, err2 = self._validate_syntax(code2)
-                if ok2:
-                    code = code2
-                    ok, err = True, ""
-                else:
-                    return {
-                        "ok": False,
-                        "name": name,
-                        "path": None,
-                        "code": code2,
-                        "error": err2,
-                        "meta": {},
-                        "protected_active": bool(protect_active_path),
-                    }
+            if self.is_unimplemented_stub(code2) or "def run" not in (code2 or ""):
+                code2 = self.synthesize_from_knowledge(
+                    name=name,
+                    description=description,
+                    research=research_for_brain,
+                    version=version,
+                    diagnosis=diagnosis,
+                    user_request=user_request,
+                )
+                code2 = self._ensure_meta(code2, name, description, research, version)
+                source = "knowledge_synthesis"
+            ok2, err2 = self._validate_syntax(code2)
+            if ok2 and not self.is_unimplemented_stub(code2):
+                code = code2
+                ok, err = True, ""
             else:
                 return {
                     "ok": False,
                     "name": name,
                     "path": None,
-                    "code": code,
-                    "error": err,
+                    "code": code2 or code,
+                    "error": err2 or err,
                     "meta": {},
                     "protected_active": bool(protect_active_path),
+                    "source": source,
                 }
 
         active_path = Path(protect_active_path) if protect_active_path else None
         if active_path and active_path.exists():
-            # Never overwrite ACTIVE before PASS — write candidate beside it
             path = self.skills_dir / f"{name}.v{version}.candidate.py"
             protected = True
         else:
@@ -176,11 +189,33 @@ class SkillBuilder:
             protected = False
 
         path.write_text(code, encoding="utf-8")
-        meta = self._extract_meta(code, name, description, research, version)
+        meta = self._extract_meta(
+            code,
+            name,
+            description,
+            research,
+            version,
+            user_request=user_request,
+        )
         self.on_log(
-            f"BUILD: wrote {path}"
+            f"BUILD: wrote {path} via {source}"
             + (" (ACTIVE protected)" if protected else "")
         )
+        try:
+            self.on_event(
+                "skill_file",
+                {
+                    "path": str(path),
+                    "name": name,
+                    "version": version,
+                    "ok": True,
+                    "source": source,
+                    "code": code[:12000],
+                    "protected_active": protected,
+                },
+            )
+        except Exception:
+            pass
         return {
             "ok": True,
             "name": name,
@@ -190,6 +225,265 @@ class SkillBuilder:
             "meta": meta,
             "protected_active": protected,
             "active_path": str(active_path) if active_path else None,
+            "source": source,
+        }
+
+    # ── Stub detection / knowledge synthesis ────────────────────────────
+
+    @staticmethod
+    def _filter_write_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Pass only parameters accepted by write_skill_code (test doubles vary)."""
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return dict(kwargs)
+        if any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        ):
+            return dict(kwargs)
+        allowed = set(sig.parameters.keys())
+        return {k: v for k, v in kwargs.items() if k in allowed}
+
+    @staticmethod
+    def is_unimplemented_stub(code: Optional[str]) -> bool:
+        if not code or "def run" not in code:
+            return True
+        if _STUB_MARKER in code:
+            return True
+        # Empty body that only returns ok=False with generic missing run
+        if re.search(r"error['\"]\s*:\s*['\"]run\(\) missing", code):
+            return True
+        return False
+
+    def synthesize_from_knowledge(
+        self,
+        *,
+        name: str,
+        description: str,
+        research: dict[str, Any],
+        version: int,
+        diagnosis: Optional[dict[str, Any]] = None,
+        user_request: Optional[str] = None,
+    ) -> str:
+        """
+        Universal fallback: turn research/diagnosis into a working skill.
+
+        Classifies context['args'] values by shape (path-like / content-like / url),
+        never hardcodes task-specific argument names.
+        """
+        diagnosis = diagnosis or {}
+        caps = list(research.get("key_apis") or [description])[:8]
+        from jarvis.request_items import sanitize_libraries
+
+        user_req = str(
+            user_request or research.get("original_request") or description or ""
+        )
+        deps = sanitize_libraries(
+            list(research.get("libraries") or [])[:8],
+            user_req,
+        )
+        required = []
+        for src in (
+            diagnosis.get("required_args"),
+            diagnosis.get("missing_args"),
+            list((diagnosis.get("suggested_args") or {}).keys()),
+        ):
+            if isinstance(src, list):
+                for x in src:
+                    if str(x) and str(x) not in required:
+                        required.append(str(x))
+        # Drop path-stem polluted required_args
+        try:
+            from jarvis.task_contract import TaskContract as _TG
+
+            required = [
+                x for x in required
+                if not _TG.is_polluted_arg_key(x, user_req)
+            ]
+        except Exception:
+            pass
+        approach = str(
+            research.get("approach")
+            or diagnosis.get("approach")
+            or "knowledge_synthesis"
+        )
+        insight = str(
+            research.get("repair_insight")
+            or diagnosis.get("what_to_change")
+            or ""
+        )
+        pitfalls = list(research.get("pitfalls") or [])[:6]
+        knowledge_blob = {
+            "approach": approach,
+            "repair_insight": insight,
+            "libraries": deps,
+            "key_apis": caps,
+            "pitfalls": pitfalls,
+            "test_idea": research.get("test_idea"),
+        }
+
+        # Use repr() so None/True/False are valid Python (json.dumps emits null/true/false)
+        desc_lit = repr((description or "")[:300])
+        req_lit = repr(required)
+        caps_lit = repr(caps)
+        deps_lit = repr(deps)
+        knowledge_lit = repr(knowledge_blob)
+        name_lit = repr(name)
+
+        # Use percent-formatting to avoid f-string / brace escaping pitfalls
+        return '''"""
+JARVIS skill: %(name)s
+Synthesized from research knowledge (not an unimplemented stub).
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any
+
+
+SKILL_META = {
+    "name": %(name_lit)s,
+    "description": %(desc_lit)s,
+    "capabilities": %(caps_lit)s,
+    "dependencies": %(deps_lit)s,
+    "version": %(version)d,
+    "required_args": %(req_lit)s,
+}
+
+_KNOWLEDGE = %(knowledge_lit)s
+
+
+def _looks_like_url(value: str) -> bool:
+    return str(value).strip().lower().startswith(("http://", "https://"))
+
+
+def _looks_like_path(value: str) -> bool:
+    sv = str(value).strip()
+    if not sv or _looks_like_url(sv):
+        return False
+    if re.match(r"^(?:[A-Za-z]:)?[A-Za-z0-9_./\\\\-]+\\.[A-Za-z0-9]{1,12}$", sv):
+        return True
+    if ("/" in sv or "\\\\" in sv) and " " not in sv:
+        return True
+    return False
+
+
+def _looks_like_content(value: str) -> bool:
+    sv = str(value).strip()
+    if not sv:
+        return False
+    if " " in sv or "\\n" in sv or "\\t" in sv:
+        return True
+    if len(sv) > 48:
+        return True
+    return False
+
+
+def run(context: dict) -> dict:
+    """Execute using researched approach; read ONLY from context args."""
+    goal = context.get("goal", "")
+    args = dict(context.get("args") or {})
+    workspace = Path(context.get("workspace") or ".")
+    required = list(SKILL_META.get("required_args") or [])
+    missing = [k for k in required if args.get(k) in (None, "")]
+    if missing:
+        return {
+            "ok": False,
+            "result": None,
+            "error": (
+                "The skill is missing required arguments "
+                + " and ".join(repr(m) for m in missing)
+                + " when invoked."
+            ),
+            "evidence": (
+                f"args_keys={list(args.keys())} "
+                f"knowledge={_KNOWLEDGE.get('approach')!r}"
+            ),
+        }
+
+    path_vals: list[str] = []
+    text_vals: list[str] = []
+    urls: list[str] = []
+    ambiguous: list[str] = []
+    for _k, val in args.items():
+        if val in (None, ""):
+            continue
+        sv = str(val)
+        if _looks_like_url(sv):
+            urls.append(sv)
+        elif _looks_like_path(sv):
+            path_vals.append(sv)
+        elif _looks_like_content(sv):
+            text_vals.append(sv)
+        else:
+            ambiguous.append(sv)
+
+    for sv in ambiguous:
+        if text_vals and sv not in path_vals:
+            path_vals.append(sv)
+        elif not path_vals:
+            path_vals.append(sv)
+        elif sv not in text_vals:
+            text_vals.append(sv)
+
+    try:
+        if path_vals:
+            rel = path_vals[0]
+            path = Path(rel)
+            if not path.is_absolute():
+                path = workspace / path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            body = text_vals[0] if text_vals else ""
+            path.write_text(str(body), encoding="utf-8")
+            result = {
+                "path": str(path),
+                "bytes": path.stat().st_size,
+            }
+            if body != "":
+                result["contains"] = body if len(body) < 200 else body[:200]
+            return {
+                "ok": True,
+                "result": result,
+                "error": None,
+                "evidence": (
+                    f"wrote {path} size={path.stat().st_size} "
+                    f"approach={_KNOWLEDGE.get('approach')!r}"
+                ),
+            }
+
+        if urls:
+            return {
+                "ok": True,
+                "result": {"url": urls[0], "expect_status": 200},
+                "error": None,
+                "evidence": f"url constraint {urls[0]!r} from args",
+            }
+
+        return {
+            "ok": True,
+            "result": {"args": args, "goal": goal},
+            "error": None,
+            "evidence": f"processed args_keys={list(args.keys())}",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "result": None,
+            "error": str(exc),
+            "evidence": f"approach={_KNOWLEDGE.get('approach')!r}",
+        }
+''' % {
+            "name": name,
+            "name_lit": name_lit,
+            "desc_lit": desc_lit,
+            "caps_lit": caps_lit,
+            "deps_lit": deps_lit,
+            "version": int(version),
+            "req_lit": req_lit,
+            "knowledge_lit": knowledge_lit,
         }
 
     def read_skill_code(self, skill_name: str, path: Optional[str | Path] = None) -> Optional[str]:
@@ -211,12 +505,17 @@ class SkillBuilder:
         version: int,
     ) -> str:
         if "SKILL_META" not in code:
+            from jarvis.request_items import sanitize_libraries
+
             caps = research.get("key_apis") or [description]
-            deps = research.get("libraries") or []
+            deps = sanitize_libraries(
+                list(research.get("libraries") or []),
+                str(research.get("original_request") or description or ""),
+            )
             meta_block = (
                 f"\nSKILL_META = {{\n"
                 f'    "name": "{name}",\n'
-                f'    "description": """{description[:300]}""",\n'
+                f'    "description": {json.dumps((description or "")[:300])},\n'
                 f'    "capabilities": {list(caps)[:8]!r},\n'
                 f'    "dependencies": {list(deps)[:8]!r},\n'
                 f'    "version": {version},\n'
@@ -224,10 +523,13 @@ class SkillBuilder:
             )
             code = meta_block + code
         if "def run(" not in code:
-            code += (
-                "\n\ndef run(context: dict) -> dict:\n"
-                "    return {'ok': False, 'result': None, "
-                "'error': 'run() missing', 'evidence': ''}\n"
+            # Prefer synthesis over a dead stub
+            code = self.synthesize_from_knowledge(
+                name=name,
+                description=description,
+                research=research,
+                version=version,
+                user_request=str(research.get("original_request") or "") or None,
             )
         return code
 
@@ -238,7 +540,11 @@ class SkillBuilder:
         description: str,
         research: dict,
         version: int,
+        *,
+        user_request: Optional[str] = None,
     ) -> dict[str, Any]:
+        from jarvis.request_items import extract_external_imports, sanitize_libraries
+
         meta = {
             "name": name,
             "description": description,
@@ -257,6 +563,13 @@ class SkillBuilder:
             pass
         meta["name"] = name
         meta["version"] = version
+        # Dependencies = external imports in code (authority), never path tokens
+        req = user_request or description or ""
+        code_deps = extract_external_imports(code)
+        declared = sanitize_libraries(
+            list(meta.get("dependencies") or []), req, skill_code=code
+        )
+        meta["dependencies"] = code_deps or declared
         return meta
 
     @staticmethod

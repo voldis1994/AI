@@ -19,11 +19,13 @@ class SkillTester:
         self,
         workspace: str | Path,
         on_log: Optional[Callable[[str], None]] = None,
+        on_event: Optional[Callable[[str, dict], None]] = None,
         timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
         self.workspace = Path(workspace)
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.on_log = on_log or (lambda _m: None)
+        self.on_event = on_event or (lambda _k, _p: None)
         self.timeout = timeout
 
     def test(
@@ -71,6 +73,24 @@ class SkillTester:
             f"ok={skill_ok} timed_out={skill_result.get('timed_out')} "
             f"crash={skill_result.get('crash')}"
         )
+        try:
+            self.on_event(
+                "subprocess",
+                {
+                    "mode": "test",
+                    "command": f"python -c skill:{path.name}",
+                    "stdout": str(skill_result.get("stdout") or "")[:8000],
+                    "stderr": str(skill_result.get("stderr") or "")[:8000],
+                    "traceback": str(skill_result.get("traceback") or "")[:8000],
+                    "returncode": skill_result.get("returncode"),
+                    "timed_out": bool(skill_result.get("timed_out")),
+                    "ok": skill_ok,
+                    "error": str(skill_result.get("error") or "")[:500],
+                    "skill_path": str(path),
+                },
+            )
+        except Exception:
+            pass
 
         return {
             "ok": skill_ok,

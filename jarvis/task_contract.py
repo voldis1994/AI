@@ -1,0 +1,2094 @@
+"""
+Immutable TaskContract — the single USER REQUEST truth source for JARVIS.
+
+Every pipeline stage (UNDERSTAND → VALIDATE → MEMORY → PLAN → RESEARCH →
+BUILD → TEST → EXECUTE → OBSERVE → VERIFY → REMEMBER → DONE) reads the same
+frozen contract. After VALIDATE, original_request / desired_outcomes /
+acceptance_criteria are never rewritten.
+
+Core Python enforces universal contract/invariant rules. Semantics are derived
+structurally from the request (and optional model assist) — never by inventing
+user requirements or task-specific hardcode.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Optional
+
+from jarvis.request_items import (
+    classify_request_items,
+    path_segment_tokens,
+    sanitize_libraries,
+)
+from jarvis.outcomes import (
+    OUTCOME_ARTIFACT,
+    OUTCOME_CAPABILITY,
+    OUTCOME_CONVERSATION,
+    OUTCOME_EXECUTION,
+    OUTCOME_FINAL_OUTPUT,
+    OUTCOME_LEARNING,
+    OUTCOME_RESEARCH,
+    OUTCOME_SIDE_EFFECT,
+    OUTCOME_TEST,
+    derive_required_outcomes,
+    extract_final_output_constraints,
+)
+
+
+# Generic placeholder / invented values — not task-specific file names.
+_INVENTED_RE = re.compile(
+    r"(?i)\b(?:user[_-]?provided(?:[_-]?\w+)?|"
+    r"default(?:[_-]?(?:path|file|name|content|value|dir|output))?|"
+    r"placeholder|changeme|your[_-]?name|todo|tbd|xxx+|dummy|"
+    r"sample(?:[_-]?(?:path|file))|example(?:[_-]?(?:path|file))|"
+    r"temp[_-]?file|untitled)\b"
+)
+
+_PATH_LIKE = re.compile(
+    r"^(?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,12}$"
+)
+
+# Function words / verbs — never treated as file paths or payload by themselves.
+_STOP = {
+    "a", "an", "the", "and", "or", "to", "for", "with", "from", "into",
+    "in", "on", "at", "of", "by", "is", "are", "be", "as", "it", "this",
+    "that", "create", "write", "make", "build", "run", "file", "files",
+    "containing", "contains", "named", "called", "please", "jarvis",
+    "text", "content", "contents", "data", "value", "values",
+    "izveido", "uzraksti", "failu", "faila", "ar", "saturu", "satur",
+    "nosaukumu", "tekstu", "teksts", "lūdzu", "ludzu", "ka", "kā",
+    "par", "paradi", "parādi", "man", "lai", "un", "vai", "bet",
+    "jo", "ja", "ko", "kas", "kur", "kad", "tik", "tai", "tos", "tas",
+    "šo", "so", "ti", "tu", "es", "mēs", "mes", "jūs", "jus",
+    "example", "examples", "demo", "show", "how", "works", "working",
+    "python", "code", "script", "program",
+}
+
+# Lean stop set for SUBJECT extraction — keep domain words (python/java/…)
+# so polysemous surface tokens remain part of the topic.
+_SUBJECT_STOP = {
+    "a", "an", "the", "and", "or", "to", "for", "with", "from", "into",
+    "in", "on", "at", "of", "by", "is", "are", "be", "as", "it", "this",
+    "that", "create", "write", "make", "build", "run", "file", "files",
+    "containing", "contains", "named", "called", "please", "jarvis",
+    "text", "content", "contents", "data", "value", "values",
+    "about", "regarding", "concerning", "summary", "summarize", "notes",
+    "note", "using", "based", "according", "source", "learn", "learned",
+    "knowledge", "previously", "already", "prior", "memory",
+    "izveido", "uzraksti", "failu", "faila", "ar", "saturu", "satur",
+    "nosaukumu", "tekstu", "teksts", "lūdzu", "ludzu", "ka", "kā",
+    "par", "paradi", "parādi", "man", "lai", "un", "vai", "bet",
+    "jo", "ja", "ko", "kas", "kur", "kad", "tik", "tai", "tos", "tas",
+    "šo", "so", "ti", "tu", "es", "mēs", "mes", "jūs", "jus",
+    "example", "examples", "demo", "show", "how", "works", "working",
+}
+
+# Canonical DIAGNOSE layers (legacy aliases accepted + normalized).
+# "unknown" = unrecognized / insufficient evidence — NEVER treated as skill_code.
+FAULT_LAYERS = frozenset({
+    "goal_parsing",
+    "context_mapping",
+    "skill_code",
+    "execution",
+    "environment",
+    "verifier",
+    "unknown",
+})
+_LEGACY_LAYER = {
+    "context_args": "context_mapping",
+    "test_harness": "execution",
+    "dependency": "environment",
+    "unknown": "unknown",
+    "unrecognized": "unknown",
+    "none": "unknown",
+    "null": "unknown",
+    "": "unknown",
+}
+
+# Action verbs used only to label high-level actions (not as args).
+_ACTION_VERBS = re.compile(
+    r"(?i)\b(create|write|make|build|run|fetch|download|install|learn|"
+    r"research|execute|test|verify|izveido|uzraksti|palaid|iemācies|"
+    r"iemacies|paradi|parādi|summarize|summary|note|notes|"
+    r"say|print|tell|speak|announce|echo|return|compute|calculate|"
+    r"reverse|sort|saki|pasaki|izdrukā|atgriez|aprēķin)\b"
+)
+
+# Communicative / output verbs → skill_output_contains (behavior, not workspace).
+_COMMUNICATIVE_RE = re.compile(
+    r"(?i)\b(?:say|print|tell|speak|announce|echo|output|display|"
+    r"saki|pasaki|izdrukā|izdruka|parādi\s+tekstu)\s+"
+    r"(?:(?:me|us|them|him|her|to\s+(?:me|us|them))\s+)?"
+    r"(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9][\w.-]{0,47}))"
+)
+
+# Return / equals cues with a grounded literal value.
+_RETURN_EQUALS_RE = re.compile(
+    r"(?i)\b(?:return|returns|atgriez|equal(?:s)?|result\s*(?:is|=)|"
+    r"should\s+(?:be|return)|must\s+(?:be|return)|"
+    r"rezultāts\s*(?:ir|=))\s+"
+    r"[\"']?([^\"'\n]+?)[\"']?\s*$"
+)
+
+# Return-type cues (an int / a list / …).
+_RETURN_TYPE_RE = re.compile(
+    r"(?i)\b(?:return|returns|produce|yield|atgriez)\s+"
+    r"(?:an?\s+)?(integers?|ints?|strings?|strs?|lists?|"
+    r"dicts?|dictionaries|bool(?:ean)?s?|floats?|tuples?|none)\b"
+)
+
+# Arithmetic expression grounded in the request (operands literal).
+_ARITH_EXPR_RE = re.compile(
+    r"(?<![\w.])(\d+(?:\.\d+)?)\s*([\+\-\*/×÷])\s*(\d+(?:\.\d+)?)(?![\w.])"
+)
+
+# Reverse / sort with a grounded sequence literal in the request.
+_REVERSE_LIT_RE = re.compile(
+    r"(?i)\breverse\s+(\[[^\]]+\]|\([^\)]+\)|[\"'][^\"']+[\"'])"
+)
+_SORT_LIT_RE = re.compile(
+    r"(?i)\bsort\s+(\[[^\]]+\])"
+)
+
+# Tokens that are manner/filler — never treated as communicative payload.
+# Do NOT include ordinary words that can themselves be the message (e.g. world).
+_BEHAVIOR_PAYLOAD_STOP = frozenset({
+    "a", "an", "the", "to", "for", "with", "from", "into", "in", "on",
+    "at", "of", "by", "is", "are", "be", "as", "it", "this", "that",
+    "me", "us", "them", "him", "her", "please", "politely", "nicely",
+    "kindly", "quietly", "loudly", "softly", "something", "anything",
+    "somehow", "someone", "somebody", "everything", "nothing", "stuff",
+    "things", "thing", "now", "here", "there", "user",
+    "out", "back", "again", "just", "only", "also", "very", "really",
+    "true", "false", "none", "null", "result", "value", "answer",
+    "integer", "int", "string", "str", "list", "dict", "bool", "float",
+    "tuple", "boolean", "dictionary", "man", "lai", "un", "vai",
+})
+
+_TYPE_ALIASES = {
+    "integer": "int", "integers": "int", "int": "int", "ints": "int",
+    "string": "str", "strings": "str", "str": "str", "strs": "str",
+    "list": "list", "lists": "list",
+    "dict": "dict", "dicts": "dict", "dictionaries": "dict", "dictionary": "dict",
+    "bool": "bool", "boolean": "bool", "booleans": "bool", "bools": "bool",
+    "float": "float", "floats": "float",
+    "tuple": "tuple", "tuples": "tuple",
+    "none": "none",
+}
+
+# Topic cues — capture the surface subject without inventing a sense.
+_ABOUT_CUE = re.compile(
+    r"(?i)\b(?:about|regarding|concerning|on\s+the\s+topic\s+of|"
+    r"par(?:\s+tēmu)?|par\s+tematu)\s+"
+    r"(.+?)(?=\s+(?:containing|contains|with\s+text|ar\s+tekstu|saturu|"
+    r"from|using|via|based\s+on|create|write|make|build|"
+    r"izveido|uzraksti)\b|[,\"']|$)"
+)
+
+# Explicit content origins grounded in the request (never invented).
+# Prefer URL / memory / path-like tokens — not bare adverbs after "using".
+_SOURCE_CUE = re.compile(
+    r"(?i)\b(?:from|via|based\s+on|according\s+to|source)\s+"
+    r"[\"']?((?:https?://\S+)|(?:memory|prior\s+knowledge)|"
+    r"[A-Za-z0-9_./\\-]{2,}\.[A-Za-z0-9]{1,12}|[A-Za-z0-9_./\\-]{3,})[\"']?"
+)
+
+_MEMORY_CUE = re.compile(
+    r"(?i)\b(?:previously\s+learned|already\s+(?:know|learned|researched)|"
+    r"from\s+(?:memory|prior\s+knowledge)|what\s+you\s+(?:know|learned|"
+    r"researched)|prior\s+knowledge|saved\s+knowledge|"
+    r"apgūtaj\w*|iemācīt\w*|no\s+atmiņ\w*)\b"
+)
+
+# Sentinel subject values — never invent a disambiguated meaning.
+SUBJECT_UNKNOWN = "unknown"
+SUBJECT_AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True)
+class TaskContract:
+    """
+    Canonical immutable contract for one USER REQUEST.
+
+    After VALIDATE, ``original_request``, ``desired_outcomes``, and
+    ``acceptance_criteria`` are never rewritten. Stages may only refresh
+    grounded ``inputs`` (and constraint checks derived from them) via
+    ``with_inputs`` — never invent new user requirements.
+    """
+
+    request_id: str
+    original_request: str
+    intent: str  # advisory primary label only — not exclusive lifecycle router
+    desired_outcomes: tuple[str, ...]
+    artifacts: tuple[str, ...]
+    behaviors: tuple[dict[str, Any], ...]
+    constraints: dict[str, Any]
+    inputs: dict[str, Any]
+    outputs: tuple[str, ...]
+    side_effects: tuple[str, ...]
+    acceptance_criteria: tuple[str, ...]
+    verification_plan: tuple[dict[str, Any], ...]
+    capability_requirements: tuple[str, ...]
+    validated: bool = False
+    # UNDERSTAND views derived once from original_request (not parallel truth)
+    subject: str = SUBJECT_UNKNOWN
+    actions: tuple[str, ...] = ()
+    content_source: tuple[str, ...] = ()
+    content_requirements: tuple[str, ...] = ()
+    # Structured requirements — multiple outcomes may be required together
+    required_outcomes: tuple[str, ...] = ()
+    final_output_constraints: dict[str, Any] = field(default_factory=dict)
+    requirements: dict[str, Any] = field(default_factory=dict)
+
+    # ── Convenience surfaces used by MEMORY / PLAN ──────────────────────
+
+    @property
+    def topic(self) -> str:
+        return self.subject
+
+    @property
+    def action(self) -> str:
+        return self.actions[0] if self.actions else "execute"
+
+    @property
+    def target(self) -> tuple[str, ...]:
+        return self.artifacts
+
+    @property
+    def goal(self) -> str:
+        """Planner-facing summary — always the immutable original request."""
+        return self.original_request
+
+    def is_verifiable(self) -> bool:
+        """True when acceptance_criteria / verification_plan are independently checkable."""
+        ro = set(self.required_outcomes or ())
+        actionable = {
+            OUTCOME_ARTIFACT,
+            OUTCOME_EXECUTION,
+            OUTCOME_SIDE_EFFECT,
+            OUTCOME_CAPABILITY,
+            OUTCOME_TEST,
+        }
+        weak = {
+            "skill_ok_and_verified",
+            "needs_refine",
+            "",
+            "conversation_reply:nonempty@answer",
+            "learning_knowledge:covers_request@knowledge_artifact",
+        }
+        has_concrete = False
+        for s in self.acceptance_criteria or ():
+            if str(s).strip() and str(s).strip() not in weak:
+                has_concrete = True
+                break
+        if not has_concrete:
+            for ch in self.verification_plan or ():
+                if isinstance(ch, dict) and ch.get("kind") and ch.get("target"):
+                    kind = str(ch.get("kind") or "")
+                    if kind and kind != "needs_refine":
+                        has_concrete = True
+                        break
+        c = self.constraints or {}
+        if not has_concrete and any(
+            c.get(k) for k in ("files", "directories", "http", "imports", "must_contain")
+        ):
+            has_concrete = True
+        checks = c.get("checks") or []
+        if not has_concrete and isinstance(checks, list) and any(
+            isinstance(x, dict) and x.get("kind") and x.get("target") for x in checks
+        ):
+            has_concrete = True
+
+        # Actionable outcomes require concrete criteria (not conversation/learning stubs)
+        if ro & actionable:
+            return has_concrete
+        if has_concrete:
+            return True
+        # Learning / conversation / research-only — stage VERIFY covers them
+        if ro & {
+            OUTCOME_LEARNING,
+            OUTCOME_CONVERSATION,
+            OUTCOME_RESEARCH,
+            OUTCOME_FINAL_OUTPUT,
+        }:
+            return True
+        return False
+
+    def needs_refine(self) -> bool:
+        """True when BUILD/PLAN must not proceed — contract not verifiable."""
+        return not self.is_verifiable()
+
+    def requires(self, kind: str) -> bool:
+        return str(kind) in (self.required_outcomes or ())
+
+    def requires_capability_stages(self) -> bool:
+        """True when PLAN/BUILD/TEST/EXECUTE stages may be needed."""
+        ro = set(self.required_outcomes or ())
+        return bool(
+            ro
+            & {
+                OUTCOME_ARTIFACT,
+                OUTCOME_EXECUTION,
+                OUTCOME_CAPABILITY,
+                OUTCOME_TEST,
+                OUTCOME_SIDE_EFFECT,
+            }
+        )
+
+    def requires_learning_stage(self) -> bool:
+        return self.requires(OUTCOME_LEARNING) or self.requires(OUTCOME_RESEARCH)
+
+    def requires_conversation_stage(self) -> bool:
+        return self.requires(OUTCOME_CONVERSATION) and not self.requires_capability_stages()
+
+    # Legacy method names used during migration of call sites — thin redirects
+    # removed: callers must use is_verifiable / needs_refine.
+
+    @classmethod
+    def understand(
+        cls,
+        original_request: str,
+        *,
+        request_id: Optional[str] = None,
+        intent: Optional[str] = None,
+        args: Optional[dict[str, Any]] = None,
+        skill_meta: Optional[dict[str, Any]] = None,
+        capability_requirements: Optional[tuple[str, ...] | list[str]] = None,
+        brain: Any = None,
+    ) -> "TaskContract":
+        """
+        UNDERSTAND — semantic contract fields from the USER REQUEST.
+
+        Semantics come from the model (``brain.understand_contract``) or a
+        universal offline literal/structure draft. Deterministic code only
+        grounds and validates the draft — it is not the primary semantics
+        generator and must not invent task-specific requirements.
+        """
+        import uuid
+
+        from jarvis.contract_semantics import (
+            ground_semantic_draft,
+            offline_semantic_draft,
+        )
+
+        req = (original_request or "").strip()
+        rid = (request_id or uuid.uuid4().hex[:12]).strip()
+        grounded = cls.sanitize_args(args or {}, req, skill_meta=skill_meta)
+
+        draft: dict[str, Any] = {}
+        if brain is not None and hasattr(brain, "understand_contract"):
+            try:
+                draft = brain.understand_contract(req, prior_args=grounded) or {}
+            except Exception:
+                draft = {}
+        if not isinstance(draft, dict) or not draft:
+            draft = offline_semantic_draft(req, grounded)
+
+        grounded_draft = ground_semantic_draft(draft, req)
+        if intent:
+            grounded_draft["intent"] = (intent or "task").strip() or "task"
+
+        cons = dict(grounded_draft.get("constraints") or {})
+        cons.setdefault("check_process", True)
+        cons.setdefault("source", "task_contract_semantic")
+        # Ensure checks exist for VERIFY
+        if not cons.get("checks"):
+            cons["checks"] = list(grounded_draft.get("verification_plan") or [])
+
+        acceptance = tuple(
+            str(x) for x in (grounded_draft.get("acceptance_criteria") or []) if str(x).strip()
+        ) or ("needs_refine",)
+        if acceptance == ("needs_refine",) and not cons.get("checks"):
+            # Explicitly unverifiable semantic result
+            pass
+        elif acceptance == ("needs_refine",):
+            acceptance = cls._derive_success_criteria(cons, req)
+
+        plan = tuple(
+            dict(x)
+            for x in (grounded_draft.get("verification_plan") or cons.get("checks") or [])
+            if isinstance(x, dict) and x.get("kind") and x.get("target")
+        )
+        behaviors = tuple(
+            dict(b)
+            for b in (grounded_draft.get("behaviors") or [])
+            if isinstance(b, dict) and b.get("kind") and b.get("target")
+        )
+        artifacts = tuple(
+            str(a) for a in (grounded_draft.get("artifacts") or []) if str(a).strip()
+        )
+        outcomes = tuple(
+            str(o) for o in (grounded_draft.get("desired_outcomes") or []) if str(o).strip()
+        )
+        if not outcomes and acceptance and acceptance != ("needs_refine",):
+            outcomes = cls._desired_outcomes(
+                artifacts,
+                behaviors,
+                tuple(grounded_draft.get("content_requirements") or ()),
+                acceptance,
+            )
+
+        content_reqs = tuple(
+            str(c)
+            for c in (grounded_draft.get("content_requirements") or [])
+            if str(c).strip()
+        )
+        if not content_reqs:
+            content_reqs = cls._derive_content_requirements(cons)
+        content_source = tuple(
+            str(s) for s in (grounded_draft.get("content_source") or []) if str(s).strip()
+        )
+        if not content_source:
+            content_source = cls._derive_content_source(req, cons)
+        # Structural subject from request (authoritative) — draft prose is advisory only
+        derived_subject = cls._derive_subject(
+            req, artifacts, content_reqs, content_source
+        )
+        subject = derived_subject or str(
+            grounded_draft.get("subject") or SUBJECT_UNKNOWN
+        ).strip() or SUBJECT_UNKNOWN
+        actions = tuple(
+            str(a).lower()
+            for a in (grounded_draft.get("actions") or [])
+            if str(a).strip()
+        ) or cls._derive_actions(req)
+
+        foc = dict(grounded_draft.get("final_output_constraints") or {})
+        if not foc:
+            foc = extract_final_output_constraints(req)
+        if foc:
+            cons = dict(cons)
+            cons["final_output"] = dict(foc)
+
+        req_hint = dict(grounded_draft.get("requirements") or {})
+        # Advisory intent hints only — never invent capability for bare prose
+        if intent == "learning":
+            req_hint.setdefault("needs_learning", True)
+        elif intent == "conversation":
+            req_hint.setdefault("needs_conversation", True)
+        # intent=="task" does NOT auto-set needs_capability: that must come
+        # from grounded artifacts/behaviors or an explicit requirements hint.
+
+        # Additive offline requirements hints (not authoritative routing).
+        # May ADD learning/research/capability flags; cannot strip grounded arts.
+        try:
+            from jarvis.intent import IntentClassifier
+
+            offline_hint = IntentClassifier.classify_offline(req)
+            req_hint = IntentClassifier.merge_into_contract_requirements(
+                req_hint, offline_hint
+            )
+        except Exception:
+            pass
+
+        required = derive_required_outcomes(
+            artifacts=artifacts,
+            behaviors=behaviors,
+            side_effects=tuple(
+                str(s) for s in (grounded_draft.get("side_effects") or []) if str(s).strip()
+            ),
+            acceptance_criteria=acceptance,
+            content_source=content_source,
+            constraints=cons,
+            draft_outcomes=outcomes,
+            requirements_hint=req_hint,
+            final_output_constraints=foc,
+        )
+        # Primary advisory label from outcomes (not exclusive lifecycle)
+        primary = str(grounded_draft.get("intent") or intent or "").strip()
+        if not primary or primary == "task":
+            if OUTCOME_LEARNING in required and not (
+                OUTCOME_ARTIFACT in required or OUTCOME_EXECUTION in required
+            ):
+                primary = "learning"
+            elif OUTCOME_CONVERSATION in required and not (
+                set(required)
+                & {
+                    OUTCOME_ARTIFACT,
+                    OUTCOME_EXECUTION,
+                    OUTCOME_LEARNING,
+                    OUTCOME_CAPABILITY,
+                }
+            ):
+                primary = "conversation"
+            else:
+                primary = "task"
+
+        # Conversation / learning-only: replace empty needs_refine placeholder
+        actionable = {
+            OUTCOME_ARTIFACT,
+            OUTCOME_EXECUTION,
+            OUTCOME_SIDE_EFFECT,
+            OUTCOME_CAPABILITY,
+            OUTCOME_TEST,
+        }
+        if acceptance == ("needs_refine",) and not (set(required) & actionable):
+            if OUTCOME_LEARNING in required:
+                acceptance = ("learning_knowledge:covers_request@knowledge_artifact",)
+            elif OUTCOME_CONVERSATION in required:
+                acceptance = ("conversation_reply:nonempty@answer",)
+
+        return cls(
+            request_id=rid,
+            original_request=req,
+            intent=primary,
+            desired_outcomes=outcomes,
+            artifacts=artifacts,
+            behaviors=behaviors,
+            constraints=cons,
+            inputs=dict(grounded_draft.get("inputs") or grounded),
+            outputs=tuple(
+                str(o) for o in (grounded_draft.get("outputs") or []) if str(o).strip()
+            ),
+            side_effects=tuple(
+                str(s) for s in (grounded_draft.get("side_effects") or []) if str(s).strip()
+            ),
+            acceptance_criteria=acceptance,
+            verification_plan=plan,
+            capability_requirements=tuple(capability_requirements or ()),
+            validated=False,
+            subject=subject,
+            actions=actions,
+            content_source=content_source,
+            content_requirements=content_reqs,
+            required_outcomes=required,
+            final_output_constraints=dict(foc),
+            requirements=dict(req_hint),
+        )
+
+    @classmethod
+    def validate(cls, contract: "TaskContract") -> "TaskContract":
+        """
+        VALIDATE — freeze verifiable contracts; mark needs_refine otherwise.
+
+        After a successful validate(), original_request / desired_outcomes /
+        acceptance_criteria must not be rewritten (enforced by with_inputs).
+        """
+        if contract.validated and contract.is_verifiable():
+            return contract
+        if not contract.is_verifiable():
+            # Attempt offline strengthen once from the same original_request
+            strengthened = cls.refine(contract)
+            if not strengthened.is_verifiable():
+                cons = dict(strengthened.constraints or {})
+                cons["needs_refine"] = True
+                cons["source"] = "task_contract_validate"
+                return replace(
+                    strengthened,
+                    desired_outcomes=("needs_refine",),
+                    behaviors=(),
+                    constraints=cons,
+                    acceptance_criteria=("needs_refine",),
+                    verification_plan=(),
+                    validated=False,
+                )
+            contract = strengthened
+        return replace(contract, validated=True)
+
+    @classmethod
+    def from_request(
+        cls,
+        original_request: str,
+        goal: Optional[str] = None,
+        args: Optional[dict[str, Any]] = None,
+        skill_meta: Optional[dict[str, Any]] = None,
+        *,
+        request_id: Optional[str] = None,
+        intent: Optional[str] = None,
+        capability_requirements: Optional[tuple[str, ...] | list[str]] = None,
+        auto_validate: bool = True,
+        brain: Any = None,
+    ) -> "TaskContract":
+        """UNDERSTAND (+ VALIDATE by default) — single entry for building a contract."""
+        # Do not force intent="task" — that would add needs_capability and
+        # bypass conversation/learning-only outcome derivation.
+        contract = cls.understand(
+            original_request if original_request is not None else (goal or ""),
+            request_id=request_id,
+            intent=intent,
+            args=args,
+            skill_meta=skill_meta,
+            capability_requirements=capability_requirements,
+            brain=brain,
+        )
+        if auto_validate:
+            return cls.validate(contract)
+        return contract
+
+    def constraints_for_verify(
+        self, args: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        """
+        Frozen verification view of constraints.
+
+        Does NOT re-interpret original_request. Optionally overlays grounded
+        input values onto already-locked file specs (path/contains) when the
+        input is request-grounded and matches a locked artifact/needle.
+        """
+        out = dict(self.constraints or {})
+        out["checks"] = [
+            dict(ch) for ch in (self.verification_plan or out.get("checks") or [])
+            if isinstance(ch, dict)
+        ]
+        if not args:
+            return out
+        grounded = self.sanitize_args(args, self.original_request)
+        files = [dict(f) for f in (out.get("files") or []) if isinstance(f, dict)]
+        art_set = {str(a).lower() for a in self.artifacts}
+        for f in files:
+            p = str(f.get("path") or "")
+            for key in ("path", "dest", "file", "output", "filepath"):
+                cand = grounded.get(key)
+                if cand and self.is_grounded(cand, self.original_request):
+                    if p.lower() == str(cand).lower() or Path(p).name.lower() == Path(
+                        str(cand)
+                    ).name.lower() or str(cand).lower() in art_set:
+                        f["path"] = str(cand)
+            for key in ("content", "body", "text", "contains"):
+                cand = grounded.get(key)
+                if cand is not None and self.is_grounded(cand, self.original_request):
+                    if f.get("contains") is None or str(f.get("contains")) == str(cand):
+                        if any(
+                            str(cand) == str(x)
+                            for x in self.content_requirements
+                        ) or str(cand) in self.original_request:
+                            f["contains"] = str(cand)
+        out["files"] = files
+        return out
+
+    def with_inputs(
+        self,
+        args: Optional[dict[str, Any]],
+        skill_meta: Optional[dict[str, Any]] = None,
+    ) -> "TaskContract":
+        """
+        Refresh grounded inputs without rewriting locked truth fields.
+
+        If ``validated``, original_request / desired_outcomes / acceptance_criteria
+        and verification_plan stay exactly as validated. Constraints used for
+        VERIFY overlay inputs onto the frozen plan — no request re-parse.
+        """
+        grounded = self.sanitize_args(
+            args or {}, self.original_request, skill_meta=skill_meta
+        )
+        merged = dict(self.inputs or {})
+        merged.update(grounded)
+        merged = self.sanitize_args(merged, self.original_request, skill_meta=skill_meta)
+
+        if self.validated:
+            cons = self.constraints_for_verify(merged)
+            return replace(self, constraints=cons, inputs=merged, validated=True)
+
+        # Not yet validated — allow semantic refresh from grounded inputs
+        refreshed = self.understand(
+            self.original_request,
+            request_id=self.request_id,
+            intent=self.intent,
+            args=merged,
+            skill_meta=skill_meta,
+            capability_requirements=self.capability_requirements,
+        )
+        return replace(
+            refreshed,
+            inputs=merged,
+            artifacts=refreshed.artifacts or self.artifacts,
+            capability_requirements=self.capability_requirements,
+            validated=False,
+            subject=(
+                refreshed.subject
+                if refreshed.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+                else self.subject
+            ),
+            actions=refreshed.actions or self.actions,
+            content_source=refreshed.content_source or self.content_source,
+            content_requirements=refreshed.content_requirements
+            or self.content_requirements,
+            required_outcomes=refreshed.required_outcomes or self.required_outcomes,
+            final_output_constraints=dict(
+                refreshed.final_output_constraints or self.final_output_constraints or {}
+            ),
+            requirements=dict(refreshed.requirements or self.requirements or {}),
+        )
+
+    # Prefer with_inputs; keep name used by context/orchestrator call sites.
+    def with_args(
+        self,
+        args: Optional[dict[str, Any]],
+        skill_meta: Optional[dict[str, Any]] = None,
+    ) -> "TaskContract":
+        return self.with_inputs(args, skill_meta=skill_meta)
+
+    def with_capability_requirements(
+        self, reqs: tuple[str, ...] | list[str]
+    ) -> "TaskContract":
+        """Attach competence/capability ids discovered after UNDERSTAND."""
+        return replace(self, capability_requirements=tuple(reqs or ()))
+
+    def with_requirements_hint(
+        self, hint: Optional[dict[str, Any]]
+    ) -> "TaskContract":
+        """
+        Merge additive requirements hints into the contract.
+
+        Hints may add learning/research/capability flags. They must never
+        remove artifact/execution outcomes already implied by the contract.
+        """
+        from jarvis.intent import IntentClassifier
+
+        if self.validated:
+            # Locked — only enrich requirements metadata, keep outcomes frozen
+            merged = IntentClassifier.merge_into_contract_requirements(
+                self.requirements, hint
+            )
+            return replace(self, requirements=merged)
+
+        merged = IntentClassifier.merge_into_contract_requirements(
+            self.requirements, hint
+        )
+        required = derive_required_outcomes(
+            artifacts=self.artifacts,
+            behaviors=self.behaviors,
+            side_effects=self.side_effects,
+            acceptance_criteria=self.acceptance_criteria,
+            content_source=self.content_source,
+            constraints=self.constraints,
+            draft_outcomes=self.desired_outcomes,
+            requirements_hint=merged,
+            final_output_constraints=self.final_output_constraints,
+        )
+        actionable = {
+            OUTCOME_ARTIFACT,
+            OUTCOME_EXECUTION,
+            OUTCOME_CAPABILITY,
+            OUTCOME_TEST,
+            OUTCOME_SIDE_EFFECT,
+        }
+        primary = self.intent
+        if set(required) & actionable:
+            primary = "task"
+        elif OUTCOME_LEARNING in required:
+            primary = "learning"
+        elif OUTCOME_CONVERSATION in required:
+            primary = "conversation"
+        return replace(
+            self,
+            requirements=merged,
+            required_outcomes=required,
+            intent=primary,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "original_request": self.original_request,
+            "intent": self.intent,
+            "desired_outcomes": list(self.desired_outcomes),
+            "artifacts": list(self.artifacts),
+            "behaviors": [dict(b) for b in self.behaviors],
+            "constraints": self.constraints,
+            "inputs": dict(self.inputs or {}),
+            "outputs": list(self.outputs),
+            "side_effects": list(self.side_effects),
+            "acceptance_criteria": list(self.acceptance_criteria),
+            "verification_plan": [dict(v) for v in self.verification_plan],
+            "capability_requirements": list(self.capability_requirements),
+            "validated": self.validated,
+            "required_outcomes": list(self.required_outcomes),
+            "final_output_constraints": dict(self.final_output_constraints or {}),
+            "requirements": dict(self.requirements or {}),
+            "subject": self.subject,
+            "actions": list(self.actions),
+            "content_source": list(self.content_source),
+            "content_requirements": list(self.content_requirements),
+            "verifiable": self.is_verifiable(),
+            "needs_refine": self.needs_refine(),
+        }
+
+    @classmethod
+    def refine(
+        cls,
+        contract: "TaskContract",
+        *,
+        brain: Any = None,
+        args: Optional[dict[str, Any]] = None,
+    ) -> "TaskContract":
+        """
+        Strengthen contract expectations from the immutable original_request.
+
+        Never invents paths/content absent from the request. If still
+        unverifiable, returns a contract with acceptance_criteria=needs_refine.
+        """
+        if contract.validated and contract.is_verifiable():
+            # Locked — refine must not rewrite acceptance / outcomes
+            return contract
+
+        req = contract.original_request
+        grounded = cls.sanitize_args(args or {}, req)
+        grounded.update(
+            {
+                k: v
+                for k, v in (contract.inputs or {}).items()
+                if v not in (None, "")
+            }
+        )
+        for f in (contract.constraints or {}).get("files") or []:
+            p = str((f or {}).get("path") or "").strip()
+            if p and "path" not in grounded and cls.is_grounded(p, req):
+                grounded.setdefault("path", p)
+            c = (f or {}).get("contains")
+            if c is not None and "content" not in grounded and cls.is_grounded(c, req):
+                grounded.setdefault("content", c)
+        for h in (contract.constraints or {}).get("http") or []:
+            u = str((h or {}).get("url") or "").strip()
+            if u and cls.is_grounded(u, req):
+                grounded.setdefault("url", u)
+        for src in contract.content_source or ():
+            if cls.looks_like_url(str(src)) and cls.is_grounded(src, req):
+                grounded.setdefault("url", str(src))
+
+        if brain is not None and hasattr(brain, "extract_task_args"):
+            try:
+                hinted = brain.extract_task_args(req, prior_args=grounded) or {}
+                if isinstance(hinted, dict):
+                    for k, v in hinted.items():
+                        if v in (None, ""):
+                            continue
+                        if cls.is_invented_default(v, req):
+                            continue
+                        if not cls.is_grounded(v, req) and not isinstance(
+                            v, (int, float, bool)
+                        ):
+                            continue
+                        grounded.setdefault(str(k), v)
+            except Exception:
+                pass
+
+        refined = cls.understand(
+            req,
+            request_id=contract.request_id,
+            intent=contract.intent,
+            args=grounded,
+            capability_requirements=contract.capability_requirements,
+            brain=brain,
+        )
+        # Preserve additive requirements from the pre-refine contract
+        if contract.requirements:
+            refined = refined.with_requirements_hint(contract.requirements)
+        if contract.required_outcomes and not refined.required_outcomes:
+            refined = replace(refined, required_outcomes=contract.required_outcomes)
+        # Union required outcomes (hints must not drop artifact/execution)
+        if contract.required_outcomes:
+            merged_out = tuple(
+                dict.fromkeys(
+                    list(contract.required_outcomes) + list(refined.required_outcomes)
+                )
+            )
+            refined = replace(refined, required_outcomes=merged_out)
+        if (
+            refined.subject in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+            and contract.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+        ):
+            refined = replace(
+                refined,
+                artifacts=refined.artifacts or contract.artifacts,
+                subject=contract.subject,
+                actions=refined.actions or contract.actions,
+                content_source=refined.content_source or contract.content_source,
+                content_requirements=refined.content_requirements
+                or contract.content_requirements,
+                capability_requirements=refined.capability_requirements
+                or contract.capability_requirements,
+            )
+        if refined.needs_refine():
+            cons = dict(refined.constraints or {})
+            cons["needs_refine"] = True
+            cons["source"] = "task_contract_refine"
+            return replace(
+                refined,
+                desired_outcomes=("needs_refine",),
+                behaviors=(),
+                constraints=cons,
+                acceptance_criteria=("needs_refine",),
+                verification_plan=(),
+                validated=False,
+                required_outcomes=refined.required_outcomes or contract.required_outcomes,
+                requirements=dict(refined.requirements or contract.requirements or {}),
+                final_output_constraints=dict(
+                    refined.final_output_constraints
+                    or contract.final_output_constraints
+                    or {}
+                ),
+            )
+        return refined
+
+    # ── Structured derivation helpers (contract fields) ─────────────────
+
+    @staticmethod
+    def _verification_plan_from_constraints(
+        constraints: dict[str, Any],
+        acceptance: tuple[str, ...] | list[str],
+    ) -> tuple[dict[str, Any], ...]:
+        checks = list((constraints or {}).get("checks") or [])
+        out: list[dict[str, Any]] = []
+        for ch in checks:
+            if isinstance(ch, dict) and ch.get("kind") and ch.get("target"):
+                out.append(
+                    {
+                        "kind": str(ch["kind"]),
+                        "target": str(ch["target"]),
+                        "how": str(ch.get("how") or ""),
+                    }
+                )
+        if out:
+            return tuple(out[:24])
+        # Parse acceptance labels kind:target@how
+        for raw in acceptance or ():
+            s = str(raw).strip()
+            if not s or s in ("needs_refine", "skill_ok_and_verified"):
+                continue
+            how = ""
+            body = s
+            if "@" in s:
+                body, how = s.rsplit("@", 1)
+            if ":" not in body:
+                continue
+            kind, target = body.split(":", 1)
+            out.append(
+                {"kind": kind.strip(), "target": target.strip(), "how": how.strip()}
+            )
+        return tuple(out[:24])
+
+    @staticmethod
+    def _behaviors_from_plan(
+        plan: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], ...]:
+        beh: list[dict[str, Any]] = []
+        for ch in plan or ():
+            if not isinstance(ch, dict):
+                continue
+            kind = str(ch.get("kind") or "")
+            if kind.startswith("skill_") or kind in (
+                "skill_output_contains",
+                "skill_result_equals",
+                "skill_result_type",
+            ):
+                beh.append(
+                    {
+                        "kind": kind,
+                        "target": str(ch.get("target") or ""),
+                        "how": str(ch.get("how") or ""),
+                    }
+                )
+        return tuple(beh)
+
+    @staticmethod
+    def _desired_outcomes(
+        artifacts: tuple[str, ...] | list[str],
+        behaviors: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+        content_reqs: tuple[str, ...] | list[str],
+        acceptance: tuple[str, ...] | list[str],
+    ) -> tuple[str, ...]:
+        out: list[str] = []
+        for a in artifacts or ():
+            label = f"artifact:{a}"
+            if label not in out:
+                out.append(label)
+        for c in content_reqs or ():
+            label = f"content:{c}"
+            if label not in out:
+                out.append(label)
+        for b in behaviors or ():
+            if isinstance(b, dict) and b.get("kind") and b.get("target"):
+                label = f"behavior:{b['kind']}:{b['target']}"
+                if label not in out:
+                    out.append(label)
+        if not out:
+            for s in acceptance or ():
+                if s and s not in ("needs_refine", "skill_ok_and_verified"):
+                    out.append(str(s))
+        return tuple(out[:16])
+
+    @staticmethod
+    def _derive_outputs(
+        artifacts: tuple[str, ...] | list[str],
+        behaviors: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    ) -> tuple[str, ...]:
+        out: list[str] = []
+        for a in artifacts or ():
+            if a and a not in out:
+                out.append(str(a))
+        for b in behaviors or ():
+            if isinstance(b, dict) and b.get("target"):
+                t = f"result:{b.get('kind')}:{b.get('target')}"
+                if t not in out:
+                    out.append(t)
+        return tuple(out[:16])
+
+    @staticmethod
+    def _derive_side_effects(
+        constraints: dict[str, Any],
+        actions: tuple[str, ...] | list[str],
+    ) -> tuple[str, ...]:
+        effects: list[str] = []
+        if constraints.get("files"):
+            effects.append("filesystem_write")
+        if constraints.get("directories"):
+            effects.append("directory_create")
+        if constraints.get("http"):
+            effects.append("network_http")
+        if constraints.get("imports"):
+            effects.append("import_dependency")
+        for a in actions or ():
+            if a in ("install",) and "env_install" not in effects:
+                effects.append("env_install")
+        return tuple(effects)
+
+    @staticmethod
+    def _filter_plan_to_acceptance(
+        plan: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+        acceptance: tuple[str, ...] | list[str],
+    ) -> tuple[dict[str, Any], ...]:
+        allowed: set[str] = set()
+        for raw in acceptance or ():
+            s = str(raw).strip()
+            if not s:
+                continue
+            body = s.split("@", 1)[0]
+            allowed.add(body)
+            if ":" in body:
+                allowed.add(body.split(":", 1)[0])
+        out: list[dict[str, Any]] = []
+        for ch in plan or ():
+            if not isinstance(ch, dict):
+                continue
+            key = f"{ch.get('kind')}:{ch.get('target')}"
+            if key in allowed or str(ch.get("kind") or "") in allowed:
+                out.append(dict(ch))
+        return tuple(out)
+
+    # ── Fault-layer helpers (universal) ─────────────────────────────────
+
+    @staticmethod
+    def normalize_fault_layer(layer: Any) -> str:
+        """
+        Map diagnosis fault_layer to a canonical value.
+
+        Missing / UNKNOWN / unrecognized layers stay ``unknown``.
+        They must NEVER silently become ``skill_code`` (no rewrite without evidence).
+        """
+        if layer is None:
+            return "unknown"
+        raw = str(layer).strip().lower()
+        if not raw or raw in ("none", "null", "unknown", "unrecognized", "?"):
+            return "unknown"
+        raw = _LEGACY_LAYER.get(raw, raw)
+        if raw not in FAULT_LAYERS:
+            return "unknown"
+        return raw
+
+    @classmethod
+    def rewrite_skill_for_layer(cls, layer: Any) -> bool:
+        """
+        Skill rewrite allowed ONLY for an explicit skill_code attribution.
+
+        unknown / unrecognized / other layers → False (never auto-rewrite).
+        """
+        return cls.normalize_fault_layer(layer) == "skill_code"
+
+    @classmethod
+    def apply_rewrite_gate(cls, diagnosis: Optional[dict[str, Any]]) -> dict[str, Any]:
+        """
+        Normalize fault_layer; rewrite_skill=True only for skill_code.
+
+        Diagnosers must attribute skill_code only with evidence. unknown /
+        unrecognized layers never unlock a skill rewrite.
+        """
+        out = dict(diagnosis or {})
+        layer = cls.normalize_fault_layer(out.get("fault_layer"))
+        out["fault_layer"] = layer
+        out["rewrite_skill"] = layer == "skill_code"
+        return out
+
+    # ── Grounding helpers (universal) ───────────────────────────────────
+
+    @classmethod
+    def is_invented_default(cls, value: Any, request: str) -> bool:
+        if value in (None, ""):
+            return False
+        sv = str(value)
+        if cls.is_grounded(sv, request):
+            return False
+        return bool(_INVENTED_RE.search(sv))
+
+    @staticmethod
+    def is_grounded(value: Any, request: str) -> bool:
+        if value in (None, ""):
+            return False
+        sv = str(value)
+        req = request or ""
+        if sv in req:
+            return True
+        base = Path(sv).name
+        if base and base in req:
+            return True
+        # Case-insensitive containment for short tokens
+        if len(sv) >= 2 and sv.lower() in req.lower():
+            return True
+        if base and len(base) >= 2 and base.lower() in req.lower():
+            return True
+        return False
+
+    @classmethod
+    def request_tokens(cls, request: str) -> set[str]:
+        return {
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9_./\\-]{2,}", request or "")
+            if t.lower() not in _STOP
+        }
+
+    @classmethod
+    def path_segment_tokens(
+        cls,
+        request: str,
+        artifacts: Optional[tuple[str, ...] | list[str]] = None,
+    ) -> set[str]:
+        """Stems/dirs from path-like request tokens — never deps or arg keys."""
+        return path_segment_tokens(request, artifacts)
+
+    @classmethod
+    def classify_items(
+        cls,
+        request: str,
+        *,
+        args: Optional[dict[str, Any]] = None,
+        artifacts: Optional[tuple[str, ...] | list[str]] = None,
+    ) -> list:
+        """PATH/FILE/LIBRARY/COMMAND/CONTENT/REQUIREMENT classification."""
+        return classify_request_items(
+            request, grounded_args=args, artifacts=artifacts
+        )
+
+    @classmethod
+    def sanitize_libraries(
+        cls,
+        names: Optional[list],
+        request: str,
+        *,
+        artifacts: Optional[tuple[str, ...] | list[str]] = None,
+        skill_code: Optional[str] = None,
+    ) -> list[str]:
+        return sanitize_libraries(
+            names, request, artifacts=artifacts, skill_code=skill_code
+        )
+
+    @classmethod
+    def is_polluted_arg_key(
+        cls,
+        key: str,
+        request: str,
+        *,
+        schema_keys: Optional[set[str]] = None,
+    ) -> bool:
+        """
+        True when a key looks like a request content-token promoted to an arg name.
+
+        Schema keys and explicit key=value names in the request are never polluted.
+        Path stems (e.g. calculator from workspace/calculator.py) are always polluted.
+        """
+        k = str(key or "").strip()
+        if not k:
+            return True
+        if schema_keys and k in schema_keys:
+            return False
+        if re.search(rf"(?i)\b{re.escape(k)}\s*[:=]", request or ""):
+            return False
+        # Path segments of output files must never become arg keys / deps
+        if k.lower() in cls.path_segment_tokens(request):
+            return True
+        # Very short keys that appear as bare words in the request are needles
+        tokens = cls.request_tokens(request)
+        # Also include stop-filtered scan so 'ti' (stopword) is still caught
+        bare = {t.lower() for t in re.findall(r"[A-Za-z0-9_./\\-]{2,}", request or "")}
+        if k.lower() in bare and k.lower() not in {s.lower() for s in (schema_keys or set())}:
+            # Allow only if it is an explicit schema-shaped name not from request tokens
+            # Keys that appear in the request as words are polluted unless schema-declared.
+            return True
+        if k.lower() in tokens:
+            return True
+        return False
+
+    @classmethod
+    def sanitize_args(
+        cls,
+        args: dict[str, Any],
+        request: str,
+        *,
+        skill_meta: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Ground values AND drop polluted word-keys from the request sentence."""
+        schema: set[str] = set()
+        if isinstance(skill_meta, dict):
+            for src in (
+                skill_meta.get("required_args"),
+                skill_meta.get("input_schema"),
+                list((skill_meta.get("args_schema") or {}).keys())
+                if isinstance(skill_meta.get("args_schema"), dict)
+                else [],
+            ):
+                if isinstance(src, list):
+                    schema.update(str(x) for x in src if x)
+                elif isinstance(src, dict):
+                    schema.update(str(x) for x in src.keys())
+        grounded = cls.ground_args(args or {}, request)
+        out: dict[str, Any] = {}
+        for k, v in grounded.items():
+            if cls.is_polluted_arg_key(k, request, schema_keys=schema):
+                continue
+            out[str(k)] = v
+        return out
+
+    @classmethod
+    def ground_args(cls, args: dict[str, Any], request: str) -> dict[str, Any]:
+        """Keep only arg values present in / clearly derived from the USER REQUEST."""
+        out: dict[str, Any] = {}
+        for k, v in (args or {}).items():
+            if v in (None, ""):
+                continue
+            if cls.is_invented_default(v, request):
+                continue
+            if not cls.is_grounded(v, request):
+                # Allow numbers/bools always; strings must be grounded
+                if isinstance(v, (int, float, bool)):
+                    out[str(k)] = v
+                continue
+            out[str(k)] = v
+        return out
+
+    @staticmethod
+    def looks_like_url(value: str) -> bool:
+        return str(value).strip().lower().startswith(("http://", "https://"))
+
+    @classmethod
+    def looks_like_path(cls, value: str) -> bool:
+        sv = str(value).strip()
+        if not sv or cls.looks_like_url(sv):
+            return False
+        if _PATH_LIKE.match(sv):
+            return True
+        if ("/" in sv or "\\" in sv) and " " not in sv:
+            return True
+        return False
+
+    @staticmethod
+    def looks_like_content(value: str) -> bool:
+        sv = str(value).strip()
+        if not sv:
+            return False
+        if " " in sv or "\n" in sv or "\t" in sv:
+            return True
+        if len(sv) > 48:
+            return True
+        return False
+
+    @classmethod
+    def derive_constraints(
+        cls, request: str, args: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        """
+        Conservative constraints from USER REQUEST + grounded args only.
+
+        Does NOT treat every word in the sentence as a file path or must_contain
+        needle. Prefer: quoted strings, extension-bearing filenames, grounded
+        schema args, explicit key=value pairs.
+        """
+        args = dict(args or {})
+        expect: dict[str, Any] = {
+            "files": [],
+            "directories": [],
+            "imports": [],
+            "http": [],
+            "must_contain": [],
+            "check_process": True,
+            "source": "task_contract",
+        }
+
+        path_vals: list[str] = []
+        text_vals: list[str] = []
+
+        # 1) Grounded structured args (schema keys / explicit mappings)
+        for _k, val in args.items():
+            sv = str(val)
+            if cls.looks_like_url(sv):
+                expect["http"].append({"url": sv})
+            elif cls.looks_like_path(sv):
+                if sv not in path_vals:
+                    path_vals.append(sv)
+            elif cls.looks_like_content(sv):
+                if sv not in text_vals:
+                    text_vals.append(sv)
+            else:
+                # Bare token from a schema arg — treat as content payload only
+                # when paired with a path, otherwise keep as soft content.
+                if sv not in text_vals and sv not in path_vals and len(sv) >= 2:
+                    text_vals.append(sv)
+
+        # 2) Bare URLs in the request (content_source; never path artifacts)
+        for m in re.finditer(r"https?://\S+", request or ""):
+            u = m.group(0).rstrip(".,);]\"'")
+            if u and not cls.is_invented_default(u, request):
+                expect["http"].append({"url": u})
+
+        # 3) Quoted strings from the request (highest-confidence literals)
+        for a, b in re.findall(r"\"([^\"]+)\"|'([^']+)'", request or ""):
+            tok = (a or b).strip()
+            if not tok or cls.is_invented_default(tok, request):
+                continue
+            if cls.looks_like_url(tok):
+                expect["http"].append({"url": tok})
+            elif cls.looks_like_path(tok):
+                if tok not in path_vals:
+                    path_vals.append(tok)
+            else:
+                if tok not in text_vals:
+                    text_vals.append(tok)
+
+        # 4) Bare filenames with extensions in the request (not every word)
+        #    Skip tokens that are substrings of a captured URL host/path.
+        url_blobs = " ".join(
+            str((h or {}).get("url") or "") for h in expect["http"]
+        ).lower()
+        for m in re.finditer(
+            r"(?<![A-Za-z0-9_\"'])([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,12})\b",
+            request or "",
+        ):
+            tok = m.group(1)
+            if cls.is_invented_default(tok, request):
+                continue
+            if cls.looks_like_url(tok):
+                continue
+            if tok.lower() in url_blobs or any(
+                tok.lower() in str((h or {}).get("url") or "").lower()
+                for h in expect["http"]
+            ):
+                continue
+            if tok not in path_vals:
+                path_vals.append(tok)
+
+        # 5) key=value pairs in the request (never split https:// into key=value)
+        for km in re.finditer(
+            r"(?P<k>[A-Za-z_][\w]*)\s*[:=]\s*(?P<v>\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+            request or "",
+        ):
+            key = (km.group("k") or "").lower()
+            if key in ("http", "https"):
+                continue
+            raw = km.group("v")
+            if (raw.startswith('"') and raw.endswith('"')) or (
+                raw.startswith("'") and raw.endswith("'")
+            ):
+                raw = raw[1:-1]
+            # URL fragment left after https: split — treat as URL, not path
+            if raw.startswith("//") and key in ("http", "https"):
+                continue
+            if raw.startswith("//"):
+                continue
+            if cls.is_invented_default(raw, request):
+                continue
+            if cls.looks_like_url(raw):
+                expect["http"].append({"url": raw})
+            elif cls.looks_like_path(raw) and raw not in path_vals:
+                if raw.lower() in url_blobs:
+                    continue
+                path_vals.append(raw)
+            elif cls.looks_like_content(raw) and raw not in text_vals:
+                text_vals.append(raw)
+            elif raw not in text_vals and raw not in path_vals:
+                text_vals.append(raw)
+
+        # 6) Content after explicit cue words (NOT every sentence token).
+        #    Prevents "ti"/"Python"/… must_contain pollution while still
+        #    capturing payloads like: containing HELLO / ar tekstu DARBOJAS.
+        if not text_vals:
+            for m in re.finditer(
+                r"(?i)(?:containing|contains|with\s+text|text|content|"
+                r"tekstu|saturu|ar\s+tekstu)\s+[\"']?"
+                r"([A-Za-z0-9_./\\-]{2,})",
+                request or "",
+            ):
+                tok = m.group(1)
+                if tok.lower() in _STOP:
+                    continue
+                if cls.is_invented_default(tok, request) or cls.looks_like_path(tok):
+                    continue
+                if tok not in text_vals:
+                    text_vals.append(tok)
+                    break
+
+        # 7) If we have a path but still no payload, take at most ONE remaining
+        #    significant token (≥3 chars) that is not a stopword/path.
+        if path_vals and not text_vals:
+            leftovers: list[str] = []
+            for tok in re.findall(r"[A-Za-z0-9_./\\-]{3,}", request or ""):
+                low = tok.lower()
+                if low in _STOP:
+                    continue
+                if cls.is_invented_default(tok, request) or cls.looks_like_path(tok):
+                    continue
+                if tok in path_vals:
+                    continue
+                leftovers.append(tok)
+            if len(leftovers) == 1:
+                text_vals.append(leftovers[0])
+
+        primary = text_vals[0] if text_vals else None
+        for i, p in enumerate(path_vals):
+            entry: dict[str, Any] = {"path": p, "min_bytes": 1}
+            if i == 0 and primary is not None:
+                entry["contains"] = primary
+            expect["files"].append(entry)
+
+        if primary is not None:
+            for extra in text_vals[1:]:
+                # Only multi-word / substantial extras become must_contain
+                if cls.looks_like_content(str(extra)) or len(str(extra)) >= 4:
+                    expect["must_contain"].append(str(extra))
+            # Pathless payload: primary never attached to a file contains —
+            # keep it as a content/behavior needle (VERIFY uses skill output
+            # when no file targets exist).
+            if not path_vals and (
+                cls.looks_like_content(str(primary)) or len(str(primary)) >= 4
+            ):
+                if str(primary) not in expect["must_contain"]:
+                    expect["must_contain"].insert(0, str(primary))
+        elif text_vals and not path_vals:
+            expect["must_contain"].extend(
+                str(t) for t in text_vals
+                if cls.looks_like_content(str(t)) or len(str(t)) >= 4
+            )
+
+        low = (request or "").lower()
+        if any(w in low for w in ("directory", "folder", "katalog", "mapi")):
+            for tok in re.findall(r"[A-Za-z0-9_./\\-]{2,}", request or ""):
+                if ("/" in tok or "\\" in tok) and not Path(tok).suffix:
+                    if not cls.is_invented_default(tok, request):
+                        expect["directories"].append({"path": tok})
+
+        return expect
+
+    # ── Structured views ────────────────────────────────────────────────
+
+    @classmethod
+    def _derive_actions(cls, request: str) -> tuple[str, ...]:
+        found = [m.group(1).lower() for m in _ACTION_VERBS.finditer(request or "")]
+        # Preserve order, unique
+        out: list[str] = []
+        for a in found:
+            if a not in out:
+                out.append(a)
+        if not out:
+            out = ["execute"]
+        return tuple(out[:8])
+
+    @staticmethod
+    def _derive_artifacts(constraints: dict[str, Any]) -> tuple[str, ...]:
+        arts: list[str] = []
+        for f in constraints.get("files") or []:
+            p = str((f or {}).get("path") or "").strip()
+            if p and p not in arts:
+                arts.append(p)
+        for d in constraints.get("directories") or []:
+            p = str((d or {}).get("path") or "").strip()
+            if p and p not in arts:
+                arts.append(p)
+        # URLs are content_source, not output artifacts, unless also a file target.
+        return tuple(arts)
+
+    @staticmethod
+    def _derive_content_requirements(constraints: dict[str, Any]) -> tuple[str, ...]:
+        reqs: list[str] = []
+        for f in constraints.get("files") or []:
+            c = (f or {}).get("contains")
+            if c is not None and str(c).strip() and str(c) not in reqs:
+                reqs.append(str(c))
+        for m in constraints.get("must_contain") or []:
+            if m is not None and str(m).strip() and str(m) not in reqs:
+                reqs.append(str(m))
+        return tuple(reqs)
+
+    @classmethod
+    def _derive_content_source(
+        cls, request: str, constraints: dict[str, Any]
+    ) -> tuple[str, ...]:
+        """
+        Origins of content grounded in the request only.
+
+        URLs, explicit from/using/via cues, and memory references.
+        Empty when the request does not name a source — never invent one.
+        """
+        sources: list[str] = []
+        for h in constraints.get("http") or []:
+            u = str((h or {}).get("url") or "").strip()
+            if u and u not in sources:
+                sources.append(u)
+        for m in re.finditer(r"https?://\S+", request or ""):
+            u = m.group(0).rstrip(".,);]")
+            if u and u not in sources:
+                sources.append(u)
+        for m in _SOURCE_CUE.finditer(request or ""):
+            tok = (m.group(1) or "").strip()
+            if not tok:
+                continue
+            low = tok.lower()
+            if low in ("memory", "prior knowledge"):
+                tok = "memory"
+            elif low in _SUBJECT_STOP or low in _STOP:
+                continue
+            if tok not in sources and not cls.is_invented_default(tok, request):
+                sources.append(tok)
+        if _MEMORY_CUE.search(request or "") and "memory" not in sources:
+            sources.append("memory")
+        return tuple(sources[:8])
+
+    @classmethod
+    def _derive_subject(
+        cls,
+        request: str,
+        artifacts: tuple[str, ...] | list[str],
+        content_requirements: tuple[str, ...] | list[str],
+        content_source: tuple[str, ...] | list[str],
+    ) -> str:
+        """
+        Surface subject/topic from the request — never a guessed sense.
+
+        Prefer explicit about/regarding cues; otherwise leftover content tokens
+        after stripping actions, artifacts, payloads, and sources.
+        Ambiguous single-token leftovers stay ``ambiguous``; empty → ``unknown``.
+        """
+        req = request or ""
+        # 1) Explicit topic cue — keep surface phrase (do not disambiguate)
+        m = _ABOUT_CUE.search(req)
+        if m:
+            phrase = " ".join((m.group(1) or "").split()).strip(" .,;:-")
+            # Strip trailing artifact mentions accidentally captured
+            for art in artifacts:
+                if art and art in phrase:
+                    phrase = phrase.replace(art, " ")
+            cleaned: list[str] = []
+            for tok in re.findall(r"[A-Za-z0-9_]{3,}", phrase):
+                low = tok.lower()
+                if low in _SUBJECT_STOP:
+                    continue
+                if cls.looks_like_path(tok):
+                    continue
+                if tok not in cleaned:
+                    cleaned.append(tok)
+            if len(cleaned) >= 2:
+                return " ".join(cleaned[:10])
+            if len(cleaned) == 1:
+                return SUBJECT_AMBIGUOUS
+            # fall through if cue yielded nothing useful
+
+        exclude: set[str] = set()
+        for art in artifacts:
+            exclude.add(str(art).lower())
+            exclude.add(Path(str(art)).stem.lower())
+            for part in re.findall(r"[A-Za-z0-9_]{2,}", str(art)):
+                exclude.add(part.lower())
+        for c in content_requirements:
+            exclude.add(str(c).lower())
+            for part in re.findall(r"[A-Za-z0-9_]{2,}", str(c)):
+                exclude.add(part.lower())
+        for src in content_source:
+            exclude.add(str(src).lower())
+            for part in re.findall(r"[A-Za-z0-9_]{2,}", str(src)):
+                if part.lower() not in ("http", "https", "www"):
+                    exclude.add(part.lower())
+        exclude.update(path_segment_tokens(req, artifacts))
+        for a in cls._derive_actions(req):
+            exclude.add(a.lower())
+
+        tokens: list[str] = []
+        for tok in re.findall(r"[A-Za-z0-9_]{3,}", req):
+            low = tok.lower()
+            if low in _SUBJECT_STOP or low in exclude:
+                continue
+            if cls.looks_like_path(tok) or cls.looks_like_url(tok):
+                continue
+            if tok not in tokens:
+                tokens.append(tok)
+
+        if not tokens:
+            return SUBJECT_UNKNOWN
+        # Single leftover token with no supporting context → do not invent sense
+        if len(tokens) == 1:
+            return SUBJECT_AMBIGUOUS
+        return " ".join(tokens[:10])
+
+    @classmethod
+    def _derive_behavior_checks(cls, request: str) -> list[dict[str, Any]]:
+        """
+        Structured behavior/functionality checks from USER REQUEST semantics.
+
+        Converts requested functionality into verifiable criteria even when no
+        path/URL/args were given. Only uses literals grounded in the request —
+        never invents payloads, expected values, or types the user did not ask for.
+        """
+        req = request or ""
+        checks: list[dict[str, Any]] = []
+
+        def _add(kind: str, target: str, how: str) -> None:
+            t = str(target or "").strip()
+            if not t:
+                return
+            entry = {"kind": kind, "target": t, "how": how}
+            if entry not in checks:
+                checks.append(entry)
+
+        # 1) Communicative output — say/print/… + grounded payload token
+        for m in _COMMUNICATIVE_RE.finditer(req):
+            tok = ((m.group(1) or m.group(2) or m.group(3) or "")).strip()
+            if not tok:
+                continue
+            low = tok.lower()
+            # Multi-word quoted payloads: reject if every token is filler
+            words = [w.lower() for w in re.findall(r"[A-Za-z0-9][\w.-]*", tok)]
+            if words and all(
+                w in _BEHAVIOR_PAYLOAD_STOP or w in _STOP for w in words
+            ):
+                continue
+            if low in _BEHAVIOR_PAYLOAD_STOP or low in _STOP:
+                continue
+            if cls.is_invented_default(tok, req) or cls.looks_like_path(tok):
+                continue
+            if not cls.is_grounded(tok, req):
+                continue
+            _add("skill_output_contains", tok, "skill_stdout_or_result")
+
+        # 2) Explicit return type (before equals — "return an int" is type, not equals)
+        for m in _RETURN_TYPE_RE.finditer(req):
+            raw_t = (m.group(1) or "").strip().lower()
+            canon = _TYPE_ALIASES.get(raw_t)
+            if canon:
+                _add("skill_result_type", canon, "skill_result")
+
+        # 3) Return / equals literal — only when no type criterion already covers it
+        if not any(c.get("kind") == "skill_result_type" for c in checks):
+            m = _RETURN_EQUALS_RE.search(req.strip())
+            if m:
+                raw = (m.group(1) or "").strip().rstrip(".,;:")
+                # Drop leading articles
+                raw = re.sub(r"(?i)^(an?|the)\s+", "", raw).strip()
+                if raw and raw.lower() not in _BEHAVIOR_PAYLOAD_STOP:
+                    if raw.lower() not in _TYPE_ALIASES and not cls.is_invented_default(
+                        raw, req
+                    ):
+                        # Prefer short grounded literals / numbers / sequences
+                        if (
+                            cls.is_grounded(raw, req)
+                            or re.fullmatch(r"-?\d+(?:\.\d+)?", raw)
+                            or (
+                                raw[:1] in "([\"'"
+                                and raw[-1:] in ")]\"'"
+                                and raw in req
+                            )
+                        ):
+                            _add("skill_result_equals", raw, "skill_result")
+
+        # 4) Arithmetic with grounded operands → expected numeric result
+        am = _ARITH_EXPR_RE.search(req)
+        if am:
+            a_s, op, b_s = am.group(1), am.group(2), am.group(3)
+            if a_s in req and b_s in req and op in req:
+                try:
+                    a = float(a_s) if "." in a_s else int(a_s)
+                    b = float(b_s) if "." in b_s else int(b_s)
+                    if op in ("+",):
+                        val: Any = a + b
+                    elif op in ("-",):
+                        val = a - b
+                    elif op in ("*", "×"):
+                        val = a * b
+                    elif op in ("/", "÷"):
+                        if b == 0:
+                            val = None
+                        else:
+                            val = a / b
+                    else:
+                        val = None
+                    if val is not None:
+                        if isinstance(val, float) and val.is_integer():
+                            val = int(val)
+                        _add("skill_result_equals", str(val), "skill_result")
+                except Exception:
+                    pass
+
+        # 5) Reverse / sort only with grounded example literals
+        rm = _REVERSE_LIT_RE.search(req)
+        if rm:
+            lit = (rm.group(1) or "").strip()
+            if lit and lit in req and not cls.is_invented_default(lit, req):
+                expected = cls._eval_reverse_literal(lit)
+                if expected is not None:
+                    _add("skill_result_equals", expected, "skill_result")
+        sm = _SORT_LIT_RE.search(req)
+        if sm:
+            lit = (sm.group(1) or "").strip()
+            if lit and lit in req and not cls.is_invented_default(lit, req):
+                expected = cls._eval_sort_literal(lit)
+                if expected is not None:
+                    _add("skill_result_equals", expected, "skill_result")
+
+        return checks
+
+    @staticmethod
+    def _eval_reverse_literal(lit: str) -> Optional[str]:
+        """Compute reverse of a grounded list/tuple/string literal; else None."""
+        s = (lit or "").strip()
+        if not s:
+            return None
+        try:
+            if (s.startswith('"') and s.endswith('"')) or (
+                s.startswith("'") and s.endswith("'")
+            ):
+                return s[1:-1][::-1]
+            if s.startswith("(") and s.endswith(")"):
+                # Normalize to list-like for eval safety
+                inner = s[1:-1].strip()
+                if not inner:
+                    return "()"
+                # Use literal_eval via ast for safety
+                import ast
+
+                val = ast.literal_eval(s if s.endswith(",)") or "," in s else f"({inner},)")
+                if isinstance(val, tuple):
+                    return repr(tuple(reversed(val)))
+            if s.startswith("[") and s.endswith("]"):
+                import ast
+
+                val = ast.literal_eval(s)
+                if isinstance(val, list):
+                    return repr(list(reversed(val)))
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _eval_sort_literal(lit: str) -> Optional[str]:
+        """Compute sorted form of a grounded list literal; else None."""
+        s = (lit or "").strip()
+        if not (s.startswith("[") and s.endswith("]")):
+            return None
+        try:
+            import ast
+
+            val = ast.literal_eval(s)
+            if isinstance(val, list):
+                return repr(sorted(val))
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _attach_checks(
+        cls, constraints: dict[str, Any], request: str
+    ) -> dict[str, Any]:
+        """
+        Attach structured, independently checkable ``checks`` to constraints.
+
+        Each check: kind + target + how (workspace_stat / workspace_read /
+        http_get / importlib / directory_stat / skill_stdout_or_result /
+        skill_result). Derived only from request-grounded constraints and
+        semantic behavior cues — never from skill self-proof.
+        """
+        out = dict(constraints or {})
+        checks: list[dict[str, Any]] = []
+
+        def _add(kind: str, target: str, how: str) -> None:
+            t = str(target or "").strip()
+            if not t:
+                return
+            entry = {"kind": kind, "target": t, "how": how}
+            if entry not in checks:
+                checks.append(entry)
+
+        has_files = bool(out.get("files"))
+
+        for f in out.get("files") or []:
+            p = str((f or {}).get("path") or "").strip()
+            if p:
+                _add("artifact_exists", p, "workspace_stat")
+            c = (f or {}).get("contains")
+            if c is not None and str(c).strip():
+                _add("content_present", str(c), "workspace_read")
+        for m in out.get("must_contain") or []:
+            if m is not None and str(m).strip():
+                if has_files:
+                    # Path/artifact goal — content must appear in workspace files
+                    _add("content_present", str(m), "workspace_read")
+                else:
+                    # Pathless content → verify real skill/tool output behavior
+                    _add(
+                        "skill_output_contains",
+                        str(m),
+                        "skill_stdout_or_result",
+                    )
+        for d in out.get("directories") or []:
+            p = str((d or {}).get("path") or "").strip()
+            if p:
+                _add("directory_exists", p, "directory_stat")
+        for h in out.get("http") or []:
+            u = str((h or {}).get("url") or "").strip()
+            if u:
+                _add("http_ok", u, "http_get")
+        for mod in out.get("imports") or []:
+            if mod is not None and str(mod).strip():
+                _add("import_ok", str(mod), "importlib")
+
+        # content_source URLs not already in http → checkable origins
+        if not out.get("http"):
+            for m in re.finditer(r"https?://\S+", request or ""):
+                u = m.group(0).rstrip(".,);]\"'")
+                if u and not cls.is_invented_default(u, request):
+                    _add("http_ok", u, "http_get")
+                    out.setdefault("http", []).append({"url": u})
+
+        # Semantic behavior/functionality criteria from USER REQUEST
+        for beh in cls._derive_behavior_checks(request or ""):
+            _add(
+                str(beh.get("kind") or ""),
+                str(beh.get("target") or ""),
+                str(beh.get("how") or ""),
+            )
+
+        out["checks"] = checks[:24]
+        out["source"] = out.get("source") or "contract"
+        return out
+
+    @classmethod
+    def _derive_success_criteria(
+        cls,
+        constraints: dict[str, Any],
+        request: str = "",
+    ) -> tuple[str, ...]:
+        """
+        Verifiable success criteria from the full request-derived constraints.
+
+        Encodes artifact/content/network checks and semantic behavior criteria
+        (skill output / result equality / result type). Never falls back to
+        skill self-proof stubs.
+        """
+        crit: list[str] = []
+        checks = list((constraints or {}).get("checks") or [])
+        if checks:
+            for ch in checks:
+                if not isinstance(ch, dict):
+                    continue
+                kind = str(ch.get("kind") or "").strip()
+                target = str(ch.get("target") or "").strip()
+                how = str(ch.get("how") or "").strip()
+                if not kind or not target:
+                    continue
+                # kind:target@how — machine-checkable; VERIFY parses this
+                label = f"{kind}:{target}"
+                if how:
+                    label = f"{label}@{how}"
+                if label not in crit:
+                    crit.append(label)
+        else:
+            for p in cls._derive_artifacts(constraints):
+                crit.append(f"artifact_exists:{p}@workspace_stat")
+            for c in cls._derive_content_requirements(constraints):
+                crit.append(f"content_present:{c}@workspace_read")
+            for d in (constraints or {}).get("directories") or []:
+                p = str((d or {}).get("path") or "").strip()
+                if p:
+                    crit.append(f"directory_exists:{p}@directory_stat")
+            for h in (constraints or {}).get("http") or []:
+                u = str((h or {}).get("url") or "").strip()
+                if u:
+                    crit.append(f"http_ok:{u}@http_get")
+            for mod in (constraints or {}).get("imports") or []:
+                if mod is not None and str(mod).strip():
+                    crit.append(f"import_ok:{mod}@importlib")
+            # Behavior fallback when checks were not attached yet
+            for beh in cls._derive_behavior_checks(request or ""):
+                kind = str(beh.get("kind") or "")
+                target = str(beh.get("target") or "")
+                how = str(beh.get("how") or "")
+                if kind and target:
+                    label = f"{kind}:{target}" + (f"@{how}" if how else "")
+                    if label not in crit:
+                        crit.append(label)
+
+        if not crit:
+            # Explicitly unverifiable — caller must refine, not invent PASS
+            return ("needs_refine",)
+        return tuple(crit[:16])
+
+    # ── Query / MEMORY grounding ────────────────────────────────────────
+
+    def grounding_bundle(self) -> str:
+        """Text used to score research queries and memory relevance."""
+        parts = [
+            self.subject
+            if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+            else "",
+            " ".join(self.content_source),
+            " ".join(self.artifacts),
+            " ".join(self.content_requirements),
+            self.original_request,
+        ]
+        return " ".join(p for p in parts if p).strip()
+
+    def memory_topic(self) -> str:
+        """Slug for MEMORY retrieval — subject first, never invent a sense."""
+        from jarvis.intent import IntentClassifier
+
+        if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS):
+            return IntentClassifier.topic_slug(self.subject)
+        return IntentClassifier.topic_slug(self.original_request)
+
+    def prefers_memory_first(self) -> bool:
+        """True when the request points at prior/learned knowledge as source."""
+        if "memory" in {s.lower() for s in self.content_source}:
+            return True
+        return bool(_MEMORY_CUE.search(self.original_request or ""))
+
+    def subject_tokens(self) -> set[str]:
+        anchor = (
+            self.subject
+            if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+            else ""
+        )
+        if not anchor:
+            return set()
+        return {
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9_]{3,}", anchor)
+            if t.lower() not in _SUBJECT_STOP
+        }
+
+    def query_is_grounded(self, query: str) -> bool:
+        """
+        True when a research query stays semantically tied to this TaskContract.
+
+        Rejects queries that share only a single short token with a multi-token
+        subject (classic polysemy drift) while inventing an unrelated domain.
+        Soft relatedness alone is not enough when subject-token overlap is weak.
+        """
+        q = (query or "").strip()
+        if not q:
+            return False
+        # Whole query literally present in request/subject
+        if q in (self.original_request or "") or (
+            self.subject
+            and self.subject not in (SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+            and q in self.subject
+        ):
+            return True
+
+        subj = (
+            self.subject
+            if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+            else ""
+        )
+        for src in self.content_source:
+            src_l = str(src).lower()
+            if src_l == "memory":
+                continue
+            if src and src_l in q.lower():
+                return True
+
+        subj_tokens = self.subject_tokens()
+        q_tokens = {
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9_]{3,}", q)
+            if t.lower() not in _SUBJECT_STOP
+        }
+        overlap = subj_tokens & q_tokens
+
+        # Multi-token subject: require ≥2 subject tokens in the query.
+        # A single shared token is classic polysemy drift (python→pip, java→JDK).
+        if len(subj_tokens) >= 2:
+            if len(overlap) < 2:
+                return False
+            try:
+                from jarvis.learning_verify import soft_relatedness
+
+                return soft_relatedness(subj or self.grounding_bundle(), q) >= 0.18
+            except Exception:
+                return True
+
+        if overlap:
+            return True
+
+        # unknown/ambiguous subject — require request-token overlap (not actions)
+        req_tokens = {
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9_]{3,}", self.original_request or "")
+            if t.lower() not in _SUBJECT_STOP
+        }
+        actions = {a.lower() for a in self.actions}
+        art_stems = {Path(a).stem.lower() for a in self.artifacts}
+        useful = {
+            t for t in (req_tokens & q_tokens)
+            if t not in actions and t not in art_stems
+        }
+        if len(useful) >= 2:
+            return True
+        return False
+
+    def default_research_queries(self) -> list[str]:
+        """Regenerate queries strictly from TaskContract fields (no invented sense)."""
+        out: list[str] = []
+        subj = (
+            self.subject
+            if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+            else ""
+        )
+        if subj:
+            out.append(subj)
+            if self.content_requirements:
+                out.append(f"{subj} {' '.join(self.content_requirements[:2])}")
+        for src in self.content_source[:2]:
+            if str(src).lower() == "memory":
+                continue
+            if subj:
+                out.append(f"{subj} {src}")
+            else:
+                out.append(str(src))
+        if not out:
+            # Fall back to full immutable request — never invent a topic
+            out = [self.original_request]
+        # Dedupe
+        seen: list[str] = []
+        for q in out:
+            q = " ".join(str(q).split())
+            if q and q not in seen:
+                seen.append(q)
+        return seen[:6]
+
+    def ground_research_queries(
+        self,
+        queries: Optional[list] = None,
+        *,
+        regenerate: bool = True,
+    ) -> list[str]:
+        """
+        Keep only TaskContract-grounded queries; regenerate from TaskContract on total drift.
+        """
+        raw = [str(q).strip() for q in (queries or []) if str(q).strip()]
+        kept = [q for q in raw if self.query_is_grounded(q)]
+        # Preserve order, unique
+        out: list[str] = []
+        for q in kept:
+            if q not in out:
+                out.append(q)
+        if out:
+            return out[:6]
+        if regenerate:
+            return self.default_research_queries()
+        return []

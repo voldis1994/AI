@@ -73,6 +73,7 @@ class Memory:
                     phase TEXT,
                     observation TEXT NOT NULL,
                     code_fingerprint TEXT,
+                    failure_signature TEXT,
                     created_at REAL NOT NULL
                 );
 
@@ -119,6 +120,19 @@ class Memory:
                 CREATE INDEX IF NOT EXISTS idx_learn_sol_skill ON learning_solutions(skill_name);
                 """
             )
+            # Migrate older DBs that predate failure_signature
+            cols = {
+                r[1]
+                for r in self._conn.execute("PRAGMA table_info(learning_failures)").fetchall()
+            }
+            if "failure_signature" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE learning_failures ADD COLUMN failure_signature TEXT"
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_learn_fail_sig "
+                "ON learning_failures(failure_signature)"
+            )
             self._conn.commit()
 
     def add_message(self, role: str, content: str, meta: Optional[dict] = None) -> int:
@@ -155,6 +169,76 @@ class Memory:
             for m in msgs
             if m["role"] in ("user", "assistant")
         ]
+
+    def conversation_history_for_llm(self, limit: int = 8) -> list[dict[str, str]]:
+        """
+        History for the conversation handler only.
+
+        Excludes learning/task cycle turns so a prior DONE / final_result cannot
+        be reused as the answer to a new chat question.
+        """
+        msgs = self.recent_messages(max(limit * 4, 24))
+        skip: set[int] = set()
+        for i, m in enumerate(msgs):
+            if m.get("role") != "assistant":
+                continue
+            meta = m.get("meta") if isinstance(m.get("meta"), dict) else {}
+            intent = str(meta.get("intent") or "").lower()
+            if (
+                intent in ("learning", "task")
+                or meta.get("task_id")
+                or self._looks_like_cycle_outcome(str(m.get("content") or ""))
+            ):
+                skip.add(i)
+                if i > 0 and msgs[i - 1].get("role") == "user":
+                    skip.add(i - 1)
+
+        out: list[dict[str, str]] = []
+        for i, m in enumerate(msgs):
+            if i in skip:
+                continue
+            if m.get("role") not in ("user", "assistant"):
+                continue
+            content = str(m.get("content") or "").strip()
+            if not content:
+                continue
+            out.append({"role": str(m["role"]), "content": content})
+        return out[-limit:]
+
+    def last_cycle_assistant_reply(self) -> Optional[str]:
+        """Most recent learning/task assistant reply (for stale-result guards)."""
+        for m in reversed(self.recent_messages(30)):
+            if m.get("role") != "assistant":
+                continue
+            meta = m.get("meta") if isinstance(m.get("meta"), dict) else {}
+            intent = str(meta.get("intent") or "").lower()
+            content = str(m.get("content") or "")
+            if (
+                intent in ("learning", "task")
+                or meta.get("task_id")
+                or self._looks_like_cycle_outcome(content)
+            ):
+                return content
+        return None
+
+    @staticmethod
+    def _looks_like_cycle_outcome(content: str) -> bool:
+        """Heuristic for untagged learning/task final replies."""
+        if not content:
+            return False
+        head = content.lstrip()[:80].upper()
+        markers = (
+            "DONE.",
+            "DONE ",
+            "LEARNING VERIFY",
+            "LEARNING COMPLETE",
+            "SKILL RESULT",
+            "VERIFIER PASS",
+            "VERIFIER FAIL",
+            "DONE NAV ATĻAUTS",
+            "DONE NAV ATLAUTS",
+        )
+        return any(head.startswith(m) or m in content[:200].upper() for m in markers)
 
     def save_experience(
         self,
@@ -240,12 +324,15 @@ class Memory:
         observation: dict[str, Any],
         version: Optional[int] = None,
         phase: Optional[str] = None,
+        failure_signature: Optional[str] = None,
     ) -> int:
+        sig = failure_signature or observation.get("failure_signature")
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO learning_failures "
-                "(skill_name, goal, version, phase, observation, code_fingerprint, created_at) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "(skill_name, goal, version, phase, observation, code_fingerprint, "
+                "failure_signature, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
                 (
                     skill_name,
                     goal,
@@ -253,6 +340,7 @@ class Memory:
                     phase or observation.get("phase"),
                     json.dumps(observation, default=str),
                     observation.get("code_fingerprint"),
+                    sig,
                     time.time(),
                 ),
             )
@@ -440,6 +528,9 @@ class Memory:
             solutions = self._conn.execute(
                 "SELECT COUNT(*) AS c FROM learning_solutions"
             ).fetchone()["c"]
+        knowledge_entries = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM facts WHERE key LIKE 'knowledge:%'"
+        ).fetchone()["c"]
         return {
             "conversations": conversations,
             "experiences": experiences,
@@ -449,6 +540,223 @@ class Memory:
             "learning_failures": failures,
             "learning_diagnoses": diagnoses,
             "learning_solutions": solutions,
+            "knowledge_topics": knowledge_entries,
+        }
+
+    # ── Research knowledge persistence ──────────────────────────────────
+
+    def save_research_knowledge(
+        self,
+        skill_name: str,
+        research: dict[str, Any],
+        *,
+        goal: str = "",
+        queries: Optional[list] = None,
+    ) -> dict[str, Any]:
+        """
+        Persist research insights for a skill and return the updated history.
+
+        Keeps a rolling history under knowledge:{skill_name} and the latest
+        snapshot under research:{skill_name}.
+        """
+        entry = {
+            "ts": time.time(),
+            "goal": goal,
+            "queries": list(queries or [])[:8],
+            "approach": research.get("approach"),
+            "libraries": list(research.get("libraries") or [])[:12],
+            "key_apis": list(research.get("key_apis") or [])[:12],
+            "pitfalls": list(research.get("pitfalls") or [])[:12],
+            "repair_insight": research.get("repair_insight") or "",
+            "test_idea": research.get("test_idea") or "",
+            "sources": list(research.get("sources") or [])[:12],
+            "result_count": len(research.get("results") or []),
+        }
+        key = f"knowledge:{skill_name}"
+        prior = self.get_fact(key) or []
+        if not isinstance(prior, list):
+            prior = [prior]
+        prior.append(entry)
+        prior = prior[-20:]
+        self.set_fact(key, prior, source="research")
+        self.set_fact(f"research:{skill_name}", research, source="research")
+        return {"entry": entry, "history": prior}
+
+    def get_research_knowledge(self, skill_name: str, limit: int = 8) -> list[dict[str, Any]]:
+        prior = self.get_fact(f"knowledge:{skill_name}") or []
+        if not isinstance(prior, list):
+            return [prior] if prior else []
+        return list(prior)[-limit:]
+
+    def get_latest_research(self, skill_name: str) -> Optional[dict[str, Any]]:
+        val = self.get_fact(f"research:{skill_name}")
+        return val if isinstance(val, dict) else None
+
+    # ── Topic knowledge (learning requests — NOT tied to a skill) ───────
+
+    def save_topic_knowledge(
+        self,
+        topic: str,
+        research: dict[str, Any],
+        *,
+        goal: str = "",
+        queries: Optional[list] = None,
+        summary: str = "",
+        verified: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Persist knowledge for a learning topic (independent of any skill).
+
+        Keys: knowledge:topic:{slug} (history) and topic:{slug} (latest).
+        """
+        from jarvis.intent import IntentClassifier
+
+        slug = IntentClassifier.topic_slug(topic or goal or "topic")
+        art = research.get("artifact") if isinstance(research.get("artifact"), dict) else {}
+        entry = {
+            "ts": time.time(),
+            "topic": topic or slug,
+            "goal": goal,
+            "request_id": art.get("request_id") or research.get("request_id") or "",
+            "queries": list(queries or [])[:8],
+            "summary": (
+                summary
+                or art.get("summary")
+                or research.get("summary")
+                or research.get("approach")
+                or ""
+            )[:4000],
+            "approach": art.get("summary") or research.get("approach"),
+            "concepts": list(art.get("concepts") or research.get("concepts") or research.get("key_apis") or [])[:20],
+            "explanations": list(art.get("explanations") or research.get("explanations") or [])[:12],
+            "examples": list(art.get("examples") or research.get("examples") or [])[:8],
+            "practice": str(art.get("practice") or research.get("practice") or research.get("test_idea") or ""),
+            "libraries": list(research.get("libraries") or [])[:12],
+            "key_apis": list(
+                art.get("concepts") or research.get("concepts") or research.get("key_apis") or []
+            )[:20],
+            "pitfalls": [],  # never persist diagnostic gap labels as knowledge
+            "test_idea": str(art.get("practice") or research.get("practice") or research.get("test_idea") or ""),
+            "practical_result": art.get("practical_result") or research.get("practical_result"),
+            "sources": list(
+                art.get("source_evidence") or research.get("source_evidence") or research.get("sources") or []
+            )[:12],
+            "artifact": art or None,
+            "result_count": len(research.get("results") or []),
+            "verified": bool(verified),
+        }
+        key = f"knowledge:topic:{slug}"
+        prior = self.get_fact(key) or []
+        if not isinstance(prior, list):
+            prior = [prior]
+        prior.append(entry)
+        prior = prior[-20:]
+        self.set_fact(key, prior, source="learning")
+        self.set_fact(f"topic:{slug}", entry, source="learning")
+        return {"topic": slug, "entry": entry, "history": prior}
+
+    def get_topic_knowledge(self, topic: str, limit: int = 8) -> list[dict[str, Any]]:
+        from jarvis.intent import IntentClassifier
+
+        slug = IntentClassifier.topic_slug(topic)
+        prior = self.get_fact(f"knowledge:topic:{slug}") or []
+        if not isinstance(prior, list):
+            return [prior] if prior else []
+        return list(prior)[-limit:]
+
+    def list_topic_knowledge_keys(self) -> list[str]:
+        """All knowledge:topic:* fact keys."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key FROM facts WHERE key LIKE 'knowledge:topic:%'"
+            ).fetchall()
+        return [str(r["key"]) for r in rows]
+
+    def retrieve_relevant_knowledge(
+        self,
+        query: str,
+        *,
+        topic: str = "",
+        limit: int = 6,
+        verified_only: bool = False,
+    ) -> dict[str, Any]:
+        """
+        MEMORY RETRIEVAL — find prior topic knowledge relevant to this request.
+
+        Scores exact topic slug first, then related topics via soft_relatedness.
+        Returns entries newest-first within score tiers.
+        """
+        from jarvis import learning_verify as lv
+        from jarvis.intent import IntentClassifier
+
+        q = (query or "").strip()
+        topic_slug = IntentClassifier.topic_slug(topic or q or "topic")
+        hits: list[tuple[float, dict[str, Any]]] = []
+
+        # 1) Exact topic history
+        for e in self.get_topic_knowledge(topic_slug, limit=12):
+            if not isinstance(e, dict):
+                continue
+            if verified_only and not e.get("verified"):
+                continue
+            blob = " ".join(
+                [
+                    str(e.get("summary") or ""),
+                    str(e.get("goal") or ""),
+                    " ".join(str(x) for x in (e.get("concepts") or [])[:8]),
+                ]
+            )
+            rel = lv.soft_relatedness(q, blob) if q else 0.5
+            hits.append((1.0 + rel, dict(e)))
+
+        # 2) Other topic stores (related subjects)
+        for key in self.list_topic_knowledge_keys():
+            if key == f"knowledge:topic:{topic_slug}":
+                continue
+            prior = self.get_fact(key) or []
+            if not isinstance(prior, list):
+                prior = [prior] if prior else []
+            for e in prior[-6:]:
+                if not isinstance(e, dict):
+                    continue
+                if verified_only and not e.get("verified"):
+                    continue
+                blob = " ".join(
+                    [
+                        str(e.get("topic") or ""),
+                        str(e.get("summary") or ""),
+                        str(e.get("goal") or ""),
+                        " ".join(str(x) for x in (e.get("concepts") or [])[:8]),
+                    ]
+                )
+                rel = lv.soft_relatedness(q, blob) if q else 0.0
+                if rel < 0.18:
+                    continue
+                hits.append((rel, dict(e)))
+
+        hits.sort(key=lambda x: -x[0])
+        # Dedupe by (topic, summary prefix)
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for score, e in hits:
+            sig = f"{e.get('topic')}|{str(e.get('summary') or '')[:80]}"
+            if sig in seen:
+                continue
+            seen.add(sig)
+            e = dict(e)
+            e["_retrieval_score"] = round(float(score), 4)
+            out.append(e)
+            if len(out) >= limit:
+                break
+
+        verified = [e for e in out if e.get("verified")]
+        return {
+            "query": q,
+            "topic": topic_slug,
+            "entries": out,
+            "verified": verified,
+            "count": len(out),
+            "verified_count": len(verified),
         }
 
     def close(self) -> None:

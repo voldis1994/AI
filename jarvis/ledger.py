@@ -43,6 +43,12 @@ class Ledger:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # Faster durable writes on the hot path (many phase logs per attempt)
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -73,18 +79,31 @@ class Ledger:
             )
             self._conn.commit()
 
-    def start_task(self, goal: str) -> str:
-        task_id = uuid.uuid4().hex[:12]
+    def start_task(self, goal: str, task_id: Optional[str] = None) -> str:
+        """Create task row only — callers log the detailed REQUEST phase once.
+
+        When ``task_id`` is provided (unified request_id lifecycle), reuse it
+        so ledger rows share the same id as TaskContract.request_id.
+        """
+        tid = (task_id or "").strip() or uuid.uuid4().hex[:12]
         now = time.time()
         with self._lock:
-            self._conn.execute(
-                "INSERT INTO tasks (id, goal, status, created_at, updated_at, result) "
-                "VALUES (?,?,?,?,?,?)",
-                (task_id, goal, "REQUEST", now, now, None),
-            )
+            existing = self._conn.execute(
+                "SELECT id FROM tasks WHERE id=?", (tid,)
+            ).fetchone()
+            if existing:
+                self._conn.execute(
+                    "UPDATE tasks SET goal=?, status=?, updated_at=? WHERE id=?",
+                    (goal, "REQUEST", now, tid),
+                )
+            else:
+                self._conn.execute(
+                    "INSERT INTO tasks (id, goal, status, created_at, updated_at, result) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (tid, goal, "REQUEST", now, now, None),
+                )
             self._conn.commit()
-        self.log(task_id, "REQUEST", f"New request: {goal}")
-        return task_id
+        return tid
 
     def log(
         self,
