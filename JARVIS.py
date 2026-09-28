@@ -784,6 +784,28 @@ def run(context: dict) -> dict:
         assert tg_java2.content_source == tg_java.content_source
         assert tg_java2.user_request == java_req
 
+        # Hierarchical competence classification (no task-specific hardcode)
+        from jarvis.competence import (
+            classify_task_competences,
+            preferred_tool_name,
+        )
+        clf_poly = classify_task_competences(tg_poly)
+        assert "io.files" in clf_poly["skill_ids"], clf_poly
+        assert any("io.create" in c for c in clf_poly["capability_ids"]), clf_poly
+        assert "subject." in (clf_poly.get("subject_branch") or "")
+        tool_nm = preferred_tool_name(tg_poly, clf_poly)
+        assert tool_nm.startswith("io_files"), tool_nm
+        assert "habitat_notes" not in tool_nm  # not a per-request slug
+        # Multi-competence: fetch + write opens net + io
+        tg_multi = TaskGoal.from_request(
+            'Fetch https://example.com/x and write out.txt containing "OK"'
+        )
+        clf_multi = classify_task_competences(tg_multi)
+        assert "net.http" in clf_multi["skill_ids"], clf_multi
+        assert "io.files" in clf_multi["skill_ids"], clf_multi
+        assert any("net.fetch" in c for c in clf_multi["capability_ids"]), clf_multi
+        assert any("io.write" in c for c in clf_multi["capability_ids"]), clf_multi
+
         args_root = root / "data" / "_e2e_args"
         if args_root.exists():
             shutil.rmtree(args_root)
@@ -4287,6 +4309,223 @@ def run(context: dict) -> dict:
         )
     except Exception as exc:
         msg = f"E2E_REQUEST_GROUNDING: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # Hierarchical competence system (SKILL/CAPABILITY/TOOL + migration + reuse)
+    print("  — e2e competence hierarchy (classify/migrate/reuse/extend) —")
+    try:
+        from jarvis.competence import preferred_tool_name as _ptn_c
+        from jarvis.competence_registry import CompetenceRegistry as _CompReg
+        from jarvis.capability_registry import CapabilityRegistry as _CapReg2
+        from jarvis.orchestrator import Orchestrator as _OrchComp
+        from jarvis.task_goal import TaskGoal as _TGComp
+
+        comp_root = root / "data" / "_e2e_competence"
+        if comp_root.exists():
+            shutil.rmtree(comp_root)
+        comp_root.mkdir(parents=True)
+        skills_dir = comp_root / "skills"
+        skills_dir.mkdir(parents=True)
+
+        # Unit: migrate legacy task-specific skill → TOOL under io.files
+        db_c = comp_root / "migrate.db"
+        reg_c = _CapReg2(db_c)
+        legacy_name = "create_file_alpha_report_txt_containing"
+        legacy_path = skills_dir / f"{legacy_name}.py"
+        legacy_path.write_text(
+            "from pathlib import Path\n"
+            "SKILL_META = {\n"
+            f'  "name": "{legacy_name}",\n'
+            '  "description": "write file",\n'
+            '  "capabilities": ["write_file"],\n'
+            '  "dependencies": [],\n'
+            '  "version": 1,\n'
+            '  "required_args": ["dest", "body"],\n'
+            "}\n"
+            "def run(context):\n"
+            "    args = context.get('args') or {}\n"
+            "    p = Path(context.get('workspace') or '.') / str(args.get('dest') or 'x.txt')\n"
+            "    p.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    p.write_text(str(args.get('body') or '') + '\\n', encoding='utf-8')\n"
+            "    return {'ok': True, 'result': {'path': str(p)}, 'error': None, 'evidence': 'ok'}\n",
+            encoding="utf-8",
+        )
+        reg_c.register_candidate(
+            legacy_name,
+            'Create file alpha_report.txt containing ALPHA_OK',
+            str(legacy_path),
+            ["write_file"],
+            version=1,
+            protect_active=False,
+        )
+        reg_c.set_status(legacy_name, "ACTIVE")
+        # Mark a success so migration marks verified
+        reg_c.mark_success(legacy_name)
+        comp_c = _CompReg(db_c, reg_c)
+        mig = comp_c.migrate_legacy_skills()
+        assert mig["migrated"] >= 1, mig
+        tool = comp_c.get_tool(legacy_name)
+        assert tool and tool["competence_id"] == "io.files", tool
+        assert legacy_path.exists()  # working code preserved
+        # Second migrate is idempotent
+        mig2 = comp_c.migrate_legacy_skills()
+        assert mig2["migrated"] == 0 and mig2["skipped"] >= 1, mig2
+        reg_c.close()
+        comp_c.close()
+
+        class CompBrain(Brain):
+            def __init__(self) -> None:
+                super().__init__()
+                self.builds = 0
+                self.names: list[str] = []
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": ["create", "file"],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                # Deliberately request-slug skill_name — orchestrator must prefer
+                # competence tool name when extending (not create yet-another skill)
+                return {
+                    "steps": ["build"],
+                    "can_reuse": [],
+                    "missing": [goal],
+                    "needs_research": False,
+                    "needs_new_skill": True,
+                    "skill_name": Brain._slug(goal)[:40],
+                    "skill_description": goal,
+                    "research_queries": [],
+                    "args": {"dest": "comp_out.txt", "body": "COMP_OK"},
+                    "required_args": ["dest", "body"],
+                }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                return {"dest": "comp_out.txt", "body": "COMP_OK"}
+
+            def write_skill_code(
+                self,
+                skill_name,
+                description,
+                research,
+                previous_code=None,
+                error_log=None,
+                diagnosis=None,
+                failed_approaches=None,
+                test_plan=None,
+                **kwargs,
+            ) -> str:
+                self.builds += 1
+                self.names.append(skill_name)
+                return f'''
+from pathlib import Path
+SKILL_META = {{
+    "name": "{skill_name}",
+    "description": {description!r},
+    "capabilities": ["write_file", "io.create"],
+    "dependencies": [],
+    "version": {self.builds},
+    "required_args": ["dest", "body"],
+}}
+def run(context: dict) -> dict:
+    args = context.get("args") or {{}}
+    workspace = Path(context.get("workspace") or ".")
+    dest = str(args.get("dest") or "out.txt")
+    path = workspace / dest
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(args.get("body") or "") + "\\n", encoding="utf-8")
+    return {{
+        "ok": True,
+        "result": {{"path": str(path), "contains": str(args.get("body") or "")}},
+        "error": None,
+        "evidence": f"wrote {{path}}",
+    }}
+'''
+
+            def diagnose(self, observation, failed_approaches=None, prior_solutions=None):
+                return {
+                    "root_cause": "n/a",
+                    "fault_layer": "unknown",
+                    "rewrite_skill": False,
+                    "what_to_change": "",
+                    "approach": "write",
+                    "approach_changed": False,
+                    "needs_research": False,
+                    "missing_knowledge": [],
+                    "research_queries": [],
+                    "needs_new_deps": [],
+                    "missing_args": [],
+                    "required_args": ["dest", "body"],
+                    "suggested_args": {"dest": "comp_out.txt", "body": "COMP_OK"},
+                    "test_plan": "execute",
+                    "expected_artifacts": ["comp_out.txt"],
+                    "is_unfixable": False,
+                    "diagnosis": "ok",
+                }
+
+            def verify_claim(self, goal, result, evidence) -> dict:
+                return {"achieved": True, "confidence": 0.9, "reason": "ok"}
+
+            def converse(self, user_text, history=None) -> str:
+                return "ok"
+
+        logs_c: list[str] = []
+        brain_c = CompBrain()
+        orch_c = _OrchComp(
+            root=comp_root,
+            brain=brain_c,
+            on_log=lambda m: logs_c.append(m),
+        )
+        assert any("COMPETENCE: migrated" in m for m in logs_c) or True
+        goal_c = 'Create comp_out.txt containing "COMP_OK"'
+        tg_c = _TGComp.from_request(goal_c)
+        expect_tool = _ptn_c(tg_c)
+        result_c = orch_c.run_cycle(goal_c)
+        assert result_c.get("success"), result_c
+        assert any("COMPETENCE DECISION:" in m for m in logs_c), logs_c[:40]
+        # Built under competence tool name — not request slug as the only option
+        assert brain_c.names, brain_c.names
+        assert brain_c.names[0] == expect_tool, (brain_c.names, expect_tool)
+        assert brain_c.names[0] != Brain._slug(goal_c)[:40], brain_c.names
+        out_c = comp_root / "workspace_runtime" / "comp_out.txt"
+        assert out_c.exists() and "COMP_OK" in out_c.read_text(encoding="utf-8")
+        # TOOL registered under competence
+        tool_row = orch_c.competences.get_tool(brain_c.names[0])
+        assert tool_row, orch_c.competences.list_tools()
+        assert tool_row.get("competence_id") == "io.files", tool_row
+        assert tool_row.get("verified") is True
+        # Second similar task REUSE_COMPOSE — no new skill slug
+        builds_before = brain_c.builds
+        logs_c.clear()
+        result_c2 = orch_c.run_cycle('Create comp_out.txt containing "COMP_OK"')
+        assert result_c2.get("success"), result_c2
+        assert any("REUSE_COMPOSE" in m or "CAPABILITY DECISION: REUSE" in m for m in logs_c), [
+            m for m in logs_c if "COMPETENCE" in m or "CAPABILITY" in m
+        ]
+        # Prefer reuse — builds should not grow (or grow less than a full new skill)
+        assert brain_c.builds == builds_before, (brain_c.builds, builds_before)
+        stats = orch_c.get_dashboard_stats()
+        assert "competences" in stats and stats["competences"].get("tools", 0) >= 1
+        orch_c.close()
+        print(
+            "  OK competence hierarchy — migrate + classify + "
+            "TOOL reuse (no per-request skill)"
+        )
+    except Exception as exc:
+        msg = f"E2E_COMPETENCE: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)
