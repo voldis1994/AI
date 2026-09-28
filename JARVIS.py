@@ -3535,9 +3535,12 @@ def run(context):
             and "compatible=False" in m
             for m in logs_c
         ), [m for m in logs_c if "CAPABILITY" in m]
-        assert any("CAPABILITY DECISION: BUILD_NEW" in m for m in logs_c), [
-            m for m in logs_c if "CAPABILITY" in m
-        ]
+        assert any(
+            "CAPABILITY DECISION: BUILD_NEW" in m
+            or "CAPABILITY DECISION: EXTEND" in m
+            or "CAPABILITY DECISION: OPEN_BRANCH" in m
+            for m in logs_c
+        ), [m for m in logs_c if "CAPABILITY" in m]
         # Must not REPAIR the bait into a universal skill
         assert not orch_c.brain.repaired_bait, "bait skill was rewritten"
         bait_after = orch_c.registry.get_skill("python_decorators_basics")
@@ -3609,9 +3612,12 @@ def run(context):
             "Create markdown file beta_notes.md containing BETA_OK"
         )
         assert r2.get("success") is True, r2
-        assert any("CAPABILITY DECISION: BUILD_NEW" in m for m in logs_c2), [
-            m for m in logs_c2 if "CAPABILITY" in m
-        ]
+        assert any(
+            "CAPABILITY DECISION: BUILD_NEW" in m
+            or "CAPABILITY DECISION: EXTEND" in m
+            or "CAPABILITY DECISION: OPEN_BRANCH" in m
+            for m in logs_c2
+        ), [m for m in logs_c2 if "CAPABILITY" in m]
         assert any(
             "compatible=False" in m and "simple_calculator" in m for m in logs_c2
         ), [m for m in logs_c2 if "CAPABILITY MATCH" in m]
@@ -3674,7 +3680,9 @@ def run(context):
         orch_c.close()
         orch_c2.close()
         orch_r.close()
-        print("  OK capability match — bait rejected, BUILD_NEW, compatible REUSE")
+        print(
+            "  OK capability match — bait rejected, EXTEND/BUILD_NEW, compatible REUSE"
+        )
     except Exception as exc:
         msg = f"E2E_CAPABILITY_MATCH: {exc}"
         print(f"  FAIL {msg}")

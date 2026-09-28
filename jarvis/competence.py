@@ -263,14 +263,30 @@ def classify_task_competences(task_goal: TaskGoal) -> dict[str, Any]:
 
 def preferred_tool_name(task_goal: TaskGoal, classification: Optional[dict] = None) -> str:
     """
-    Stable tool name from competence + capability — NOT a slug of the full request.
+    Stable tool name from competence + capability (+ artifact class) —
+    NOT a slug of the full request or a specific filename.
 
-    Prevents every codegen from becoming a new task-specific skill.
+    Prevents every codegen from becoming a new task-specific skill, while
+    still separating tool variants by artifact kind/extension class so that
+    extending ``io.create`` for ``.md`` does not overwrite a ``.txt`` tool.
     """
     clf = classification or classify_task_competences(task_goal)
     primary = str(clf.get("primary_skill") or "general").replace(".", "_")
     caps = list(clf.get("capabilities") or ["act.unknown"])
     cap = str(caps[0]).replace(".", "_")
+    # Artifact class only (extension / kind) — never the basename/stem
+    art_class = ""
+    for a in task_goal.artifacts or ():
+        suf = Path(str(a)).suffix.lower().lstrip(".")
+        if suf and suf.isalnum() and len(suf) <= 12:
+            art_class = suf
+            break
+    if not art_class:
+        kinds = list(clf.get("artifact_kinds") or [])
+        if kinds and kinds[0] not in ("unknown", "token"):
+            art_class = str(kinds[0])
+    if art_class:
+        return slugify(f"{primary}_{cap}_{art_class}", 40)
     return slugify(f"{primary}_{cap}", 40)
 
 
