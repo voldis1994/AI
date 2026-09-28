@@ -35,10 +35,28 @@ except ModuleNotFoundError:  # pragma: no cover
     tk = None  # type: ignore
     scrolledtext = None  # type: ignore
 
-# Ensure project root is on sys.path
+# Ensure project root is on sys.path — APPEND, never insert(0).
+# insert(0) lets a local folder/file named ``ollama`` (or other deps) shadow
+# the installed site-packages module and yields: No module named 'ollama'.
 ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+_root_s = str(ROOT)
+if _root_s in sys.path:
+    try:
+        sys.path.remove(_root_s)
+    except ValueError:
+        pass
+sys.path.append(_root_s)
+# Warn if a local path would still shadow the real Ollama Python package
+_shadow = ROOT / "ollama"
+if _shadow.exists():
+    import warnings
+
+    warnings.warn(
+        f"Local path {_shadow} may shadow the installed 'ollama' package — "
+        "rename/remove it if imports fail.",
+        RuntimeWarning,
+        stacklevel=1,
+    )
 
 (ROOT / "data").mkdir(exist_ok=True)
 (ROOT / "skills").mkdir(exist_ok=True)
