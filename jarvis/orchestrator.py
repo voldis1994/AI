@@ -49,11 +49,25 @@ from jarvis.perf import PerfTracker, set_active_tracker
 from jarvis.invariants import (
     InvariantError,
     assert_active_requires_independent_verify,
+    assert_all_outcomes_verified,
     assert_build_allowed,
     assert_done_requires_verify,
     assert_locked_truth,
     assert_requests_isolated,
     prior_request_isolation,
+)
+from jarvis.outcomes import (
+    OUTCOME_ARTIFACT,
+    OUTCOME_CAPABILITY,
+    OUTCOME_CONVERSATION,
+    OUTCOME_EXECUTION,
+    OUTCOME_FINAL_OUTPUT,
+    OUTCOME_LEARNING,
+    OUTCOME_RESEARCH,
+    OUTCOME_SIDE_EFFECT,
+    OUTCOME_TEST,
+    OutcomeTracker,
+    verify_final_output,
 )
 from jarvis.runtime_fingerprint import fingerprint_line
 from jarvis.capability_match import (
@@ -208,12 +222,14 @@ class Orchestrator:
 
     def handle_user_message(self, text: str) -> dict[str, Any]:
         """
-        Route ONE user message in isolation:
+        Unified lifecycle for ONE user message:
 
-        INTENT → correct handler → EXECUTE/ANSWER → own reply → DONE
+        REQUEST → UNDERSTAND → TaskContract → VALIDATE → stages →
+        VERIFY ALL required outcomes → REMEMBER → DONE
 
-        Never reuses a previous request's final_result / DONE outcome as the
-        answer for a new request (conversation must not echo prior learning).
+        TaskContract is created BEFORE any routing. IntentClassifier only
+        supplies additive requirements hints — never an exclusive lifecycle
+        fork. Learning is a stage inside the same request_id lifecycle.
         """
         text = (text or "").strip()
         request_id = uuid.uuid4().hex[:12]
@@ -242,7 +258,6 @@ class Orchestrator:
         self._request_cache = {}
         self.perf = PerfTracker(request_id)
         set_active_tracker(self.perf)
-        # Pool request context: collect results + dedupe same work across models
         if hasattr(self.brain, "begin_request_pool"):
             try:
                 self.brain.begin_request_pool(request_id)
@@ -253,9 +268,8 @@ class Orchestrator:
         )
         self._status("THINKING")
         self._log(f"REQUEST_ID: {request_id} text={text[:120]!r}")
-        # Do not _log USER/JARVIS reply here — GUI/CLI already display them once.
 
-        # Fast-path commands
+        # Fast-path commands (not TaskContract work)
         low = text.lower().strip()
         if low in ("/status", "status"):
             reply = self._format_status()
@@ -279,84 +293,60 @@ class Orchestrator:
                 request_id, text, "help", reply, intent_name="help"
             )
 
-        # Classify THIS request independently (never inherit prior skill/result)
         model_status = self.brain.model_status()
         brain_up = model_status == "ONLINE"
-        if not brain_up:
-            intent = self._offline_classify(text)
-        else:
-            intent = self.brain.classify_intent(text)
-        intent = IntentClassifier.normalize(intent, text)
-        intent_name = str(intent.get("intent") or "conversation")
-        self._log(
-            f"INTENT: {intent_name} request_id={request_id} "
-            f"needs_capability={intent.get('needs_capability')} "
-            f"goal={intent.get('goal')!r}"
+
+        # ── UNDERSTAND before any routing decision ──────────────────────
+        self.perf.begin("UNDERSTAND")
+        self._status("UNDERSTAND")
+        contract = TaskContract.understand(
+            text,
+            request_id=request_id,
+            brain=self.brain,
         )
+        # Requirements hints — additive only; cannot strip artifact/execution
+        if not brain_up:
+            hint = self._offline_classify(text)
+        else:
+            hint = self.brain.classify_intent(text)
+        hint = IntentClassifier.normalize(hint, text)
+        contract = contract.with_requirements_hint(hint)
+        self._log(
+            f"UNDERSTAND: request_id={request_id} "
+            f"required_outcomes={list(contract.required_outcomes)} "
+            f"primary={contract.intent!r} "
+            f"artifacts={list(contract.artifacts)[:4]} "
+            f"needs_learning={contract.requires_learning_stage()} "
+            f"needs_capability={contract.requires_capability_stages()}"
+        )
+        self.perf.end("UNDERSTAND", outcomes=len(contract.required_outcomes))
 
-        if intent_name == "conversation":
-            self._status("CONVERSING")
-            reply = self._answer_conversation(
-                text,
-                request_id=request_id,
-                brain_up=brain_up,
-                model_status=model_status,
-            )
-            out = self._finish_request(
-                request_id,
-                text,
-                "conversation",
-                reply,
-                intent_name="conversation",
-                intent=intent,
-                success=True,
-            )
-            self._status("DONE")
-            self._status("IDLE")
-            return out
-
-        # Learning / knowledge — isolated cycle; no prior final_result as reply
-        if intent_name == "learning":
-            goal = intent.get("goal") or text
-            result = self.run_learning_cycle(goal, original_request=text)
-            reply = result.get("reply") or result.get("outcome") or str(result)
-            reply = self._ensure_fresh_reply(
-                reply, text, request_id=request_id, intent_name="learning"
-            )
-            out = self._finish_request(
-                request_id,
-                text,
-                "learning",
-                reply,
-                intent_name="learning",
-                intent=intent,
-                success=bool(result.get("success")),
-                extra={
-                    k: v
-                    for k, v in result.items()
-                    if k
-                    not in (
-                        "reply", "outcome", "type", "intent", "request_id",
-                        "success",
-                    )
-                },
-            )
-            return out
-
-        # Action task — isolated cycle for THIS request only
-        goal = intent.get("goal") or text
-        result = self.run_cycle(goal, original_request=text)
+        # Unified lifecycle — one request_id, one contract (no parallel cycles)
+        result = self.run_cycle(
+            contract.original_request,
+            original_request=text,
+            request_id=request_id,
+            contract=contract,
+            requirements_hint=hint,
+        )
+        result_type = str(result.get("type") or "task")
+        intent_name = str(
+            (result.get("contract") or {}).get("intent")
+            or contract.intent
+            or hint.get("intent")
+            or "task"
+        )
         reply = result.get("reply") or result.get("outcome") or str(result)
         reply = self._ensure_fresh_reply(
-            reply, text, request_id=request_id, intent_name="task"
+            reply, text, request_id=request_id, intent_name=intent_name
         )
         out = self._finish_request(
             request_id,
             text,
-            "task",
+            result_type,
             reply,
-            intent_name="task",
-            intent=intent,
+            intent_name=intent_name,
+            intent=hint,
             success=bool(result.get("success")),
             extra={
                 k: v
@@ -537,39 +527,76 @@ class Orchestrator:
         self, goal: str, original_request: Optional[str] = None
     ) -> dict[str, Any]:
         """
-        Self-correcting learning / knowledge path:
+        Compatibility wrapper — learning is a stage in the unified lifecycle.
 
-        USER REQUEST → research → KnowledgeArtifact synthesis → VERIFY
-        on FAIL: DIAGNOSE missing artifact fields → gap-fill only → VERIFY
-
-        VERIFY compares USER REQUEST ↔ clean KnowledgeArtifact only
-        (never research/debug/repair logs). Reuses verified topic knowledge
-        before new research. Does not build/repair skills.
+        Does not mint an independent request lifecycle. Builds one TaskContract
+        with needs_learning and delegates to run_cycle.
         """
         user_request = (original_request or goal or "").strip()
-        contract = TaskContract.from_request(user_request, goal=goal)
+        request_id = uuid.uuid4().hex[:12]
+        contract = TaskContract.understand(
+            user_request,
+            request_id=request_id,
+            brain=self.brain,
+        )
+        contract = contract.with_requirements_hint(
+            {
+                "intent": "learning",
+                "needs_learning": True,
+                "needs_research": True,
+                "needs_capability": False,
+                "goal": user_request,
+            }
+        )
+        return self.run_cycle(
+            contract.original_request,
+            original_request=user_request,
+            request_id=request_id,
+            contract=contract,
+            requirements_hint={
+                "intent": "learning",
+                "needs_learning": True,
+                "needs_research": True,
+            },
+        )
+
+    def _run_learning_stage_body(
+        self,
+        contract: TaskContract,
+        *,
+        task_id: str,
+        request_id: str,
+        declare_global_done: bool = False,
+    ) -> dict[str, Any]:
+        """
+        LEARN stage — KnowledgeArtifact research/verify subflow.
+
+        When ``declare_global_done`` is False (default), success only proves the
+        learning outcome — it must not set global DONE for the whole request.
+        """
+        user_request = contract.original_request
         goal = contract.goal
-        # Subject/topic from TaskContract — never invent a disambiguated sense
         topic = contract.memory_topic()
         learn_key = f"learning:{topic}"
-        request_id = uuid.uuid4().hex[:12]
-        task_id = self.ledger.start_task(goal)
-        self._status("REQUEST")
+        self._status("LEARN")
         self._log(
-            f"[{task_id}] REQUEST (learning): {contract.original_request} "
-            f"subject={contract.subject!r} request_id={request_id}"
+            f"[{task_id}] LEARN stage: {contract.original_request} "
+            f"subject={contract.subject!r} request_id={request_id} "
+            f"declare_global_done={declare_global_done}"
         )
         self.ledger.log(
             task_id,
-            "REQUEST",
-            "Learning TaskContract frozen (KnowledgeArtifact path)",
+            "LEARN",
+            "Learning stage (KnowledgeArtifact) — not global DONE",
             {
                 **contract.to_dict(),
                 "topic": topic,
-                "intent": "learning",
                 "request_id": request_id,
+                "declare_global_done": declare_global_done,
             },
         )
+        # Bind locals expected by the historical learning body below
+        # (continues with MEMORY → research → VERIFY loop).
 
         try:
             # ── MEMORY RETRIEVAL by TaskContract.subject (before any SEARCH) ─
@@ -641,6 +668,7 @@ class Orchestrator:
                         approach="reuse_verified_artifact",
                         queries=[],
                         memory_used=True,
+                        declare_global_done=declare_global_done,
                     )
                 # Verified blob exists but gaps vs THIS request → search only missing
                 missing_from_mem = list(
@@ -862,6 +890,7 @@ class Orchestrator:
                         attempt=attempt,
                         approach=current_approach,
                         queries=queries,
+                        declare_global_done=declare_global_done,
                     )
 
                 # ── FAIL → OBSERVE → DIAGNOSE concrete artifact gaps ──
@@ -1010,7 +1039,8 @@ class Orchestrator:
 
             outcome = (
                 f"LEARNING VERIFY FAIL after {learn_max} attempts: "
-                f"{(verification or {}).get('reason')}. DONE nav atļauts. "
+                f"{(verification or {}).get('reason')}. "
+                f"Learning outcome not verified. "
                 f"Knowledge draft under topic:{topic}."
             )
             self.memory.save_experience(
@@ -1028,13 +1058,15 @@ class Orchestrator:
                     "calibration": self.calibration.status(),
                 },
             )
-            self.ledger.finish(
-                task_id, False,
-                {"outcome": outcome, "topic": topic, "attempts": learn_max},
-            )
+            if declare_global_done:
+                self.ledger.finish(
+                    task_id, False,
+                    {"outcome": outcome, "topic": topic, "attempts": learn_max},
+                )
             return {
                 "type": "learning",
                 "success": False,
+                "verified": False,
                 "task_id": task_id,
                 "request_id": request_id,
                 "reply": outcome,
@@ -1047,12 +1079,15 @@ class Orchestrator:
             tb = traceback.format_exc()
             outcome = f"Learning error: {exc}"
             self._log(f"[{task_id}] EXCEPTION: {tb}")
-            self.ledger.finish(task_id, False, {"error": str(exc), "traceback": tb})
+            if declare_global_done:
+                self.ledger.finish(task_id, False, {"error": str(exc), "traceback": tb})
             self.memory.save_experience(goal, outcome, False, details={"traceback": tb})
             return {
                 "type": "learning",
                 "success": False,
+                "verified": False,
                 "task_id": task_id,
+                "request_id": request_id,
                 "reply": outcome,
                 "outcome": outcome,
             }
@@ -1101,10 +1136,17 @@ class Orchestrator:
         approach: str,
         queries: list,
         memory_used: bool = False,
+        declare_global_done: bool = False,
     ) -> dict[str, Any]:
+        """
+        Persist verified KnowledgeArtifact.
+
+        Proves the learning outcome only. Global DONE is declared only when
+        ``declare_global_done`` is True AND the caller has checked all
+        required TaskContract outcomes.
+        """
         artifact.verified = True
         research = self._research_from_artifact(artifact)
-        # Attach extract evidence into source_evidence when present
         if not artifact.source_evidence and research.get("sources"):
             artifact.source_evidence = list(research.get("sources") or [])[:15]
         saved = self.memory.save_topic_knowledge(
@@ -1119,7 +1161,7 @@ class Orchestrator:
             f"KNOWLEDGE SAVED: topic={topic} verified=True "
             f"concepts={len(artifact.concepts)} "
             f"sources={len(artifact.source_evidence)} "
-            f"request_id={request_id}"
+            f"request_id={request_id} global_done={declare_global_done}"
         )
         if memory_used:
             self._log(
@@ -1135,15 +1177,26 @@ class Orchestrator:
                 f"\nPractical result: "
                 f"{practical.get('result', practical.get('answer'))!r}"
             )
-        outcome = (
-            f"DONE. Learning complete — knowledge verified & saved.\n"
-            f"Topic: {topic}\n"
-            f"Attempts: {attempt}\n"
-            f"Approach: {approach}\n"
-            f"Summary: {(saved.get('entry') or {}).get('summary', '')[:400]}\n"
-            f"Sources: {len(artifact.source_evidence)}"
-            f"{practical_line}"
-        )
+        if declare_global_done:
+            outcome = (
+                f"DONE. Learning complete — knowledge verified & saved.\n"
+                f"Topic: {topic}\n"
+                f"Attempts: {attempt}\n"
+                f"Approach: {approach}\n"
+                f"Summary: {(saved.get('entry') or {}).get('summary', '')[:400]}\n"
+                f"Sources: {len(artifact.source_evidence)}"
+                f"{practical_line}"
+            )
+        else:
+            outcome = (
+                f"LEARNING outcome VERIFIED (not global DONE).\n"
+                f"Topic: {topic}\n"
+                f"Attempts: {attempt}\n"
+                f"Approach: {approach}\n"
+                f"Summary: {(saved.get('entry') or {}).get('summary', '')[:400]}\n"
+                f"Sources: {len(artifact.source_evidence)}"
+                f"{practical_line}"
+            )
         self._status("SAVE_EXPERIENCE")
         self.memory.save_experience(
             goal, outcome, True,
@@ -1157,27 +1210,36 @@ class Orchestrator:
                 "intent": "learning",
                 "attempts": attempt,
                 "approach": approach,
+                "declare_global_done": declare_global_done,
             },
         )
-        self.ledger.finish(
-            task_id,
-            True,
-            {
-                "topic": topic,
-                "verified": True,
-                "intent": "learning",
-                "attempts": attempt,
-                "request_id": request_id,
-            },
-        )
-        self._status("DONE")
-        self._log(
-            f"[{task_id}] DONE (learning topic={topic} attempts={attempt} "
-            f"request_id={request_id})"
-        )
+        if declare_global_done:
+            self.ledger.finish(
+                task_id,
+                True,
+                {
+                    "topic": topic,
+                    "verified": True,
+                    "intent": "learning",
+                    "attempts": attempt,
+                    "request_id": request_id,
+                },
+            )
+            self._status("DONE")
+            self._log(
+                f"[{task_id}] DONE (learning topic={topic} attempts={attempt} "
+                f"request_id={request_id})"
+            )
+        else:
+            self._log(
+                f"[{task_id}] LEARNING outcome VERIFIED topic={topic} "
+                f"attempts={attempt} request_id={request_id} "
+                f"(awaiting other required outcomes)"
+            )
         return {
             "type": "learning",
             "success": True,
+            "verified": True,
             "task_id": task_id,
             "request_id": request_id,
             "reply": outcome,
@@ -1187,6 +1249,93 @@ class Orchestrator:
             "artifact": artifact.to_dict(),
             "verification": verification,
             "attempts": attempt,
+        }
+
+    def _execute_learning_stage(
+        self,
+        contract: TaskContract,
+        *,
+        task_id: str,
+        request_id: str,
+        declare_global_done: bool = False,
+    ) -> dict[str, Any]:
+        return self._run_learning_stage_body(
+            contract,
+            task_id=task_id,
+            request_id=request_id,
+            declare_global_done=declare_global_done,
+        )
+
+    def _complete_conversation_request(
+        self,
+        contract: TaskContract,
+        tracker: OutcomeTracker,
+        *,
+        task_id: str,
+        request_id: str,
+    ) -> dict[str, Any]:
+        """Conversation / answer stage within the unified lifecycle."""
+        self._status("CONVERSING")
+        model_status = self.brain.model_status()
+        brain_up = model_status == "ONLINE"
+        reply = self._answer_conversation(
+            contract.original_request,
+            request_id=request_id,
+            brain_up=brain_up,
+            model_status=model_status,
+        )
+        tracker.mark(
+            OUTCOME_CONVERSATION,
+            verified=bool(reply and str(reply).strip()),
+            failed=not bool(reply and str(reply).strip()),
+            evidence={"reply_len": len(str(reply or ""))},
+        )
+        if contract.requires(OUTCOME_FINAL_OUTPUT) or contract.final_output_constraints:
+            ok_fo, detail_fo = verify_final_output(
+                str(reply or ""), contract.final_output_constraints or {}
+            )
+            tracker.mark(
+                OUTCOME_FINAL_OUTPUT,
+                verified=ok_fo,
+                failed=not ok_fo,
+                evidence=detail_fo,
+            )
+        try:
+            assert_all_outcomes_verified(tracker.required, tracker.status)
+            assert_done_requires_verify(
+                verified=tracker.all_required_verified(),
+                has_evidence=bool(reply),
+            )
+        except InvariantError as inv:
+            outcome = f"DONE refused — {inv}"
+            self._log(f"[{task_id}] INVARIANT: {outcome}")
+            self.ledger.finish(
+                task_id, False, {"outcome": outcome, "outcomes": tracker.snapshot()}
+            )
+            return {
+                "type": "conversation",
+                "success": False,
+                "task_id": task_id,
+                "request_id": request_id,
+                "reply": outcome,
+                "outcome": outcome,
+                "contract": contract.to_dict(),
+                "outcomes": tracker.snapshot(),
+            }
+        self._status("DONE")
+        self._log(f"[{task_id}] DONE (conversation contract={contract.request_id})")
+        self.ledger.finish(
+            task_id, True, {"outcomes": tracker.snapshot(), "request_id": request_id}
+        )
+        return {
+            "type": "conversation",
+            "success": True,
+            "task_id": task_id,
+            "request_id": request_id,
+            "reply": reply,
+            "outcome": reply,
+            "contract": contract.to_dict(),
+            "outcomes": tracker.snapshot(),
         }
 
     def _initial_learning_queries(self, goal: str) -> list[str]:
@@ -1581,29 +1730,51 @@ class Orchestrator:
             "practical_result": practical,
         }
 
-    def run_cycle(self, goal: str, original_request: Optional[str] = None) -> dict[str, Any]:
-        """Execute the full REQUEST→UNDERSTAND→VALIDATE→…→DONE cycle."""
+    def run_cycle(
+        self,
+        goal: str,
+        original_request: Optional[str] = None,
+        *,
+        request_id: Optional[str] = None,
+        contract: Optional[TaskContract] = None,
+        requirements_hint: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """
+        Unified REQUEST→UNDERSTAND→VALIDATE→stages→VERIFY ALL→DONE cycle.
+
+        Learning is a stage when required — never a parallel top-level lifecycle.
+        DONE only when every required_outcome is VERIFIED.
+        """
         user_request = (original_request or goal or "").strip()
-        task_id = self.ledger.start_task(user_request or goal or "task")
-        # Fresh cycle — never carry TEST/prior EXECUTE proof into DONE
-        self._verified_exec_bundle = None
-        self._request_cache = {}
+        rid = (request_id or (contract.request_id if contract else "") or "").strip()
+        if not rid:
+            rid = uuid.uuid4().hex[:12]
+        task_id = rid
+        try:
+            self.ledger.start_task(user_request or goal or "task", task_id=rid)
+        except Exception:
+            pass
+        if getattr(self, "_active_request_id", None) != rid:
+            self._verified_exec_bundle = None
+            self._request_cache = {}
         self._status("REQUEST")
         self._log(f"[{task_id}] REQUEST: {user_request}")
 
         try:
-            # UNDERSTAND — derive structured TaskContract (single truth source)
             self.perf.begin("UNDERSTAND")
             self._status("UNDERSTAND")
-            contract = TaskContract.understand(
-                user_request,
-                request_id=task_id,
-                intent="task",
-                brain=self.brain,
-            )
+            if contract is None or str(contract.request_id) != rid:
+                contract = TaskContract.understand(
+                    user_request,
+                    request_id=rid,
+                    brain=self.brain,
+                )
+            if requirements_hint:
+                contract = contract.with_requirements_hint(requirements_hint)
             goal = contract.original_request
             self._log(
-                f"[{task_id}] UNDERSTAND: outcomes={list(contract.desired_outcomes)[:4]} "
+                f"[{task_id}] UNDERSTAND: required={list(contract.required_outcomes)} "
+                f"outcomes={list(contract.desired_outcomes)[:4]} "
                 f"artifacts={list(contract.artifacts)[:4]} "
                 f"behaviors={len(contract.behaviors)} "
                 f"criteria={list(contract.acceptance_criteria)[:4]}"
@@ -1612,7 +1783,10 @@ class Orchestrator:
             self.perf.end("UNDERSTAND", verifiable=contract.is_verifiable())
             self._log_request_items(task_id, contract)
 
-            # VALIDATE — freeze acceptance_criteria; refuse empty contracts
+            tracker = OutcomeTracker(contract.required_outcomes)
+            self._request_cache["outcome_tracker"] = tracker
+            self._request_cache["contract"] = contract
+
             self.perf.begin("VALIDATE")
             self._status("VALIDATE")
             brain_for_validate = (
@@ -1623,9 +1797,13 @@ class Orchestrator:
                     contract, brain=brain_for_validate
                 )
             contract = TaskContract.validate(contract)
+            if contract.required_outcomes != tracker.required:
+                tracker = OutcomeTracker(contract.required_outcomes)
+                self._request_cache["outcome_tracker"] = tracker
             self._log(
                 f"[{task_id}] VALIDATE: "
                 f"{'ok' if contract.validated and contract.is_verifiable() else 'unverifiable'} "
+                f"required={list(contract.required_outcomes)} "
                 f"criteria={list(contract.acceptance_criteria)[:4]}"
             )
             self.ledger.log(
@@ -1643,7 +1821,10 @@ class Orchestrator:
                 verifiable=contract.is_verifiable(),
                 validated=contract.validated,
             )
-            if contract.needs_refine() or not contract.validated:
+            if (
+                contract.requires_capability_stages()
+                and (contract.needs_refine() or not contract.validated)
+            ):
                 outcome = (
                     "VALIDATE FAIL: cannot derive verifiable "
                     "acceptance_criteria from USER REQUEST — refusing to "
@@ -1678,11 +1859,164 @@ class Orchestrator:
                     "type": "task",
                     "success": False,
                     "task_id": task_id,
+                    "request_id": rid,
                     "reply": outcome,
                     "outcome": outcome,
                     "fault_layer": "goal_parsing",
                     "contract": contract.to_dict(),
+                    "outcomes": tracker.snapshot(),
                 }
+
+            # Conversation-only
+            if contract.requires_conversation_stage() and not (
+                contract.requires_learning_stage()
+                or contract.requires_capability_stages()
+            ):
+                return self._complete_conversation_request(
+                    contract, tracker, task_id=task_id, request_id=rid
+                )
+
+            # LEARN stage (subflow)
+            learn_result = None
+            if contract.requires_learning_stage():
+                declare_done = not contract.requires_capability_stages()
+                learn_result = self._execute_learning_stage(
+                    contract,
+                    task_id=task_id,
+                    request_id=rid,
+                    declare_global_done=False,
+                )
+                if learn_result.get("verified"):
+                    if contract.requires(OUTCOME_LEARNING):
+                        tracker.mark(
+                            OUTCOME_LEARNING,
+                            verified=True,
+                            evidence=learn_result.get("verification"),
+                        )
+                    if contract.requires(OUTCOME_RESEARCH):
+                        tracker.mark(
+                            OUTCOME_RESEARCH,
+                            verified=True,
+                            evidence={
+                                "via": "learning_stage",
+                                "verification": learn_result.get("verification"),
+                            },
+                        )
+                else:
+                    if contract.requires(OUTCOME_LEARNING):
+                        tracker.mark(
+                            OUTCOME_LEARNING,
+                            verified=False,
+                            failed=True,
+                            evidence=learn_result.get("verification"),
+                        )
+                    if contract.requires(OUTCOME_RESEARCH):
+                        tracker.mark(
+                            OUTCOME_RESEARCH,
+                            verified=False,
+                            failed=True,
+                            evidence=learn_result.get("verification"),
+                        )
+                if not contract.requires_capability_stages():
+                    reply = str(
+                        learn_result.get("reply")
+                        or learn_result.get("outcome")
+                        or ""
+                    )
+                    if contract.requires(OUTCOME_FINAL_OUTPUT) or (
+                        contract.final_output_constraints
+                    ):
+                        ok_fo, detail_fo = verify_final_output(
+                            reply, contract.final_output_constraints or {}
+                        )
+                        tracker.mark(
+                            OUTCOME_FINAL_OUTPUT,
+                            verified=ok_fo,
+                            failed=not ok_fo,
+                            evidence=detail_fo,
+                        )
+                    try:
+                        assert_all_outcomes_verified(
+                            tracker.required, tracker.status
+                        )
+                        assert_done_requires_verify(
+                            verified=bool(learn_result.get("verified")),
+                            has_evidence=bool(
+                                learn_result.get("verification")
+                                or learn_result.get("artifact")
+                            ),
+                        )
+                    except InvariantError as inv:
+                        outcome = f"DONE refused — {inv}"
+                        self._log(f"[{task_id}] INVARIANT: {outcome}")
+                        self.ledger.finish(
+                            task_id,
+                            False,
+                            {"outcome": outcome, "outcomes": tracker.snapshot()},
+                        )
+                        return {
+                            "type": "learning",
+                            "success": False,
+                            "task_id": task_id,
+                            "request_id": rid,
+                            "reply": outcome,
+                            "outcome": outcome,
+                            "contract": contract.to_dict(),
+                            "outcomes": tracker.snapshot(),
+                            "learning": learn_result,
+                        }
+                    if learn_result.get("verified"):
+                        self._status("DONE")
+                        self.ledger.finish(
+                            task_id,
+                            True,
+                            {
+                                "outcomes": tracker.snapshot(),
+                                "request_id": rid,
+                                "topic": learn_result.get("topic"),
+                            },
+                        )
+                        out = dict(learn_result)
+                        out["success"] = True
+                        out["request_id"] = rid
+                        out["task_id"] = task_id
+                        out["contract"] = contract.to_dict()
+                        out["outcomes"] = tracker.snapshot()
+                        out["reply"] = (
+                            f"DONE. Learning complete — all required outcomes VERIFIED.\n"
+                            + str(out.get("reply") or "")
+                        )
+                        return out
+                    out = dict(learn_result or {})
+                    out["success"] = False
+                    out["request_id"] = rid
+                    out["contract"] = contract.to_dict()
+                    out["outcomes"] = tracker.snapshot()
+                    return out
+
+                if not learn_result.get("verified"):
+                    outcome = (
+                        "LEARN stage FAIL — learning outcome not verified; "
+                        "other required outcomes PENDING. DONE nav atļauts. "
+                        f"{(learn_result.get('outcome') or '')[:200]}"
+                    )
+                    self._log(f"[{task_id}] {outcome}")
+                    self.ledger.finish(
+                        task_id,
+                        False,
+                        {"outcome": outcome, "outcomes": tracker.snapshot()},
+                    )
+                    return {
+                        "type": "task",
+                        "success": False,
+                        "task_id": task_id,
+                        "request_id": rid,
+                        "reply": outcome,
+                        "outcome": outcome,
+                        "contract": contract.to_dict(),
+                        "outcomes": tracker.snapshot(),
+                        "learning": learn_result,
+                    }
 
             # MEMORY first — retrieve by TaskContract.subject/topic before PLAN/RESEARCH
             self.perf.begin("MEMORY")
@@ -2238,7 +2572,40 @@ class Orchestrator:
                     "verifier_result": verification.get("verifier_result"),
                 }
 
-            # SUCCESS path — DONE only after independent verifier PASS + evidence
+            # SUCCESS path — mark capability outcomes, then global DONE gate
+            tracker = self._request_cache.get("outcome_tracker") or OutcomeTracker(
+                contract.required_outcomes
+            )
+            if verification.get("verified"):
+                for kind in (
+                    OUTCOME_EXECUTION,
+                    OUTCOME_ARTIFACT,
+                    OUTCOME_TEST,
+                    OUTCOME_CAPABILITY,
+                    OUTCOME_SIDE_EFFECT,
+                ):
+                    if contract.requires(kind):
+                        tracker.mark(
+                            kind,
+                            verified=True,
+                            evidence=verification.get("verifier_result"),
+                        )
+            reply_preview = (
+                f"DONE. Uzdevums izpildīts un VERIFIER PASS.\n"
+                f"Skill: {(skill_record or {}).get('name')}\n"
+                f"SKILL RESULT: {exec_result.get('result')!r}\n"
+                f"VERIFIER: {verification.get('reason')}"
+            )
+            if contract.requires(OUTCOME_FINAL_OUTPUT) or contract.final_output_constraints:
+                ok_fo, detail_fo = verify_final_output(
+                    reply_preview, contract.final_output_constraints or {}
+                )
+                tracker.mark(
+                    OUTCOME_FINAL_OUTPUT,
+                    verified=ok_fo,
+                    failed=not ok_fo,
+                    evidence=detail_fo,
+                )
             try:
                 assert_done_requires_verify(
                     verified=bool(verification.get("verified")),
@@ -2248,17 +2615,25 @@ class Orchestrator:
                         or exec_result.get("evidence")
                     ),
                 )
+                assert_all_outcomes_verified(tracker.required, tracker.status)
             except InvariantError as inv:
                 outcome = f"DONE refused — {inv}"
                 self._log(f"[{task_id}] INVARIANT: {outcome}")
-                self.ledger.finish(task_id, False, {"outcome": outcome})
+                self.ledger.finish(
+                    task_id,
+                    False,
+                    {"outcome": outcome, "outcomes": tracker.snapshot()},
+                )
                 return {
                     "type": "task",
                     "success": False,
                     "task_id": task_id,
+                    "request_id": contract.request_id,
                     "reply": outcome,
                     "outcome": outcome,
                     "verifier_result": verification.get("verifier_result"),
+                    "outcomes": tracker.snapshot(),
+                    "contract": contract.to_dict(),
                 }
             self._status("REMEMBER")
             if skill_record:
@@ -2320,12 +2695,14 @@ class Orchestrator:
                 "type": "task",
                 "success": True,
                 "task_id": task_id,
+                "request_id": contract.request_id,
                 "reply": outcome,
                 "outcome": outcome,
                 "result": exec_result.get("result"),
                 "evidence": exec_result.get("evidence"),
                 "skill": (skill_record or {}).get("name"),
                 "contract": contract.to_dict(),
+                "outcomes": tracker.snapshot(),
             }
 
         except Exception as exc:

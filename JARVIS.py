@@ -1970,10 +1970,20 @@ def run(context: dict) -> dict:
             'Create file notes.txt containing "hello"'
         )["intent"] == "task"
         assert IntentClassifier.classify_offline("What is recursion?")["intent"] == "conversation"
-        assert IntentClassifier.normalize(
+        # normalize must NOT downgrade semantic needs_capability → learning
+        norm_cap = IntentClassifier.normalize(
             {"intent": "task", "needs_capability": True},
             "Research how caching works",
-        )["intent"] == "learning"
+        )
+        assert norm_cap["needs_capability"] is True, norm_cap
+        assert norm_cap["intent"] == "task", norm_cap
+        # Without capability flag, research-only offline hint stays non-capability
+        norm_res = IntentClassifier.normalize(
+            {"intent": "task", "needs_capability": False},
+            "Research how caching works",
+        )
+        assert norm_res["needs_capability"] is False, norm_res
+        assert norm_res["needs_research"] is True, norm_res
 
         learn_root = root / "data" / "_e2e_learning_intent"
         if learn_root.exists():
@@ -4714,10 +4724,17 @@ def run(context: dict) -> dict:
         assert canonicalize_layer("implementation") == LAYER_TOOL
         assert LAYER_CAPABILITY and LAYER_KNOWLEDGE and LAYER_EXPERIENCE
         assert "commit=" in _fp_line()
+        # Soft prose alone is conversation — BUILD refuse needs capability outcomes
+        # without concrete criteria (needs_capability hint without artifacts).
         soft_c = _TGSC.from_request("Be helpful please")
+        assert soft_c.requires("conversation") or soft_c.intent == "conversation"
+        soft_cap = soft_c.with_requirements_hint(
+            {"intent": "task", "needs_capability": True}
+        )
+        soft_cap = _TGSC.validate(soft_cap)
         try:
-            _assert_build(soft_c)
-            raise AssertionError("BUILD must refuse unverifiable contract")
+            _assert_build(soft_cap)
+            raise AssertionError("BUILD must refuse unverifiable capability contract")
         except _InvErr:
             pass
         try:
@@ -4797,8 +4814,13 @@ def run(context: dict) -> dict:
             on_log=lambda m: logs_sc.append(m),
         )
         soft_goal = "Be helpful please"
-        assert _TGSC.from_request(soft_goal).needs_refine()
-        result_sc = orch_sc.run_cycle(soft_goal)
+        # Soft prose alone → conversation. Capability hint without concrete
+        # criteria → VALIDATE/goal_parsing refuse (via unified handle path).
+        assert not _TGSC.from_request(soft_goal).needs_refine()
+        soft_hint = SoftGoalBrain().classify_intent(soft_goal)
+        result_sc = orch_sc.run_cycle(
+            soft_goal, requirements_hint=soft_hint
+        )
         assert result_sc.get("success") is False, result_sc
         assert result_sc.get("fault_layer") == "goal_parsing", result_sc
         assert any("VALIDATE" in m for m in logs_sc), logs_sc[:40]
@@ -4953,6 +4975,281 @@ def run(context):
         print("  OK TaskContract architecture — VALIDATE gate + full cycle + isolation")
     except Exception as exc:
         msg = f"E2E_TASK_CONTRACT_ARCH: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # 4z) Architecture invariants — unified TaskContract lifecycle
+    print("  — architecture invariants: one contract / one request_id / DONE iff all —")
+    try:
+        from jarvis.invariants import (
+            assert_all_outcomes_verified as _aov,
+            InvariantError as _InvA,
+        )
+        from jarvis.outcomes import (
+            OutcomeTracker as _OT,
+            STATUS_VERIFIED as _SV,
+            verify_final_output as _vfo,
+            extract_final_output_constraints as _efoc,
+            OUTCOME_LEARNING as _OL,
+            OUTCOME_RESEARCH as _OR,
+            OUTCOME_ARTIFACT as _OA,
+            OUTCOME_EXECUTION as _OE,
+            OUTCOME_TEST as _OTEST,
+            OUTCOME_FINAL_OUTPUT as _OFO,
+        )
+        from jarvis.intent import IntentClassifier as _IC
+        from jarvis.task_contract import TaskContract as _TC
+
+        # 1) exactly one TaskContract per USER REQUEST (immutable original_request)
+        req_u = 'Learn bees and create bees.txt with "BZZ" in 2 sentences'
+        c_u = _TC.from_request(req_u, request_id="rid_arch_01")
+        assert c_u.request_id == "rid_arch_01"
+        assert c_u.original_request == req_u
+        c_u2 = c_u.with_inputs({"dest": "bees.txt"})
+        assert c_u2.request_id == c_u.request_id
+        assert c_u2.original_request == req_u
+
+        # 2) one request_id across lifecycle (handle_user_message)
+        uni_root = root / "data" / "_e2e_unified_lifecycle"
+        if uni_root.exists():
+            shutil.rmtree(uni_root)
+        uni_root.mkdir(parents=True)
+
+        class _UniBrain(Brain):
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return _IC.classify_offline(user_text)
+
+            def understand_contract(self, original_request: str, *, prior_args=None):
+                from jarvis.contract_semantics import offline_semantic_draft
+
+                return offline_semantic_draft(original_request, prior_args)
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                return {
+                    "steps": ["build"],
+                    "can_reuse": [],
+                    "missing": [goal],
+                    "needs_research": False,
+                    "needs_new_skill": True,
+                    "skill_name": "io_files_io_create_txt",
+                    "skill_description": goal,
+                    "research_queries": [],
+                    "args": {"dest": "bees.txt", "body": "BZZ"},
+                    "required_args": ["dest", "body"],
+                }
+
+            def extract_task_args(self, *a, **k):
+                return {"dest": "bees.txt", "body": "BZZ"}
+
+            def write_skill_code(self, skill_name, description, research, **kwargs):
+                return '''
+from pathlib import Path
+SKILL_META = {"name": "%s", "capabilities": ["write_file"],
+ "required_args": ["dest", "body"], "version": 1}
+def run(context):
+    args = context.get("args") or {}
+    p = Path(context.get("workspace") or ".") / str(args.get("dest") or "x.txt")
+    p.write_text(str(args.get("body") or "") + "\\n", encoding="utf-8")
+    return {"ok": True, "result": {"path": str(p)}, "error": None, "evidence": "wrote"}
+''' % skill_name
+
+            def diagnose(self, *a, **k):
+                return {
+                    "fault_layer": "unknown",
+                    "rewrite_skill": False,
+                    "approach": "write",
+                    "needs_research": False,
+                    "research_queries": [],
+                    "missing_args": [],
+                    "required_args": ["dest", "body"],
+                    "suggested_args": {"dest": "bees.txt", "body": "BZZ"},
+                }
+
+            def verify_claim(self, *a, **k):
+                return {"achieved": True, "confidence": 0.9, "reason": "ok"}
+
+            def converse(self, user_text, history=None) -> str:
+                return "Hello from JARVIS."
+
+            def research(self, *a, **k):
+                return {
+                    "summary": "Bees are pollinating insects. Honeybees live in colonies.",
+                    "sources": ["https://example.com/bees"],
+                    "queries": ["bees"],
+                }
+
+            def synthesize_knowledge(self, *a, **k):
+                return {
+                    "summary": "Bees are pollinating insects. Honeybees live in colonies.",
+                    "facts": ["Bees pollinate plants", "Honeybees form colonies"],
+                    "approach": "study bees",
+                }
+
+        # 3/4) subflow cannot declare global DONE; DONE iff all outcomes VERIFIED
+        tr_partial = _OT(("learning", "artifact", "execution"))
+        tr_partial.mark("learning", verified=True, evidence={"ka": True})
+        try:
+            _aov(tr_partial.required, tr_partial.status)
+            raise AssertionError("learning alone must not authorize DONE")
+        except _InvA:
+            pass
+        # 5) learning PASS != task PASS
+        assert _OL in tr_partial.required and tr_partial.status[_OL] == _SV
+        assert tr_partial.pending() == ["artifact", "execution"]
+        # 6) research PASS != execution PASS
+        tr_re = _OT(("research", "execution"))
+        tr_re.mark("research", verified=True)
+        try:
+            _aov(tr_re.required, tr_re.status)
+            raise AssertionError("research alone must not authorize DONE")
+        except _InvA:
+            pass
+        # 7) TEST PASS != execution PASS
+        tr_te = _OT(("test", "execution"))
+        tr_te.mark("test", verified=True)
+        try:
+            _aov(tr_te.required, tr_te.status)
+            raise AssertionError("TEST alone must not authorize DONE")
+        except _InvA:
+            pass
+        # 8) tool self-report != VERIFY PASS — ACTIVE gate
+        from jarvis.invariants import assert_active_requires_independent_verify as _aact
+
+        try:
+            _aact(verified=False, skill_ok=True, test_ok=True)
+            raise AssertionError("skill/test self-report must not grant ACTIVE")
+        except _InvA:
+            pass
+        # 9) final-output constraints verified
+        foc = _efoc('Reply in Latvian with 2 sentences')
+        assert foc.get("language") and foc.get("sentence_count") == 2, foc
+        ok_fo, _ = _vfo("Pirmais teikums. Otrais teikums.", foc)
+        assert ok_fo is True
+        bad_fo, detail_fo = _vfo("Only one sentence here.", foc)
+        assert bad_fo is False, detail_fo
+        # 10) semantic TaskContract cannot be downgraded by regex classifier
+        sem = _TC.understand(
+            'Create out.txt containing "KEEP"',
+            request_id="rid_sem",
+        )
+        assert _OA in sem.required_outcomes and _OE in sem.required_outcomes
+        # Hostile learning-primary hint must not strip artifact/execution
+        hostile = _IC.normalize(
+            {"intent": "learning", "needs_learning": True, "needs_capability": False},
+            'Create out.txt containing "KEEP"',
+        )
+        assert hostile["needs_capability"] is True, hostile
+        merged = sem.with_requirements_hint(hostile)
+        assert _OA in merged.required_outcomes and _OE in merged.required_outcomes
+        assert _OL in merged.required_outcomes  # may add learning, never strip arts
+
+        # Combined multi-outcome contracts (unknown languages / free form)
+        combos = {
+            "learning+artifact": (
+                'Learn about ants and create ants.txt with "ANTS"',
+                {_OL, _OA, _OE},
+            ),
+            "research+artifact": (
+                'Research moss then create moss.txt with "MOSS"',
+                {_OR, _OA, _OE},
+            ),
+            "research+execution": (
+                'Research caching then create cache_note.txt with "CACHE"',
+                {_OR, _OA, _OE},
+            ),
+            "learning+execution": (
+                'Iemācies par bitēm un izveido bites.txt ar "BITE"',
+                {_OL, _OA, _OE},
+            ),
+            "artifact+test+execution": (
+                'Erstelle datei combo.txt mit "COMBO"',
+                {_OA, _OTEST, _OE},
+            ),
+            "learning+research+artifact+execution+formatted-response": (
+                'Learn and research frogs, create frogs.txt with "FROG", '
+                'reply in English with 2 sentences',
+                {_OL, _OR, _OA, _OE, _OFO},
+            ),
+        }
+        for label, (text, expect) in combos.items():
+            cc = _TC.from_request(text)
+            got = set(cc.required_outcomes)
+            missing = expect - got
+            assert not missing, (label, text, got, missing)
+            assert cc.original_request == text
+
+        # E2E: learning+artifact — learning alone must not DONE; full path verifies arts
+        logs_uni: list[str] = []
+        orch_uni = Orchestrator(
+            root=uni_root,
+            brain=_UniBrain(),
+            on_log=lambda m: logs_uni.append(m),
+        )
+        # Property: handle_user_message creates ONE request_id used throughout
+        r_hello = orch_uni.handle_user_message("Hello JARVIS")
+        assert r_hello.get("request_id"), r_hello
+        assert r_hello.get("type") == "conversation", r_hello
+        assert r_hello.get("success") is True, r_hello
+        rid_hello = r_hello["request_id"]
+
+        req_la = 'Learn about bees and create bees.txt with "BZZ"'
+        r_la = orch_uni.handle_user_message(req_la)
+        assert r_la.get("request_id"), r_la
+        assert r_la["request_id"] != rid_hello
+        # Contract in result must share request_id
+        cdict = r_la.get("contract") or {}
+        if cdict:
+            assert cdict.get("request_id") == r_la["request_id"], cdict
+            assert cdict.get("original_request") == req_la
+            ro = set(cdict.get("required_outcomes") or [])
+            assert _OL in ro and _OA in ro and _OE in ro, ro
+        # Actual artifact must exist when success
+        bees = uni_root / "workspace" / "bees.txt"
+        # workspace path may vary — search
+        found_bees = list(uni_root.rglob("bees.txt"))
+        if r_la.get("success"):
+            assert found_bees, (r_la, list(uni_root.rglob("*"))[:40])
+            body = found_bees[0].read_text(encoding="utf-8")
+            assert "BZZ" in body, body
+            outs = r_la.get("outcomes") or {}
+            assert outs.get("all_verified") is True, outs
+            assert _OL in (outs.get("status") or {}) and (
+                outs["status"].get(_OL) == _SV
+            ), outs
+            assert outs["status"].get(_OA) == _SV, outs
+            assert outs["status"].get(_OE) == _SV, outs
+        else:
+            # Partial success refused — learning must not alone force DONE
+            outs = r_la.get("outcomes") or {}
+            if outs.get("status", {}).get(_OL) == _SV:
+                assert outs.get("all_verified") is not True, outs
+                assert _OA in (outs.get("pending") or []) or _OE in (
+                    outs.get("pending") or []
+                ), outs
+
+        # run_learning_cycle is NOT an alternate top-level DONE bypass —
+        # combined contract still requires all outcomes
+        from jarvis.outcomes import OutcomeTracker as _OT2
+
+        fake = _OT2(("learning", "artifact"))
+        fake.mark("learning", verified=True)
+        try:
+            _aov(fake.required, fake.status)
+            raise AssertionError("subflow learning must not declare global DONE")
+        except _InvA:
+            pass
+
+        orch_uni.close()
+        print("  OK architecture invariants + combined-request contracts")
+    except Exception as exc:
+        msg = f"E2E_UNIFIED_LIFECYCLE: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)

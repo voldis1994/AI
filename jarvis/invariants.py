@@ -97,6 +97,31 @@ def assert_done_requires_verify(*, verified: bool, has_evidence: bool) -> None:
         )
 
 
+def assert_all_outcomes_verified(
+    required: list[str] | tuple[str, ...] | None,
+    status: dict[str, str] | None,
+) -> None:
+    """
+    Global DONE gate: every required TaskContract outcome must be VERIFIED.
+
+    Learning PASS alone must never authorize DONE when artifact/execution/
+    final_output outcomes remain PENDING.
+    """
+    from jarvis.outcomes import STATUS_VERIFIED
+
+    req = [str(x) for x in (required or ()) if str(x).strip()]
+    st = dict(status or {})
+    if not req:
+        raise InvariantError("DONE refused — TaskContract has no required outcomes")
+    pending = [k for k in req if st.get(k) != STATUS_VERIFIED]
+    if pending:
+        raise InvariantError(
+            "DONE refused — required outcomes not VERIFIED: "
+            + ", ".join(pending)
+            + f" (status={st})"
+        )
+
+
 def rewrite_allowed_for_fault(fault_layer: str | None) -> bool:
     """skill/tool rewrite only when fault_owner is implementation/skill_code."""
     layer = TaskContract.normalize_fault_layer(fault_layer)

@@ -437,6 +437,15 @@ def offline_semantic_draft(
 
     # Single grounded numeric literal with no artifact/http/quote context →
     # treat as expected equality result (model UNDERSTAND covers richer cases).
+    # Skip when the digit is a final-output count ("2 sentences", "3 teikumos")
+    # — that belongs to final_output constraints, not skill_result_equals.
+    _count_phrase = bool(
+        re.search(
+            r"(?i)\b\d+\s*(?:sentences?|teikum[aāos]*|paragraphs?|words?|"
+            r"lines?|bullets?)\b",
+            req,
+        )
+    )
     if (
         not acceptance
         and len(lit["numbers"]) == 1
@@ -444,6 +453,7 @@ def offline_semantic_draft(
         and not http
         and not lit["quotes"]
         and not lit["sequences"]
+        and not _count_phrase
     ):
         n = lit["numbers"][0]
         acceptance.append(f"skill_result_equals:{n}@skill_result")

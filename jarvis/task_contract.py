@@ -14,7 +14,7 @@ user requirements or task-specific hardcode.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -22,6 +22,19 @@ from jarvis.request_items import (
     classify_request_items,
     path_segment_tokens,
     sanitize_libraries,
+)
+from jarvis.outcomes import (
+    OUTCOME_ARTIFACT,
+    OUTCOME_CAPABILITY,
+    OUTCOME_CONVERSATION,
+    OUTCOME_EXECUTION,
+    OUTCOME_FINAL_OUTPUT,
+    OUTCOME_LEARNING,
+    OUTCOME_RESEARCH,
+    OUTCOME_SIDE_EFFECT,
+    OUTCOME_TEST,
+    derive_required_outcomes,
+    extract_final_output_constraints,
 )
 
 
@@ -208,7 +221,7 @@ class TaskContract:
 
     request_id: str
     original_request: str
-    intent: str
+    intent: str  # advisory primary label only — not exclusive lifecycle router
     desired_outcomes: tuple[str, ...]
     artifacts: tuple[str, ...]
     behaviors: tuple[dict[str, Any], ...]
@@ -225,6 +238,10 @@ class TaskContract:
     actions: tuple[str, ...] = ()
     content_source: tuple[str, ...] = ()
     content_requirements: tuple[str, ...] = ()
+    # Structured requirements — multiple outcomes may be required together
+    required_outcomes: tuple[str, ...] = ()
+    final_output_constraints: dict[str, Any] = field(default_factory=dict)
+    requirements: dict[str, Any] = field(default_factory=dict)
 
     # ── Convenience surfaces used by MEMORY / PLAN ──────────────────────
 
@@ -247,28 +264,85 @@ class TaskContract:
 
     def is_verifiable(self) -> bool:
         """True when acceptance_criteria / verification_plan are independently checkable."""
-        weak = {"skill_ok_and_verified", "needs_refine", ""}
+        ro = set(self.required_outcomes or ())
+        actionable = {
+            OUTCOME_ARTIFACT,
+            OUTCOME_EXECUTION,
+            OUTCOME_SIDE_EFFECT,
+            OUTCOME_CAPABILITY,
+            OUTCOME_TEST,
+        }
+        weak = {
+            "skill_ok_and_verified",
+            "needs_refine",
+            "",
+            "conversation_reply:nonempty@answer",
+            "learning_knowledge:covers_request@knowledge_artifact",
+        }
+        has_concrete = False
         for s in self.acceptance_criteria or ():
             if str(s).strip() and str(s).strip() not in weak:
-                return True
-        for ch in self.verification_plan or ():
-            if isinstance(ch, dict) and ch.get("kind") and ch.get("target"):
-                kind = str(ch.get("kind") or "")
-                if kind and kind != "needs_refine":
-                    return True
+                has_concrete = True
+                break
+        if not has_concrete:
+            for ch in self.verification_plan or ():
+                if isinstance(ch, dict) and ch.get("kind") and ch.get("target"):
+                    kind = str(ch.get("kind") or "")
+                    if kind and kind != "needs_refine":
+                        has_concrete = True
+                        break
         c = self.constraints or {}
-        if any(c.get(k) for k in ("files", "directories", "http", "imports", "must_contain")):
-            return True
+        if not has_concrete and any(
+            c.get(k) for k in ("files", "directories", "http", "imports", "must_contain")
+        ):
+            has_concrete = True
         checks = c.get("checks") or []
-        if isinstance(checks, list) and any(
+        if not has_concrete and isinstance(checks, list) and any(
             isinstance(x, dict) and x.get("kind") and x.get("target") for x in checks
         ):
+            has_concrete = True
+
+        # Actionable outcomes require concrete criteria (not conversation/learning stubs)
+        if ro & actionable:
+            return has_concrete
+        if has_concrete:
+            return True
+        # Learning / conversation / research-only — stage VERIFY covers them
+        if ro & {
+            OUTCOME_LEARNING,
+            OUTCOME_CONVERSATION,
+            OUTCOME_RESEARCH,
+            OUTCOME_FINAL_OUTPUT,
+        }:
             return True
         return False
 
     def needs_refine(self) -> bool:
         """True when BUILD/PLAN must not proceed — contract not verifiable."""
         return not self.is_verifiable()
+
+    def requires(self, kind: str) -> bool:
+        return str(kind) in (self.required_outcomes or ())
+
+    def requires_capability_stages(self) -> bool:
+        """True when PLAN/BUILD/TEST/EXECUTE stages may be needed."""
+        ro = set(self.required_outcomes or ())
+        return bool(
+            ro
+            & {
+                OUTCOME_ARTIFACT,
+                OUTCOME_EXECUTION,
+                OUTCOME_CAPABILITY,
+                OUTCOME_TEST,
+                OUTCOME_SIDE_EFFECT,
+            }
+        )
+
+    def requires_learning_stage(self) -> bool:
+        return self.requires(OUTCOME_LEARNING) or self.requires(OUTCOME_RESEARCH)
+
+    def requires_conversation_stage(self) -> bool:
+        return self.requires(OUTCOME_CONVERSATION) and not self.requires_capability_stages()
 
     # Legacy method names used during migration of call sites — thin redirects
     # removed: callers must use is_verifiable / needs_refine.
@@ -382,10 +456,85 @@ class TaskContract:
             if str(a).strip()
         ) or cls._derive_actions(req)
 
+        foc = dict(grounded_draft.get("final_output_constraints") or {})
+        if not foc:
+            foc = extract_final_output_constraints(req)
+        if foc:
+            cons = dict(cons)
+            cons["final_output"] = dict(foc)
+
+        req_hint = dict(grounded_draft.get("requirements") or {})
+        # Advisory intent hints only — never invent capability for bare prose
+        if intent == "learning":
+            req_hint.setdefault("needs_learning", True)
+        elif intent == "conversation":
+            req_hint.setdefault("needs_conversation", True)
+        # intent=="task" does NOT auto-set needs_capability: that must come
+        # from grounded artifacts/behaviors or an explicit requirements hint.
+
+        # Additive offline requirements hints (not authoritative routing).
+        # May ADD learning/research/capability flags; cannot strip grounded arts.
+        try:
+            from jarvis.intent import IntentClassifier
+
+            offline_hint = IntentClassifier.classify_offline(req)
+            req_hint = IntentClassifier.merge_into_contract_requirements(
+                req_hint, offline_hint
+            )
+        except Exception:
+            pass
+
+        required = derive_required_outcomes(
+            artifacts=artifacts,
+            behaviors=behaviors,
+            side_effects=tuple(
+                str(s) for s in (grounded_draft.get("side_effects") or []) if str(s).strip()
+            ),
+            acceptance_criteria=acceptance,
+            content_source=content_source,
+            constraints=cons,
+            draft_outcomes=outcomes,
+            requirements_hint=req_hint,
+            final_output_constraints=foc,
+        )
+        # Primary advisory label from outcomes (not exclusive lifecycle)
+        primary = str(grounded_draft.get("intent") or intent or "").strip()
+        if not primary or primary == "task":
+            if OUTCOME_LEARNING in required and not (
+                OUTCOME_ARTIFACT in required or OUTCOME_EXECUTION in required
+            ):
+                primary = "learning"
+            elif OUTCOME_CONVERSATION in required and not (
+                set(required)
+                & {
+                    OUTCOME_ARTIFACT,
+                    OUTCOME_EXECUTION,
+                    OUTCOME_LEARNING,
+                    OUTCOME_CAPABILITY,
+                }
+            ):
+                primary = "conversation"
+            else:
+                primary = "task"
+
+        # Conversation / learning-only: replace empty needs_refine placeholder
+        actionable = {
+            OUTCOME_ARTIFACT,
+            OUTCOME_EXECUTION,
+            OUTCOME_SIDE_EFFECT,
+            OUTCOME_CAPABILITY,
+            OUTCOME_TEST,
+        }
+        if acceptance == ("needs_refine",) and not (set(required) & actionable):
+            if OUTCOME_LEARNING in required:
+                acceptance = ("learning_knowledge:covers_request@knowledge_artifact",)
+            elif OUTCOME_CONVERSATION in required:
+                acceptance = ("conversation_reply:nonempty@answer",)
+
         return cls(
             request_id=rid,
             original_request=req,
-            intent=str(grounded_draft.get("intent") or intent or "task").strip() or "task",
+            intent=primary,
             desired_outcomes=outcomes,
             artifacts=artifacts,
             behaviors=behaviors,
@@ -405,6 +554,9 @@ class TaskContract:
             actions=actions,
             content_source=content_source,
             content_requirements=content_reqs,
+            required_outcomes=required,
+            final_output_constraints=dict(foc),
+            requirements=dict(req_hint),
         )
 
     @classmethod
@@ -424,47 +576,17 @@ class TaskContract:
                 cons = dict(strengthened.constraints or {})
                 cons["needs_refine"] = True
                 cons["source"] = "task_contract_validate"
-                return TaskContract(
-                    request_id=strengthened.request_id,
-                    original_request=strengthened.original_request,
-                    intent=strengthened.intent,
+                return replace(
+                    strengthened,
                     desired_outcomes=("needs_refine",),
-                    artifacts=strengthened.artifacts,
                     behaviors=(),
                     constraints=cons,
-                    inputs=dict(strengthened.inputs or {}),
-                    outputs=strengthened.outputs,
-                    side_effects=strengthened.side_effects,
                     acceptance_criteria=("needs_refine",),
                     verification_plan=(),
-                    capability_requirements=strengthened.capability_requirements,
                     validated=False,
-                    subject=strengthened.subject,
-                    actions=strengthened.actions,
-                    content_source=strengthened.content_source,
-                    content_requirements=strengthened.content_requirements,
                 )
             contract = strengthened
-        return TaskContract(
-            request_id=contract.request_id,
-            original_request=contract.original_request,
-            intent=contract.intent,
-            desired_outcomes=contract.desired_outcomes,
-            artifacts=contract.artifacts,
-            behaviors=contract.behaviors,
-            constraints=contract.constraints,
-            inputs=dict(contract.inputs or {}),
-            outputs=contract.outputs,
-            side_effects=contract.side_effects,
-            acceptance_criteria=contract.acceptance_criteria,
-            verification_plan=contract.verification_plan,
-            capability_requirements=contract.capability_requirements,
-            validated=True,
-            subject=contract.subject,
-            actions=contract.actions,
-            content_source=contract.content_source,
-            content_requirements=contract.content_requirements,
-        )
+        return replace(contract, validated=True)
 
     @classmethod
     def from_request(
@@ -481,11 +603,12 @@ class TaskContract:
         brain: Any = None,
     ) -> "TaskContract":
         """UNDERSTAND (+ VALIDATE by default) — single entry for building a contract."""
-        intent_s = intent or ("task" if not goal else "task")
+        # Do not force intent="task" — that would add needs_capability and
+        # bypass conversation/learning-only outcome derivation.
         contract = cls.understand(
             original_request if original_request is not None else (goal or ""),
             request_id=request_id,
-            intent=intent_s,
+            intent=intent,
             args=args,
             skill_meta=skill_meta,
             capability_requirements=capability_requirements,
@@ -557,26 +680,7 @@ class TaskContract:
 
         if self.validated:
             cons = self.constraints_for_verify(merged)
-            return TaskContract(
-                request_id=self.request_id,
-                original_request=self.original_request,
-                intent=self.intent,
-                desired_outcomes=self.desired_outcomes,
-                artifacts=self.artifacts,
-                behaviors=self.behaviors,
-                constraints=cons,
-                inputs=merged,
-                outputs=self.outputs,
-                side_effects=self.side_effects,
-                acceptance_criteria=self.acceptance_criteria,
-                verification_plan=self.verification_plan,
-                capability_requirements=self.capability_requirements,
-                validated=True,
-                subject=self.subject,
-                actions=self.actions,
-                content_source=self.content_source,
-                content_requirements=self.content_requirements,
-            )
+            return replace(self, constraints=cons, inputs=merged, validated=True)
 
         # Not yet validated — allow semantic refresh from grounded inputs
         refreshed = self.understand(
@@ -587,19 +691,10 @@ class TaskContract:
             skill_meta=skill_meta,
             capability_requirements=self.capability_requirements,
         )
-        return TaskContract(
-            request_id=self.request_id,
-            original_request=self.original_request,
-            intent=refreshed.intent,
-            desired_outcomes=refreshed.desired_outcomes,
-            artifacts=refreshed.artifacts or self.artifacts,
-            behaviors=refreshed.behaviors,
-            constraints=refreshed.constraints,
+        return replace(
+            refreshed,
             inputs=merged,
-            outputs=refreshed.outputs,
-            side_effects=refreshed.side_effects,
-            acceptance_criteria=refreshed.acceptance_criteria,
-            verification_plan=refreshed.verification_plan,
+            artifacts=refreshed.artifacts or self.artifacts,
             capability_requirements=self.capability_requirements,
             validated=False,
             subject=(
@@ -611,6 +706,11 @@ class TaskContract:
             content_source=refreshed.content_source or self.content_source,
             content_requirements=refreshed.content_requirements
             or self.content_requirements,
+            required_outcomes=refreshed.required_outcomes or self.required_outcomes,
+            final_output_constraints=dict(
+                refreshed.final_output_constraints or self.final_output_constraints or {}
+            ),
+            requirements=dict(refreshed.requirements or self.requirements or {}),
         )
 
     # Prefer with_inputs; keep name used by context/orchestrator call sites.
@@ -625,25 +725,59 @@ class TaskContract:
         self, reqs: tuple[str, ...] | list[str]
     ) -> "TaskContract":
         """Attach competence/capability ids discovered after UNDERSTAND."""
-        return TaskContract(
-            request_id=self.request_id,
-            original_request=self.original_request,
-            intent=self.intent,
-            desired_outcomes=self.desired_outcomes,
+        return replace(self, capability_requirements=tuple(reqs or ()))
+
+    def with_requirements_hint(
+        self, hint: Optional[dict[str, Any]]
+    ) -> "TaskContract":
+        """
+        Merge additive requirements hints into the contract.
+
+        Hints may add learning/research/capability flags. They must never
+        remove artifact/execution outcomes already implied by the contract.
+        """
+        from jarvis.intent import IntentClassifier
+
+        if self.validated:
+            # Locked — only enrich requirements metadata, keep outcomes frozen
+            merged = IntentClassifier.merge_into_contract_requirements(
+                self.requirements, hint
+            )
+            return replace(self, requirements=merged)
+
+        merged = IntentClassifier.merge_into_contract_requirements(
+            self.requirements, hint
+        )
+        required = derive_required_outcomes(
             artifacts=self.artifacts,
             behaviors=self.behaviors,
-            constraints=self.constraints,
-            inputs=dict(self.inputs or {}),
-            outputs=self.outputs,
             side_effects=self.side_effects,
             acceptance_criteria=self.acceptance_criteria,
-            verification_plan=self.verification_plan,
-            capability_requirements=tuple(reqs or ()),
-            validated=self.validated,
-            subject=self.subject,
-            actions=self.actions,
             content_source=self.content_source,
-            content_requirements=self.content_requirements,
+            constraints=self.constraints,
+            draft_outcomes=self.desired_outcomes,
+            requirements_hint=merged,
+            final_output_constraints=self.final_output_constraints,
+        )
+        actionable = {
+            OUTCOME_ARTIFACT,
+            OUTCOME_EXECUTION,
+            OUTCOME_CAPABILITY,
+            OUTCOME_TEST,
+            OUTCOME_SIDE_EFFECT,
+        }
+        primary = self.intent
+        if set(required) & actionable:
+            primary = "task"
+        elif OUTCOME_LEARNING in required:
+            primary = "learning"
+        elif OUTCOME_CONVERSATION in required:
+            primary = "conversation"
+        return replace(
+            self,
+            requirements=merged,
+            required_outcomes=required,
+            intent=primary,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -662,6 +796,9 @@ class TaskContract:
             "verification_plan": [dict(v) for v in self.verification_plan],
             "capability_requirements": list(self.capability_requirements),
             "validated": self.validated,
+            "required_outcomes": list(self.required_outcomes),
+            "final_output_constraints": dict(self.final_output_constraints or {}),
+            "requirements": dict(self.requirements or {}),
             "subject": self.subject,
             "actions": list(self.actions),
             "content_source": list(self.content_source),
@@ -737,55 +874,53 @@ class TaskContract:
             capability_requirements=contract.capability_requirements,
             brain=brain,
         )
+        # Preserve additive requirements from the pre-refine contract
+        if contract.requirements:
+            refined = refined.with_requirements_hint(contract.requirements)
+        if contract.required_outcomes and not refined.required_outcomes:
+            refined = replace(refined, required_outcomes=contract.required_outcomes)
+        # Union required outcomes (hints must not drop artifact/execution)
+        if contract.required_outcomes:
+            merged_out = tuple(
+                dict.fromkeys(
+                    list(contract.required_outcomes) + list(refined.required_outcomes)
+                )
+            )
+            refined = replace(refined, required_outcomes=merged_out)
         if (
             refined.subject in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
             and contract.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
         ):
-            refined = TaskContract(
-                request_id=refined.request_id,
-                original_request=refined.original_request,
-                intent=refined.intent,
-                desired_outcomes=refined.desired_outcomes,
+            refined = replace(
+                refined,
                 artifacts=refined.artifacts or contract.artifacts,
-                behaviors=refined.behaviors,
-                constraints=refined.constraints,
-                inputs=dict(refined.inputs or {}),
-                outputs=refined.outputs,
-                side_effects=refined.side_effects,
-                acceptance_criteria=refined.acceptance_criteria,
-                verification_plan=refined.verification_plan,
-                capability_requirements=refined.capability_requirements
-                or contract.capability_requirements,
-                validated=False,
                 subject=contract.subject,
                 actions=refined.actions or contract.actions,
                 content_source=refined.content_source or contract.content_source,
                 content_requirements=refined.content_requirements
                 or contract.content_requirements,
+                capability_requirements=refined.capability_requirements
+                or contract.capability_requirements,
             )
         if refined.needs_refine():
             cons = dict(refined.constraints or {})
             cons["needs_refine"] = True
             cons["source"] = "task_contract_refine"
-            return TaskContract(
-                request_id=refined.request_id,
-                original_request=refined.original_request,
-                intent=refined.intent,
+            return replace(
+                refined,
                 desired_outcomes=("needs_refine",),
-                artifacts=refined.artifacts,
                 behaviors=(),
                 constraints=cons,
-                inputs=dict(refined.inputs or {}),
-                outputs=refined.outputs,
-                side_effects=refined.side_effects,
                 acceptance_criteria=("needs_refine",),
                 verification_plan=(),
-                capability_requirements=refined.capability_requirements,
                 validated=False,
-                subject=refined.subject,
-                actions=refined.actions,
-                content_source=refined.content_source,
-                content_requirements=refined.content_requirements,
+                required_outcomes=refined.required_outcomes or contract.required_outcomes,
+                requirements=dict(refined.requirements or contract.requirements or {}),
+                final_output_constraints=dict(
+                    refined.final_output_constraints
+                    or contract.final_output_constraints
+                    or {}
+                ),
             )
         return refined
 
