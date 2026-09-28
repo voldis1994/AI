@@ -850,9 +850,12 @@ def run(context: dict) -> dict:
             s.startswith("skill_output_contains:hello") for s in tg_say.acceptance_criteria
         ), tg_say.acceptance_criteria
         assert "needs_refine" not in tg_say.acceptance_criteria
-        # Unquoted communicative text without grounded literals → needs_refine offline;
-        # model UNDERSTAND fills it when available (see FakeSemanticBrain below).
-        assert TaskContract.from_request("Say hello politely to the room").needs_refine()
+        # Unquoted communicative text without grounded literals → conversation
+        # offline (no invented skill behavior). Model UNDERSTAND can promote to
+        # a verifiable behavior when available (see SemanticBrain below).
+        tg_unq = TaskContract.from_request("Say hello politely to the room")
+        assert tg_unq.requires("conversation") or tg_unq.needs_refine(), tg_unq.to_dict()
+        assert not tg_unq.requires_capability_stages(), tg_unq.required_outcomes
         tg_say_r = TaskContract.refine(tg_say)
         assert tg_say_r.is_verifiable(), tg_say_r.acceptance_criteria
         # VERIFY checks real skill stdout/result — not evidence self-proof
