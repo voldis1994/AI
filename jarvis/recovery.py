@@ -118,29 +118,87 @@ class ProgressAwareRecovery:
         verifier_failure: Any,
         fault_layer: str,
         approach_fingerprint: str,
+        contract: Any = None,
     ) -> bool:
-        """True when the new attempt differs in a way that can break the loop."""
+        """
+        True when the new attempt differs in a way that advances the TaskContract.
+
+        Wrong-tool artifacts (paths unrelated to contract.artifacts) do NOT count
+        as progress — successful TEST/EXECUTE of an incompatible tool is ignored.
+        """
         if prev is None:
             return True
         if code_fingerprint and code_fingerprint != (prev.code_fingerprint or ""):
             return True
-        if approach_fingerprint and approach_fingerprint != (
-            prev.approach_fingerprint or ""
-        ):
-            # Approach label alone is not enough if code/artifacts/verifier identical —
-            # only counts if something else also moved OR we haven't compared code yet.
-            pass
-        prev_arts = ProgressAwareRecovery._artifact_key(prev.artifacts)
-        cur_arts = ProgressAwareRecovery._artifact_key(artifacts)
-        if cur_arts != prev_arts:
+        # Contract-grounded artifact progress only
+        cur_grounded = ProgressAwareRecovery._contract_grounded_artifacts(
+            artifacts, contract
+        )
+        prev_grounded = ProgressAwareRecovery._contract_grounded_artifacts(
+            prev.artifacts, contract
+        )
+        if cur_grounded != prev_grounded and cur_grounded:
             return True
-        prev_vr = ProgressAwareRecovery._verifier_key(prev.verifier_failure)
-        cur_vr = ProgressAwareRecovery._verifier_key(verifier_failure)
-        if cur_vr != prev_vr:
-            return True
+        # Without a contract, refuse to treat arbitrary artifact churn as progress
+        if contract is None:
+            prev_arts = ProgressAwareRecovery._artifact_key(prev.artifacts)
+            cur_arts = ProgressAwareRecovery._artifact_key(artifacts)
+            # Only count when verifier reason also moved (else wrong-tool noise)
+            prev_vr = ProgressAwareRecovery._verifier_key(prev.verifier_failure)
+            cur_vr = ProgressAwareRecovery._verifier_key(verifier_failure)
+            if cur_arts != prev_arts and cur_vr != prev_vr:
+                return True
+        else:
+            prev_vr = ProgressAwareRecovery._verifier_key(prev.verifier_failure)
+            cur_vr = ProgressAwareRecovery._verifier_key(verifier_failure)
+            if cur_vr != prev_vr:
+                # Verifier class change only counts as progress when grounded
+                # artifacts improved or fault layer moved toward resolution
+                if cur_grounded and cur_grounded != prev_grounded:
+                    return True
         if fault_layer and fault_layer != (prev.fault_layer or ""):
             return True
         return False
+
+    @staticmethod
+    def _contract_grounded_artifacts(
+        artifacts: list[Any],
+        contract: Any,
+    ) -> str:
+        """Fingerprint only artifacts that intersect TaskContract.artifacts."""
+        if contract is None:
+            return ""
+        targets: set[str] = set()
+        try:
+            for a in getattr(contract, "artifacts", ()) or ():
+                s = str(a).replace("\\", "/").lower()
+                targets.add(s)
+                targets.add(s.rsplit("/", 1)[-1])
+        except Exception:
+            return ""
+        if not targets:
+            return ""
+        parts: list[str] = []
+        for a in artifacts or []:
+            if isinstance(a, dict):
+                path = str(a.get("path") or "").replace("\\", "/").lower()
+            else:
+                path = str(a).replace("\\", "/").lower()
+            if not path:
+                continue
+            base = path.rsplit("/", 1)[-1]
+            if path in targets or base in targets or any(
+                t and (t in path or path.endswith(t)) for t in targets
+            ):
+                if isinstance(a, dict):
+                    parts.append(
+                        f"{path}|{a.get('exists')}|{a.get('size')}|{a.get('preview')}"
+                    )
+                else:
+                    parts.append(path[:80])
+        if not parts:
+            return ""
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
 
     @staticmethod
     def _artifact_key(artifacts: list[Any]) -> str:
@@ -181,6 +239,7 @@ class ProgressAwareRecovery:
         code_fingerprint: str = "",
         approach_fingerprint: str = "",
         researched: bool = False,
+        contract: Any = None,
     ) -> RecoveryAttempt:
         arts = list(artifacts or [])
         prev = self.attempts[-1] if self.attempts else None
@@ -197,6 +256,7 @@ class ProgressAwareRecovery:
             verifier_failure=verifier_failure,
             fault_layer=fault_layer,
             approach_fingerprint=approach_fingerprint,
+            contract=contract,
         )
         # Identical signature + identical code + identical verifier = no progress
         if same_sig_prev is not None:

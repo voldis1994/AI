@@ -262,30 +262,41 @@ def classify_task_competences(contract: TaskContract) -> dict[str, Any]:
 
 def preferred_tool_name(contract: TaskContract, classification: Optional[dict] = None) -> str:
     """
-    Stable tool name from competence + capability (+ artifact class) —
-    NOT a slug of the full request or a specific filename.
+    Stable tool name from competence + capability (+ behavior/outcome class).
 
-    Prevents every codegen from becoming a new task-specific skill, while
-    still separating tool variants by artifact kind/extension class so that
-    extending ``io.create`` for ``.md`` does not overwrite a ``.txt`` tool.
+    NOT a slug of the full request or a specific filename. Extension alone
+    never defines the tool — behaviors/required outcomes take precedence;
+    artifact kind is only a secondary qualifier when no behavior is locked.
     """
     clf = classification or classify_task_competences(contract)
     primary = str(clf.get("primary_skill") or "general").replace(".", "_")
     caps = list(clf.get("capabilities") or ["act.unknown"])
     cap = str(caps[0]).replace(".", "_")
-    # Artifact class only (extension / kind) — never the basename/stem
-    art_class = ""
-    for a in contract.artifacts or ():
-        suf = Path(str(a)).suffix.lower().lstrip(".")
-        if suf and suf.isalnum() and len(suf) <= 12:
-            art_class = suf
+    # Prefer behavior kind as the variant qualifier (outcomes over file type)
+    variant = ""
+    for b in contract.behaviors or ():
+        if isinstance(b, dict) and b.get("kind"):
+            variant = str(b.get("kind")).replace(".", "_")[:24]
             break
-    if not art_class:
+    if not variant:
+        for o in contract.required_outcomes or ():
+            o = str(o).lower()
+            if o in ("artifact", "execution", "side_effect", "test"):
+                variant = o
+                break
+    if not variant:
         kinds = list(clf.get("artifact_kinds") or [])
         if kinds and kinds[0] not in ("unknown", "token"):
-            art_class = str(kinds[0])
-    if art_class:
-        return slugify(f"{primary}_{cap}_{art_class}", 40)
+            variant = str(kinds[0])
+    if not variant:
+        # Last resort: extension class (never basename)
+        for a in contract.artifacts or ():
+            suf = Path(str(a)).suffix.lower().lstrip(".")
+            if suf and suf.isalnum() and len(suf) <= 12:
+                variant = suf
+                break
+    if variant:
+        return slugify(f"{primary}_{cap}_{variant}", 40)
     return slugify(f"{primary}_{cap}", 40)
 
 

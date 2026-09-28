@@ -74,6 +74,7 @@ from jarvis.capability_match import (
     evaluate_capability,
     format_decision_log,
     format_match_log,
+    outcome_capability_mismatch,
     verify_implies_capability_mismatch,
 )
 
@@ -89,6 +90,7 @@ MAX_LEARNING_NETWORK_RESEARCH = 1
 _NON_REWRITE_LAYERS = frozenset({
     "goal_parsing",
     "context_mapping",
+    "capability_mismatch",
     "execution",
     "environment",
     "verifier",
@@ -96,6 +98,8 @@ _NON_REWRITE_LAYERS = frozenset({
     "context_args",
     "test_harness",
     "dependency",
+    "wrong_tool",
+    "wrong_capability",
 })
 
 # Default skill-oriented test_idea from ResearchSystem — not valid learning notes.
@@ -684,11 +688,14 @@ class Orchestrator:
                 gap_fill_seed = False
                 missing_from_mem = []
 
-            queries = self._initial_learning_queries(goal)
+            queries = self._initial_learning_queries(contract)
             if gap_fill_seed and missing_from_mem:
                 queries = gap_fill_queries(
-                    contract.original_request, missing_from_mem
+                    contract.original_request,
+                    missing_from_mem,
+                    contract=contract,
                 )[:6]
+            queries = contract.ground_research_queries(queries)
             current_approach = "knowledge_artifact_synthesis"
             # Prefer historically successful learning approaches when known
             calib_learning = [
@@ -756,6 +763,7 @@ class Orchestrator:
                     f"gap_fill={gap_fill_only} network={use_network} "
                     f"gaps={missing_gaps!r} queries={len(queries)}"
                 )
+                queries = contract.ground_research_queries(queries)
                 fresh = self.research.research(
                     queries,
                     goal=goal,
@@ -807,15 +815,18 @@ class Orchestrator:
                 research["attempt"] = attempt
                 research["request_id"] = request_id
 
-                saved = self.memory.save_topic_knowledge(
-                    topic,
-                    research,
-                    goal=goal,
-                    queries=queries,
-                    summary=artifact.summary,
-                    verified=False,
-                )
-                self.ledger.log(task_id, "RESEARCH", "KnowledgeArtifact synthesized", {
+                # Do NOT persist unverified drafts as knowledge — only VERIFY PASS
+                # (via _finish_learning_success) may write durable topic knowledge.
+                saved = {
+                    "entry": {
+                        "topic": topic,
+                        "summary": artifact.summary,
+                        "verified": False,
+                        "draft": True,
+                    },
+                    "history": [],
+                }
+                self.ledger.log(task_id, "RESEARCH", "KnowledgeArtifact synthesized (draft)", {
                     "topic": topic,
                     "attempt": attempt,
                     "approach": current_approach,
@@ -824,7 +835,7 @@ class Orchestrator:
                     "explanations": len(artifact.explanations),
                     "examples": len(artifact.examples),
                     "gap_fill": gap_fill_only,
-                    "knowledge_entries": len(saved.get("history") or []),
+                    "persisted": False,
                     "queries": queries[:6],
                     "skill_inherit": False,
                 })
@@ -896,13 +907,13 @@ class Orchestrator:
                 # ── FAIL → OBSERVE → DIAGNOSE concrete artifact gaps ──
                 self._status("OBSERVE")
                 observation = self.observer.observe_failure(
-                    goal=goal,
+                    goal=contract.original_request,
                     skill_name=learn_key,
                     version=attempt,
                     phase="VERIFY",
                     skill_code="",
                     context={
-                        "goal": goal,
+                        "goal": contract.original_request,
                         "original_request": contract.original_request,
                         "topic": topic,
                         "approach": current_approach,
@@ -924,6 +935,7 @@ class Orchestrator:
                     },
                     verification=verification,
                     prior_approaches=failed_approaches,
+                    contract=contract,
                 )
                 observation["error_fingerprint"] = Observer.fingerprint_error(
                     observation
@@ -1005,8 +1017,9 @@ class Orchestrator:
                 queries = list(diagnosis.get("research_queries") or []) or gap_fill_queries(
                     contract.original_request,
                     list(diagnosis.get("missing_knowledge") or ["explanations"]),
+                    contract=contract,
                 )
-                queries = queries[:6]
+                queries = contract.ground_research_queries(queries)[:6]
                 next_ap = str(diagnosis.get("approach") or current_approach)
                 # Prefer calibrated gap-fill strategies over repeatedly failing ones
                 current_approach = self.calibration.pick_best_approach(
@@ -1338,16 +1351,38 @@ class Orchestrator:
             "outcomes": tracker.snapshot(),
         }
 
-    def _initial_learning_queries(self, goal: str) -> list[str]:
-        queries = [goal]
+    def _initial_learning_queries(self, contract: TaskContract) -> list[str]:
+        """
+        LEARN research queries from locked TaskContract outcomes — never the
+        whole free-form request as an ungrounded blob.
+        """
+        queries = list(contract.default_research_queries())
+        # Prefer learning/research outcome-specific queries when present
+        for kind in ("learning", "research"):
+            if contract.requires(kind):
+                for q in contract.outcome_research_queries(kind):
+                    if q not in queries:
+                        queries.insert(0, q)
         if self.brain.is_available():
             try:
+                payload = {
+                    "original_request": contract.original_request,
+                    "subject": contract.subject,
+                    "required_outcomes": list(contract.required_outcomes),
+                    "content_requirements": list(contract.content_requirements),
+                    "artifacts": list(contract.artifacts),
+                }
                 extra = self.brain.generate(
-                    f"Learning request:\n{goal}\n\n"
+                    "TaskContract (immutable):\n"
+                    f"{json.dumps(payload, ensure_ascii=False)[:2000]}\n\n"
                     "Reply ONLY with JSON: {\"queries\":[\"...\"]}\n"
-                    "3-6 focused research queries for this topic. "
-                    "Do not mention skills, file creation, or prior capabilities.",
-                    system="You plan research queries for knowledge learning.",
+                    "3-6 research queries derived from required outcomes/"
+                    "subject/content_requirements ONLY. "
+                    "Do not invent unrelated domains, skills, or file tasks.",
+                    system=(
+                        "You plan research queries grounded on a TaskContract. "
+                        "Never leave the contract's subject/outcomes."
+                    ),
                     temperature=0.2,
                     work="query_generation",
                     allow_escalate=True,
@@ -1356,12 +1391,10 @@ class Orchestrator:
                 )
                 parsed = self.brain._parse_json(extra, {"queries": []})
                 if isinstance(parsed.get("queries"), list) and parsed["queries"]:
-                    queries = [str(q) for q in parsed["queries"][:6]]
+                    queries = [str(q) for q in parsed["queries"][:6]] + queries
             except Exception:
                 pass
-        if goal not in queries:
-            queries = [goal] + [q for q in queries if q != goal]
-        return queries[:6]
+        return contract.ground_research_queries(queries)[:6]
 
     @classmethod
     def _learning_strip_skill_defaults(cls, research: dict[str, Any]) -> dict[str, Any]:
@@ -1524,7 +1557,9 @@ class Orchestrator:
                 missing.append(m)
 
         root = str(verification.get("reason") or observation.get("exception") or "")[:500]
-        queries = gap_fill_queries(contract.original_request, missing)
+        queries = gap_fill_queries(
+            contract.original_request, missing, contract=contract
+        )
         approach = (
             f"gap_fill_{'+'.join(str(m)[:20] for m in missing[:3]) or 'fields'}"
             f"_v{attempt + 1}"
@@ -2063,7 +2098,7 @@ class Orchestrator:
                 self._log(f"[{task_id}] PLAN: cache hit (reuse within request)")
             else:
                 # Deterministic baseline first; optionally refine with FAST
-                plan = self._offline_plan(goal, caps)
+                plan = self._offline_plan(contract, caps)
                 if self.brain.is_available() and not plan.get("can_reuse"):
                     try:
                         llm_plan = self.brain.plan(goal, caps)
@@ -2924,6 +2959,15 @@ class Orchestrator:
                     "actual_artifacts": actual_arts[:40],
                     "content_requirements": list(contract.content_requirements),
                     "acceptance_criteria": list(contract.acceptance_criteria),
+                    "skill": {
+                        "name": skill_name,
+                        "description": description,
+                        "file_path": str(repair_of.get("file_path") or ""),
+                        "capabilities": list(repair_of.get("capabilities") or []),
+                        "status": "ACTIVE",
+                    },
+                    "skill_path": str(repair_of.get("file_path") or ""),
+                    "capabilities": list(repair_of.get("capabilities") or []),
                     "verifier_error": str(verify_failure.get("reason") or "")[:2000],
                     "previous_failures": failed_approaches[:8],
                 },
@@ -2941,6 +2985,7 @@ class Orchestrator:
                 },
                 verification=verify_failure,
                 prior_approaches=failed_approaches,
+                contract=contract,
             )
             diagnosis, research, current_approach, last_error, last_code, args = (
                 self._observe_diagnose_enrich(
@@ -2958,6 +3003,20 @@ class Orchestrator:
             layer = diagnosis["fault_layer"]
             # Rewrite skill ONLY when fault_layer is skill_code (evidence-based)
             skip_rebuild = not diagnosis.get("rewrite_skill", False)
+            if layer == "capability_mismatch":
+                self._log(
+                    f"[{task_id}] RECOVERY STOP (seed): capability_mismatch → "
+                    f"BUILD_NEW (preserve TaskContract)"
+                )
+                self._log(format_decision_log(
+                    "BUILD_NEW",
+                    skill=skill_name,
+                    detail="outcome↔capability mismatch (seed)",
+                ))
+                diagnosis["needs_new_skill"] = True
+                diagnosis["stop_recovery"] = True
+                diagnosis["rewrite_skill"] = False
+                return None, args, contract
             if existing and existing.get("status") == "ACTIVE":
                 protect_active_path = existing.get("file_path")
                 self.registry.set_status(skill_name, "REPAIRING")
@@ -3129,6 +3188,7 @@ class Orchestrator:
                         dependencies=list(research.get("libraries") or []),
                         build_error=built.get("error"),
                         prior_approaches=failed_approaches,
+                        contract=contract,
                     )
                     diagnosis, research, current_approach, last_error, last_code, args = (
                         self._observe_diagnose_enrich(
@@ -3209,6 +3269,7 @@ class Orchestrator:
                     deps_result=dep_result,
                     build_error=f"Dependency install failed: {dep_result.get('failed')}",
                     prior_approaches=failed_approaches,
+                    contract=contract,
                 )
                 diagnosis, research, current_approach, last_error, last_code, args = (
                     self._observe_diagnose_enrich(
@@ -3391,6 +3452,15 @@ class Orchestrator:
                     or self._list_workspace_artifacts()[:40],
                     "content_requirements": list(contract.content_requirements),
                     "acceptance_criteria": list(contract.acceptance_criteria),
+                    "skill": {
+                        "name": skill_name,
+                        "description": description,
+                        "file_path": str((built or {}).get("path") or ""),
+                        "capabilities": list(caps or []),
+                        "status": "ACTIVE",
+                    },
+                    "skill_path": str((built or {}).get("path") or ""),
+                    "capabilities": list(caps or []),
                     "verifier_error": str(
                         (verification or {}).get("reason")
                         or (fail_result or {}).get("error")
@@ -3406,6 +3476,7 @@ class Orchestrator:
                     d.get("diagnosis") if isinstance(d.get("diagnosis"), dict) else d
                     for d in self.memory.recent_diagnoses(skill_name, 5)
                 ],
+                contract=contract,
             )
             if not protect:
                 self.registry.set_status(
@@ -3435,6 +3506,22 @@ class Orchestrator:
             layer = diagnosis["fault_layer"]
             # Only rewrite skill when the fault is skill_code → CODING next
             skip_rebuild = not diagnosis.get("rewrite_skill", False)
+            if layer == "capability_mismatch":
+                # Wrong tool — abort repair of this skill; force BUILD_NEW
+                self._log(
+                    f"[{task_id}] RECOVERY ROUTE: capability_mismatch → BUILD_NEW "
+                    f"(preserve TaskContract; do not rewrite wrong tool)"
+                )
+                self._log(format_decision_log(
+                    "BUILD_NEW",
+                    skill=skill_name,
+                    detail="outcome↔capability mismatch",
+                ))
+                diagnosis["needs_new_skill"] = True
+                diagnosis["stop_recovery"] = True
+                diagnosis["rewrite_skill"] = False
+                skip_rebuild = True
+                break
             if diagnosis.get("prefer_coding") and layer == "skill_code":
                 self._log(
                     f"[{task_id}] RECOVERY ROUTE: skill_code → CODING repair "
@@ -3832,6 +3919,7 @@ class Orchestrator:
                 )
             ),
             researched=False,
+            contract=contract,
         )
         observation["attempted_solution"] = attempt_rec.attempted_solution
         observation["model_used"] = model_used
@@ -4417,19 +4505,52 @@ class Orchestrator:
             approach = "fix_environment"
             change = "Install / fix missing dependencies"
         elif goal_mismatch or content_fail or skill_runtime:
-            # Evidence-backed skill_code only (VERIFY content / skill traceback)
-            layer = "skill_code"
-            approach = (
-                "honor_user_request"
-                if (goal_mismatch or content_fail)
-                else f"offline_alt_v{int(observation.get('version') or 0) + 1}"
+            # Outcome↔capability mismatch → do NOT rewrite the wrong tool
+            skill_snap = (
+                (observation.get("context") or {}).get("skill")
+                or observation.get("skill")
             )
-            change = (
-                "Rewrite skill to satisfy original TaskContract "
-                "(no default/placeholder artifacts; honor content requirements)"
-                if (goal_mismatch or content_fail)
-                else "Revise skill logic based on stderr/traceback evidence"
-            )
+            if not isinstance(skill_snap, dict):
+                # Reconstruct minimal skill dict from observation name
+                sn = str(observation.get("skill_name") or "")
+                skill_snap = {
+                    "name": sn,
+                    "description": str(
+                        (observation.get("context") or {}).get("skill_description")
+                        or ""
+                    ),
+                    "capabilities": list(
+                        (observation.get("context") or {}).get("capabilities") or []
+                    ),
+                    "status": "ACTIVE",
+                    "file_path": str(
+                        (observation.get("context") or {}).get("skill_path") or ""
+                    ),
+                } if sn else None
+            if (goal_mismatch or content_fail) and outcome_capability_mismatch(
+                skill_snap, contract
+            ):
+                layer = "capability_mismatch"
+                approach = "build_new_compatible_capability"
+                change = (
+                    "Selected capability/tool does not cover TaskContract "
+                    "required outcomes/artifacts/behaviors — BUILD_NEW; "
+                    "do not rewrite the wrong tool"
+                )
+            else:
+                # Evidence-backed skill_code only (VERIFY content / skill traceback)
+                layer = "skill_code"
+                approach = (
+                    "honor_user_request"
+                    if (goal_mismatch or content_fail)
+                    else f"offline_alt_v{int(observation.get('version') or 0) + 1}"
+                )
+                change = (
+                    "Rewrite skill to satisfy original TaskContract "
+                    "(no default/placeholder artifacts; honor content requirements)"
+                    if (goal_mismatch or content_fail)
+                    else "Revise skill logic based on stderr/traceback evidence"
+                )
         else:
             # Insufficient evidence — never invent skill_code / rewrite
             layer = "unknown"
@@ -4589,16 +4710,9 @@ class Orchestrator:
             if sk:
                 _consider(sk)
 
-        # Fallback candidates from registry keywords — still require TaskContract compatibility
-        if not scored and not plan.get("needs_new_skill"):
-            keywords = plan.get("research_queries") or [contract.original_request]
-            tokens: list[str] = []
-            for k in keywords:
-                tokens.extend(str(k).split())
-            tokens.extend(str(contract.original_request).split())
-            tokens.extend(str(a) for a in contract.artifacts)
-            for sk in self.registry.match_skills(tokens, only_active=True):
-                _consider(sk)
+        # Scan ACTIVE skills — keyword prefilter is never authoritative
+        for sk in self.registry.list_skills(status="ACTIVE"):
+            _consider(sk)
 
         scored.sort(key=lambda x: -x[0])
         matched = [sk for _, sk in scored]
@@ -4610,14 +4724,16 @@ class Orchestrator:
         return matched, reports
 
     @staticmethod
-    def _name_fits_goal(name: str, goal: str) -> bool:
-        """Legacy name overlap helper (kept for offline fallbacks)."""
-        if not name or not goal:
+    def _name_fits_goal(
+        name: str, goal: str, contract: Optional[TaskContract] = None
+    ) -> bool:
+        """Name overlap helper — prefers pipeline TaskContract when provided."""
+        if not name:
             return False
-        tg = TaskContract.from_request(goal, goal=goal)
+        tg = contract or TaskContract.from_request(goal, goal=goal)
         fake = {
             "name": name,
-            "description": goal,
+            "description": tg.original_request,
             "capabilities": [],
             "status": "ACTIVE",
             "file_path": "",
@@ -4627,39 +4743,39 @@ class Orchestrator:
     def _skill_fits_goal(
         self, skill: dict, goal: str, contract: Optional[TaskContract] = None
     ) -> bool:
-        """Whether skill is TaskContract-compatible (actions/artifacts/domain)."""
-        if not skill or not goal:
+        """Whether skill is TaskContract-compatible (outcomes/artifacts/behaviors)."""
+        if not skill:
             return False
         tg = contract or TaskContract.from_request(goal, goal=goal)
         return bool(evaluate_capability(skill, tg).get("compatible"))
 
-    def _offline_plan(self, goal: str, caps: list[str]) -> dict:
-        tg = TaskContract.from_request(goal, goal=goal)
+    def _offline_plan(self, contract: TaskContract, caps: list[str]) -> dict:
+        """Deterministic PLAN from the pipeline TaskContract — never remint."""
         matched = []
-        for m in self.registry.match_skills(goal.split(), only_active=True):
-            match = evaluate_capability(m, tg)
-            # Quiet offline plan — match logs happen at CHECK_CAPABILITIES
+        for m in self.registry.list_skills(status="ACTIVE"):
+            match = evaluate_capability(m, contract)
             if match.get("compatible"):
                 matched.append(m)
-        # Universal offline arg draft — no task-specific key hardcoding
         draft_args = TaskContract.sanitize_args(
-            ContextBuilder._offline_extract(goal), goal
+            ContextBuilder._offline_extract(contract.original_request),
+            contract.original_request,
         )
-        tool_name = preferred_tool_name(tg)
+        tool_name = preferred_tool_name(contract)
+        goal = contract.original_request
         return {
             "steps": [f"Handle: {goal}"],
             "can_reuse": [m["name"] for m in matched[:3]],
             "missing": [] if matched else [goal],
             "needs_research": not bool(matched),
             "needs_new_skill": not bool(matched),
-            # Competence-stable tool name — not a per-request skill slug
             "skill_name": tool_name or Brain._slug(goal)[:40] or "new_skill",
             "skill_description": goal,
-            "research_queries": tg.default_research_queries(),
+            "research_queries": contract.default_research_queries(),
             "args": draft_args,
             "required_args": list(draft_args.keys()),
-            "subject": tg.subject,
-            "content_source": list(tg.content_source),
+            "subject": contract.subject,
+            "content_source": list(contract.content_source),
+            "required_outcomes": list(contract.required_outcomes),
             "preferred_tool_name": tool_name,
         }
 

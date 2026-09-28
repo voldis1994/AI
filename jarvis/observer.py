@@ -40,12 +40,12 @@ class Observer:
         deps_result: Optional[dict] = None,
         prior_approaches: Optional[list] = None,
         prior_diagnoses: Optional[list] = None,
+        contract: Any = None,
     ) -> dict[str, Any]:
         """
-        Assemble a full observation dict:
+        Assemble a full observation dict grounded on the immutable TaskContract.
 
-        exception/traceback, stdout/stderr, return code, skill code,
-        context, dependencies, artifacts (+ prior failed approaches).
+        ``goal`` is kept for back-compat; contract fields are the source of truth.
         """
         tr = test_result or {}
         sr = tr.get("skill_result") if isinstance(tr.get("skill_result"), dict) else tr
@@ -62,15 +62,51 @@ class Observer:
         stderr = str(sr.get("stderr") or tr.get("stderr") or "")
         returncode = sr.get("returncode", tr.get("returncode"))
 
+        # Frozen contract snapshot — never invent mid-lifecycle semantics
+        contract_dict: dict[str, Any] = {}
+        original_request = goal
+        if contract is not None:
+            try:
+                contract_dict = (
+                    contract.to_dict() if hasattr(contract, "to_dict") else dict(contract)
+                )
+                original_request = str(
+                    getattr(contract, "original_request", None)
+                    or contract_dict.get("original_request")
+                    or goal
+                )
+            except Exception:
+                contract_dict = {}
+
         ctx = dict(context or {})
-        ctx.setdefault("goal", goal)
+        ctx.setdefault("goal", original_request)
+        ctx.setdefault("original_request", original_request)
         ctx.setdefault("workspace", str(self.workspace))
         ctx.setdefault("mode", tr.get("mode") or "test")
+        if contract_dict:
+            ctx.setdefault("contract", contract_dict)
+            ctx.setdefault(
+                "required_outcomes",
+                list(contract_dict.get("required_outcomes") or []),
+            )
+            ctx.setdefault(
+                "expected_artifacts",
+                list(contract_dict.get("artifacts") or []),
+            )
+            ctx.setdefault(
+                "acceptance_criteria",
+                list(contract_dict.get("acceptance_criteria") or []),
+            )
+            ctx.setdefault(
+                "behaviors",
+                list(contract_dict.get("behaviors") or []),
+            )
 
         artifacts = self._scan_artifacts(sr.get("result"), sr.get("evidence") or tr.get("evidence"))
 
         observation = {
-            "goal": goal,
+            "goal": original_request,
+            "original_request": original_request,
             "skill_name": skill_name,
             "version": version,
             "phase": phase,
@@ -84,6 +120,14 @@ class Observer:
             "killed": bool(sr.get("killed") or tr.get("killed")),
             "skill_code": skill_code or "",
             "context": ctx,
+            "contract": contract_dict,
+            "required_outcomes": list(
+                (contract_dict or {}).get("required_outcomes") or []
+            ),
+            "expected_artifacts": list((contract_dict or {}).get("artifacts") or []),
+            "acceptance_criteria": list(
+                (contract_dict or {}).get("acceptance_criteria") or []
+            ),
             "dependencies": list(dependencies or []),
             "deps_result": deps_result or {},
             "artifacts": artifacts,
