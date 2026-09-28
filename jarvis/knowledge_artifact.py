@@ -49,7 +49,7 @@ class KnowledgeArtifact:
 
     request_id: str = ""
     topic: str = ""
-    user_request: str = ""
+    original_request: str = ""
     concepts: list[str] = field(default_factory=list)
     explanations: list[str] = field(default_factory=list)
     examples: list[str] = field(default_factory=list)
@@ -70,7 +70,7 @@ class KnowledgeArtifact:
         return cls(
             request_id=str(d.get("request_id") or ""),
             topic=str(d.get("topic") or ""),
-            user_request=str(d.get("user_request") or ""),
+            original_request=str(d.get("original_request") or d.get("user_request") or ""),
             concepts=_clean_str_list(d.get("concepts") or d.get("key_apis") or []),
             explanations=_clean_str_list(d.get("explanations") or []),
             examples=_clean_str_list(d.get("examples") or []),
@@ -191,7 +191,7 @@ class KnowledgeArtifact:
         return KnowledgeArtifact(
             request_id=self.request_id or other.request_id,
             topic=self.topic or other.topic,
-            user_request=self.user_request or other.user_request,
+            original_request=self.original_request or other.original_request,
             concepts=_merge_unique(self.concepts, other.concepts),
             explanations=_merge_unique(self.explanations, other.explanations),
             examples=_merge_unique(self.examples, other.examples),
@@ -252,7 +252,7 @@ def synthesize_offline(
     base = prior or KnowledgeArtifact(
         request_id=request_id,
         topic=topic,
-        user_request=user_request,
+        original_request=user_request,
     )
 
     raw_clean = scrub_text(str(research.get("raw") or ""))
@@ -363,7 +363,7 @@ def synthesize_offline(
     art = KnowledgeArtifact(
         request_id=request_id or base.request_id,
         topic=topic or base.topic,
-        user_request=user_request or base.user_request,
+        original_request=user_request or base.original_request,
         concepts=concepts,
         explanations=explanations,
         examples=examples,
@@ -377,7 +377,7 @@ def synthesize_offline(
         art = prior.merge_gap_fill(art)
         art.request_id = request_id or art.request_id
         art.topic = topic or art.topic
-        art.user_request = user_request or art.user_request
+        art.original_request = user_request or art.original_request
     return art
 
 

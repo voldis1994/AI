@@ -854,8 +854,15 @@ class JarvisGUI:
         catalog = ""
         if hasattr(self.orch.brain, "model_catalog_summary"):
             catalog = self.orch.brain.model_catalog_summary()
+        try:
+            from jarvis.runtime_fingerprint import fingerprint_line
+
+            runtime_line = fingerprint_line()
+        except Exception:
+            runtime_line = "JARVIS RUNTIME commit=unknown"
         banner = (
             "[SYSTEM] JARVIS cyber-core online — integrated Workspace active.\n"
+            f"[SYSTEM] {runtime_line}\n"
             f"[SYSTEM] Ollama multi-model — {hint}\n"
             f"[SYSTEM] FAST:{fast}  REASONING:{reason}  CODING:{coding}\n"
             + (f"[SYSTEM] {catalog}\n" if catalog else "")

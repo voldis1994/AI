@@ -830,7 +830,8 @@ class Brain:
         test_plan: Optional[str] = None,
         *,
         user_request: Optional[str] = None,
-        task_goal: Optional[dict[str, Any]] = None,
+        original_request: Optional[str] = None,
+        contract: Optional[dict[str, Any]] = None,
         grounded_args: Optional[dict[str, Any]] = None,
         artifacts: Optional[list] = None,
         missing_requirements: Optional[list] = None,
@@ -858,8 +859,8 @@ class Brain:
             "Do not pretend success — set ok=False on failure.\n"
             "FORBIDDEN: do not leave a TODO/stub body and do not return "
             "'Skill body not implemented yet'. You MUST implement a real run() from the "
-            "USER REQUEST / TaskGoal / RESEARCH / DIAGNOSIS provided.\n"
-            "Honor the immutable USER REQUEST and TaskGoal constraints exactly. "
+            "USER REQUEST / TaskContract / RESEARCH / DIAGNOSIS provided.\n"
+            "Honor the immutable USER REQUEST and TaskContract constraints exactly. "
             "If a DIAGNOSIS is provided and fault_layer is skill_code, implement the fix. "
             "Do not repeat failed approaches listed below."
         )
@@ -867,12 +868,13 @@ class Brain:
             f"Skill name: {skill_name}",
             f"Description: {description}",
         ]
-        if user_request:
-            parts.append(f"USER REQUEST (immutable TaskGoal source):\n{user_request}")
-        if task_goal:
+        req_text = original_request or user_request
+        if req_text:
+            parts.append(f"USER REQUEST (immutable TaskContract source):\n{req_text}")
+        if contract:
             parts.append(
                 "TASK GOAL (structured):\n"
-                + json.dumps(task_goal, ensure_ascii=False, default=str)[:4000]
+                + json.dumps(contract, ensure_ascii=False, default=str)[:4000]
             )
         elif constraints:
             parts.append(
@@ -997,16 +999,16 @@ class Brain:
             '  "diagnosis": "one-paragraph summary"\n'
             "}\n"
             "Rules:\n"
-            "- The original USER REQUEST is an immutable TaskGoal for the whole cycle. "
+            "- The original USER REQUEST is an immutable TaskContract for the whole cycle. "
             "Never invent values that are not in the request.\n"
             "- Use exception, traceback, stdout, stderr, returncode, code, "
-            "context (especially context.args + context.user_request), dependencies, artifacts.\n"
+            "context (especially context.args + context.original_request), dependencies, artifacts.\n"
             "- goal_parsing: cannot derive constraints from the USER REQUEST.\n"
             "- context_mapping: context.args empty/missing keys, OR args contain invented "
             "defaults / values not grounded in the USER REQUEST. rewrite_skill=false. "
             "Fill suggested_args ONLY from values present in the request.\n"
             "- skill_code: skill logic wrong; used defaults; created artifacts that do not "
-            "match TaskGoal. rewrite_skill=true ONLY for this layer.\n"
+            "match TaskContract. rewrite_skill=true ONLY for this layer.\n"
             "- execution: subprocess/runner/harness failed to pass context or crashed.\n"
             "- environment: import/install/dependency failures.\n"
             "- verifier: verifier harness itself is wrong (not when skill output fails "
@@ -1044,7 +1046,7 @@ class Brain:
             work="diagnose",
             expect_json=True,
         )
-        from jarvis.task_goal import TaskGoal
+        from jarvis.task_contract import TaskContract
         from jarvis.context_builder import ContextBuilder
 
         ctx = observation.get("context") or {}
@@ -1052,18 +1054,18 @@ class Brain:
         if not isinstance(ctx_args, dict):
             ctx_args = {}
         request = str(
-            (ctx.get("user_request") if isinstance(ctx, dict) else None)
-            or observation.get("user_request")
+            (ctx.get("original_request") if isinstance(ctx, dict) else None)
+            or observation.get("original_request")
             or observation.get("goal")
             or ""
         )
         empty_args = len(ctx_args) == 0
         invented_args = any(
-            TaskGoal.is_invented_default(v, request)
+            TaskContract.is_invented_default(v, request)
             or (
                 isinstance(v, str)
                 and v
-                and not TaskGoal.is_grounded(v, request)
+                and not TaskContract.is_grounded(v, request)
             )
             for v in ctx_args.values()
         )
@@ -1104,19 +1106,19 @@ class Brain:
         else:
             # No clear evidence — do not invent skill_code
             fb_layer = "unknown"
-        fb_layer = TaskGoal.normalize_fault_layer(fb_layer)
+        fb_layer = TaskContract.normalize_fault_layer(fb_layer)
         fallback = {
             "root_cause": str(observation.get("exception") or "unknown")[:500],
             "fault_layer": fb_layer,
-            "rewrite_skill": TaskGoal.rewrite_skill_for_layer(fb_layer),
+            "rewrite_skill": TaskContract.rewrite_skill_for_layer(fb_layer),
             "what_to_change": (
-                "Map TaskGoal → skill args from USER REQUEST (no invented defaults)"
+                "Map TaskContract → skill args from USER REQUEST (no invented defaults)"
                 if fb_layer == "context_mapping"
                 else (
-                    "Re-parse immutable TaskGoal / USER REQUEST into constraints"
+                    "Re-parse immutable TaskContract / USER REQUEST into constraints"
                     if fb_layer == "goal_parsing"
                     else (
-                        "Rewrite skill to satisfy original TaskGoal "
+                        "Rewrite skill to satisfy original TaskContract "
                         "(no default/placeholder artifacts)"
                         if goal_mismatch
                         else (
@@ -1162,7 +1164,7 @@ class Brain:
             "required_args": [],
             "suggested_args": {},
             "test_plan": (
-                "Retest with grounded args from TaskGoal; VERIFY must match "
+                "Retest with grounded args from TaskContract; VERIFY must match "
                 "original USER REQUEST (reject defaults / skill self-proof)"
             ),
             "expected_artifacts": [],
@@ -1171,7 +1173,7 @@ class Brain:
         }
         result = self._parse_json(raw, fallback)
         # Normalize fault_layer — unknown/unrecognized stay unknown (not skill_code)
-        layer = TaskGoal.normalize_fault_layer(
+        layer = TaskContract.normalize_fault_layer(
             result.get("fault_layer") or fallback["fault_layer"]
         )
         # Force skill rewrite ONLY when VERIFY proves goal mismatch / defaults
@@ -1179,7 +1181,7 @@ class Brain:
         if goal_mismatch:
             layer = "skill_code"
         result["fault_layer"] = layer
-        result = TaskGoal.apply_rewrite_gate(result)
+        result = TaskContract.apply_rewrite_gate(result)
         if not isinstance(result.get("suggested_args"), dict):
             result["suggested_args"] = {}
         if not isinstance(result.get("missing_args"), list):
@@ -1200,7 +1202,7 @@ class Brain:
         if goal_mismatch and layer not in ("context_mapping", "goal_parsing"):
             layer = "skill_code"
             result["fault_layer"] = layer
-        result = TaskGoal.apply_rewrite_gate(result)
+        result = TaskContract.apply_rewrite_gate(result)
 
         # Enforce approach change when fingerprint collided with failed list
         failed_fps = {

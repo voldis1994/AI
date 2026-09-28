@@ -2,7 +2,7 @@
 JARVIS verifier — independent factual checks against the USER REQUEST.
 
 PASS is allowed only when the real world / real tool behavior satisfies the
-user's goal and TaskGoal success_criteria. Never trusts:
+user's goal and TaskContract success_criteria. Never trusts:
   - skill self-proof / evidence text
   - skill.ok alone as proof of success
   - default / placeholder values invented by a skill
@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from jarvis.task_goal import TaskGoal
+from jarvis.task_contract import TaskContract
 
 
 # Generic placeholder markers — not task-specific paths/content keys.
@@ -62,17 +62,17 @@ class Verifier:
         args: Optional[dict[str, Any]] = None,
         user_request: Optional[str] = None,
         constraints: Optional[dict[str, Any]] = None,
-        task_goal: Optional[TaskGoal] = None,
+        contract: Optional[TaskContract] = None,
     ) -> dict[str, Any]:
         """
         Returns VERIFIER RESULT:
           verified (bool), reason, checks, skill_result (echo), verifier_result
 
-        Expectations come from the immutable TaskGoal (original USER REQUEST) —
+        Expectations come from the immutable TaskContract (original USER REQUEST) —
         never from the skill's claimed result or invented defaults.
         """
         self.on_log(
-            "VERIFY: independent checks against original TaskGoal / USER REQUEST "
+            "VERIFY: independent checks against original TaskContract / USER REQUEST "
             "(not trusting skill self-proof / defaults)"
         )
 
@@ -82,12 +82,12 @@ class Verifier:
             else skill_result
         )
         checks: list[dict[str, Any]] = []
-        if task_goal is not None:
-            request = task_goal.user_request
+        if contract is not None:
+            request = contract.original_request
         else:
             request = (user_request or goal or "").strip()
         # Ground args against the original request before building constraints
-        task_args = TaskGoal.ground_args(dict(args or {}), request)
+        task_args = TaskContract.ground_args(dict(args or {}), request)
 
         if sr.get("timed_out"):
             return self._fail("Skill subprocess timed out", checks, sr, [
@@ -104,21 +104,21 @@ class Verifier:
         result = sr.get("result")
         evidence = str(sr.get("evidence") or "")
 
-        # Constraints from TaskGoal / USER REQUEST only. Skill result is not a source.
+        # Constraints from TaskContract / USER REQUEST only. Skill result is not a source.
         if constraints:
             built = constraints
-        elif task_goal is not None:
-            built = task_goal.with_args(task_args).constraints
+        elif contract is not None:
+            built = contract.with_args(task_args).constraints
         else:
             built = self.extract_constraints(request, task_args)
-        if expect and constraints is None and task_goal is None and args is None:
+        if expect and constraints is None and contract is None and args is None:
             # Legacy callers may pass expect — still run default/alignment guards
             built = self._normalize_expect(expect, request, task_args)
 
-        # Refuse empty/unverifiable TaskGoal — never fall through to skill self-proof
-        if task_goal is not None and task_goal.needs_goal_refine():
+        # Refuse empty/unverifiable TaskContract — never fall through to skill self-proof
+        if contract is not None and contract.needs_refine():
             return self._fail(
-                "TaskGoal has no verifiable success_criteria — refine before VERIFY",
+                "TaskContract has no verifiable success_criteria — refine before VERIFY",
                 checks,
                 sr,
                 [{
@@ -221,10 +221,10 @@ class Verifier:
             ok, detail = self._check_http(spec)
             checks.append({"name": "http", "ok": ok, "detail": detail})
 
-        # ── TaskGoal success_criteria (independent of skill self-claims) ──
+        # ── TaskContract success_criteria (independent of skill self-claims) ──
         criteria = []
-        if task_goal is not None:
-            criteria = list(task_goal.success_criteria or ())
+        if contract is not None:
+            criteria = list(contract.acceptance_criteria or ())
         if not criteria and isinstance(built.get("checks"), list):
             for ch in built["checks"]:
                 if isinstance(ch, dict) and ch.get("kind") and ch.get("target"):
@@ -289,7 +289,7 @@ class Verifier:
             })
 
         # ── Must have at least one user-derived constraint check ────────
-        # claim_aligns_with_request does NOT count — only TaskGoal-derived checks.
+        # claim_aligns_with_request does NOT count — only TaskContract-derived checks.
         constraint_checks = [
             c for c in checks
             if c["name"] in (
@@ -314,7 +314,7 @@ class Verifier:
             checks.append({
                 "name": "user_constraints",
                 "ok": False,
-                "detail": "success_criteria=needs_refine — TaskGoal not verifiable",
+                "detail": "success_criteria=needs_refine — TaskContract not verifiable",
             })
 
         # Skill evidence is recorded but never counts toward PASS
@@ -382,12 +382,12 @@ class Verifier:
         """
         Build verification constraints from the USER REQUEST + grounded args.
 
-        Delegates to TaskGoal.derive_constraints so VERIFY never invents file
+        Delegates to TaskContract.derive_constraints so VERIFY never invents file
         checks from random sentence tokens. Does not read skill results.
         """
-        grounded = TaskGoal.ground_args(dict(args or {}), request or "")
-        cons = TaskGoal.derive_constraints(request or "", grounded)
-        return TaskGoal._attach_checks(cons, request or "")
+        grounded = TaskContract.ground_args(dict(args or {}), request or "")
+        cons = TaskContract.derive_constraints(request or "", grounded)
+        return TaskContract._attach_checks(cons, request or "")
 
     def _check_success_criterion(
         self,
@@ -396,7 +396,7 @@ class Verifier:
         skill_result: Optional[dict[str, Any]] = None,
     ) -> tuple[bool, str]:
         """
-        Evaluate one TaskGoal success_criterion against the real world.
+        Evaluate one TaskContract success_criterion against the real world.
 
         Format: ``kind:target`` or ``kind:target@how``.
         Artifact/network kinds check the workspace/network. Behavior kinds

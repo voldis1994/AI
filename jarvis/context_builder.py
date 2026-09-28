@@ -1,7 +1,7 @@
 """
-JARVIS context/args builder — universal TaskGoal → skill input schema.
+JARVIS context/args builder — universal TaskContract → skill input schema.
 
-Maps the immutable USER REQUEST (TaskGoal) onto skill args.
+Maps the immutable USER REQUEST (TaskContract) onto skill args.
 Does not invent defaults when values are already present in the request.
 Does not hardcode task-specific argument names (path, content, etc.).
 """
@@ -12,7 +12,7 @@ import json
 import re
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
-from jarvis.task_goal import TaskGoal
+from jarvis.task_contract import TaskContract
 
 if TYPE_CHECKING:
     pass
@@ -64,7 +64,7 @@ class ContextBuilder:
         diagnosis: Optional[dict] = None,
         extra_args: Optional[dict] = None,
         user_request: Optional[str] = None,
-        task_goal: Optional[TaskGoal] = None,
+        contract: Optional[TaskContract] = None,
     ) -> dict[str, Any]:
         """
         Returns full context: {goal, args, workspace, mode, user_request}.
@@ -74,19 +74,19 @@ class ContextBuilder:
         the immutable USER REQUEST so invented defaults never enter the skill.
         """
         request = (
-            (task_goal.user_request if task_goal is not None else None)
+            (contract.original_request if contract is not None else None)
             or user_request
             or goal
             or ""
         )
-        source_goal = (task_goal.goal if task_goal is not None else None) or goal or request
+        source_goal = (contract.goal if contract is not None else None) or goal or request
 
         args: dict[str, Any] = {}
         if isinstance(prior_args, dict):
             args.update(prior_args)
 
         # Drop invented defaults + polluted word-keys from prior
-        args = TaskGoal.sanitize_args(args, request, skill_meta=skill_meta)
+        args = TaskContract.sanitize_args(args, request, skill_meta=skill_meta)
 
         # Prefer deterministic offline fill when schema keys are known —
         # avoid an extra FAST LLM call on every repair attempt.
@@ -108,13 +108,13 @@ class ContextBuilder:
         for k, v in offline_first.items():
             if v is None:
                 continue
-            if TaskGoal.is_invented_default(v, request):
+            if TaskContract.is_invented_default(v, request):
                 continue
-            if not TaskGoal.is_grounded(v, request) and not isinstance(
+            if not TaskContract.is_grounded(v, request) and not isinstance(
                 v, (int, float, bool)
             ):
                 continue
-            if TaskGoal.is_polluted_arg_key(
+            if TaskContract.is_polluted_arg_key(
                 k, request, schema_keys=self._schema_keys(skill_meta)
             ):
                 continue
@@ -138,9 +138,9 @@ class ContextBuilder:
                 for k, v in extracted.items():
                     if v is None:
                         continue
-                    if TaskGoal.is_invented_default(v, request):
+                    if TaskContract.is_invented_default(v, request):
                         continue
-                    if TaskGoal.is_polluted_arg_key(
+                    if TaskContract.is_polluted_arg_key(
                         k, request, schema_keys=self._schema_keys(skill_meta)
                     ):
                         self.on_log(f"CONTEXT: reject polluted extract key={k!r}")
@@ -151,12 +151,12 @@ class ContextBuilder:
             for k, v in diagnosis["suggested_args"].items():
                 if v is None:
                     continue
-                if TaskGoal.is_invented_default(v, request):
+                if TaskContract.is_invented_default(v, request):
                     self.on_log(
                         f"CONTEXT: reject invented suggested_args[{k}]={v!r}"
                     )
                     continue
-                if TaskGoal.is_polluted_arg_key(
+                if TaskContract.is_polluted_arg_key(
                     k, request, schema_keys=self._schema_keys(skill_meta)
                 ):
                     self.on_log(
@@ -164,7 +164,7 @@ class ContextBuilder:
                     )
                     continue
                 # Prefer grounded values already present in the request
-                if not TaskGoal.is_grounded(v, request) and not isinstance(
+                if not TaskContract.is_grounded(v, request) and not isinstance(
                     v, (int, float, bool)
                 ):
                     self.on_log(
@@ -177,16 +177,16 @@ class ContextBuilder:
             for k, v in extra_args.items():
                 if v is None:
                     continue
-                if TaskGoal.is_invented_default(v, request):
+                if TaskContract.is_invented_default(v, request):
                     continue
-                if TaskGoal.is_polluted_arg_key(
+                if TaskContract.is_polluted_arg_key(
                     k, request, schema_keys=self._schema_keys(skill_meta)
                 ):
                     continue
                 args[k] = v
 
         # Final grounding + pollution filter — never pass word-args to the skill
-        args = TaskGoal.sanitize_args(args, request, skill_meta=skill_meta)
+        args = TaskContract.sanitize_args(args, request, skill_meta=skill_meta)
         # Soft cap — dozens of keys are always a mapping bug, not a real schema
         if len(args) > 12:
             schema = self._schema_keys(skill_meta)
@@ -196,11 +196,11 @@ class ContextBuilder:
                 items = list(args.items())
                 pathish = [
                     (k, v) for k, v in items
-                    if TaskGoal.looks_like_path(str(v)) or TaskGoal.looks_like_url(str(v))
+                    if TaskContract.looks_like_path(str(v)) or TaskContract.looks_like_url(str(v))
                 ]
                 contentish = [
                     (k, v) for k, v in items
-                    if TaskGoal.looks_like_content(str(v))
+                    if TaskContract.looks_like_content(str(v))
                 ]
                 ordered = pathish + contentish + [
                     (k, v) for k, v in items
@@ -214,7 +214,7 @@ class ContextBuilder:
 
         context = {
             "goal": source_goal,
-            "user_request": request,
+            "original_request": request,
             "args": args,
             "workspace": str(workspace),
             "mode": mode,
@@ -244,12 +244,12 @@ class ContextBuilder:
                     diagnosis=diagnosis,
                 )
                 if isinstance(result, dict) and result:
-                    return TaskGoal.sanitize_args(
+                    return TaskContract.sanitize_args(
                         result, request, skill_meta=skill_meta
                     )
             except Exception as exc:
                 self.on_log(f"CONTEXT: brain extract failed ({exc}); offline fallback")
-        return TaskGoal.sanitize_args(
+        return TaskContract.sanitize_args(
             self._offline_extract(
                 request, diagnosis=diagnosis, skill_meta=skill_meta
             ),
@@ -481,7 +481,7 @@ class ContextBuilder:
 
         needed = [
             k for k in cls._needed_keys(diagnosis, skill_meta)
-            if not TaskGoal.is_polluted_arg_key(k, goal, schema_keys=schema)
+            if not TaskContract.is_polluted_arg_key(k, goal, schema_keys=schema)
         ]
         if needed:
             candidates = cls.goal_value_candidates(goal)
@@ -489,7 +489,7 @@ class ContextBuilder:
                 if key not in args or args.get(key) in (None, ""):
                     args[key] = val
 
-        return TaskGoal.sanitize_args(args, goal, skill_meta=skill_meta)
+        return TaskContract.sanitize_args(args, goal, skill_meta=skill_meta)
 
     @staticmethod
     def merge_args(*parts: Optional[dict]) -> dict[str, Any]:
@@ -509,15 +509,15 @@ class ContextBuilder:
     ) -> dict[str, Any]:
         """
         Ensure diagnosis carries missing_args / suggested_args when the
-        fault is (or looks like) context mapping from TaskGoal → skill args.
+        fault is (or looks like) context mapping from TaskContract → skill args.
 
         Layers (canonical): goal_parsing | context_mapping | skill_code |
         execution | environment | verifier. Legacy aliases are normalized.
         """
         request = (
             user_request
-            or (observation.get("context") or {}).get("user_request")
-            or observation.get("user_request")
+            or (observation.get("context") or {}).get("original_request")
+            or observation.get("original_request")
             or goal
             or ""
         )
@@ -544,12 +544,12 @@ class ContextBuilder:
             str(n)
             for n in (diagnosis.get("missing_args") or [])
             if n
-            and not TaskGoal.is_polluted_arg_key(
+            and not TaskContract.is_polluted_arg_key(
                 str(n), request, schema_keys=schema
             )
         ]
         for name in parsed:
-            if name not in missing and not TaskGoal.is_polluted_arg_key(
+            if name not in missing and not TaskContract.is_polluted_arg_key(
                 name, request, schema_keys=schema
             ):
                 missing.append(name)
@@ -562,7 +562,7 @@ class ContextBuilder:
                 str(n)
                 for n in (diagnosis.get("required_args") or [])
                 if n
-                and not TaskGoal.is_polluted_arg_key(
+                and not TaskContract.is_polluted_arg_key(
                     str(n), request, schema_keys=schema
                 )
             ]
@@ -577,7 +577,7 @@ class ContextBuilder:
                 str(n)
                 for n in req
                 if n
-                and not TaskGoal.is_polluted_arg_key(
+                and not TaskContract.is_polluted_arg_key(
                     str(n), request, schema_keys=schema
                 )
             ]
@@ -585,17 +585,17 @@ class ContextBuilder:
         invented_in_args = [
             f"{k}={v!r}"
             for k, v in ctx_args.items()
-            if TaskGoal.is_invented_default(v, request)
+            if TaskContract.is_invented_default(v, request)
             or (
                 isinstance(v, str)
                 and v
-                and not TaskGoal.is_grounded(v, request)
+                and not TaskContract.is_grounded(v, request)
                 and not isinstance(v, (int, float, bool))
             )
         ]
         polluted_keys = [
             k for k in ctx_args.keys()
-            if TaskGoal.is_polluted_arg_key(str(k), request, schema_keys=schema)
+            if TaskContract.is_polluted_arg_key(str(k), request, schema_keys=schema)
         ]
         # Ungrounded string args are mapping faults — drop them from suggestions
         empty_or_partial = (not ctx_args) or bool(missing and any(
@@ -631,7 +631,7 @@ class ContextBuilder:
         )
 
         # Normalize any legacy layer — unknown stays unknown (never → skill_code)
-        layer_now = TaskGoal.normalize_fault_layer(diagnosis.get("fault_layer"))
+        layer_now = TaskContract.normalize_fault_layer(diagnosis.get("fault_layer"))
 
         if no_constraints and not ctx_args:
             diagnosis["fault_layer"] = "goal_parsing"
@@ -642,7 +642,7 @@ class ContextBuilder:
                 diagnosis["approach"] = "goal_parsing_repair"
             if not diagnosis.get("what_to_change"):
                 diagnosis["what_to_change"] = (
-                    "Re-parse immutable TaskGoal / USER REQUEST into constraints"
+                    "Re-parse immutable TaskContract / USER REQUEST into constraints"
                 )
         elif empty_or_partial and args_signal and not skill_default_fault:
             diagnosis["fault_layer"] = "context_mapping"
@@ -655,7 +655,7 @@ class ContextBuilder:
                 diagnosis["approach"] = "context_mapping"
             if not diagnosis.get("what_to_change"):
                 diagnosis["what_to_change"] = (
-                    "Map TaskGoal → skill args from USER REQUEST "
+                    "Map TaskContract → skill args from USER REQUEST "
                     "(no invented defaults) and retest"
                 )
         elif skill_default_fault:
@@ -665,20 +665,20 @@ class ContextBuilder:
         else:
             # Keep brain/offline layer but normalize aliases + rewrite gate
             diagnosis["fault_layer"] = layer_now
-            diagnosis["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(layer_now)
+            diagnosis["rewrite_skill"] = TaskContract.rewrite_skill_for_layer(layer_now)
 
         # Enforce rewrite_skill ONLY for evidence-backed skill_code
-        diagnosis = TaskGoal.apply_rewrite_gate(diagnosis)
+        diagnosis = TaskContract.apply_rewrite_gate(diagnosis)
 
         suggested = dict(diagnosis.get("suggested_args") or {})
         # Strip invented / ungrounded / polluted suggestions
         suggested = {
             k: v for k, v in suggested.items()
             if v not in (None, "")
-            and not TaskGoal.is_invented_default(v, request)
-            and not TaskGoal.is_polluted_arg_key(str(k), request, schema_keys=schema)
+            and not TaskContract.is_invented_default(v, request)
+            and not TaskContract.is_polluted_arg_key(str(k), request, schema_keys=schema)
             and (
-                TaskGoal.is_grounded(v, request)
+                TaskContract.is_grounded(v, request)
                 or isinstance(v, (int, float, bool))
             )
         }
@@ -693,11 +693,11 @@ class ContextBuilder:
         ):
             filled = cls._offline_extract(request, diagnosis=diagnosis)
             for k, v in filled.items():
-                if TaskGoal.is_invented_default(v, request):
+                if TaskContract.is_invented_default(v, request):
                     continue
-                if TaskGoal.is_polluted_arg_key(str(k), request, schema_keys=schema):
+                if TaskContract.is_polluted_arg_key(str(k), request, schema_keys=schema):
                     continue
-                if not TaskGoal.is_grounded(v, request) and not isinstance(
+                if not TaskContract.is_grounded(v, request) and not isinstance(
                     v, (int, float, bool)
                 ):
                     continue
@@ -707,17 +707,17 @@ class ContextBuilder:
             for k, v in ctx_args.items():
                 if v in (None, ""):
                     continue
-                if TaskGoal.is_invented_default(v, request):
+                if TaskContract.is_invented_default(v, request):
                     continue
-                if TaskGoal.is_polluted_arg_key(str(k), request, schema_keys=schema):
+                if TaskContract.is_polluted_arg_key(str(k), request, schema_keys=schema):
                     continue
-                if not TaskGoal.is_grounded(v, request) and not isinstance(
+                if not TaskContract.is_grounded(v, request) and not isinstance(
                     v, (int, float, bool)
                 ):
                     continue
                 if k not in suggested or suggested.get(k) in (None, ""):
                     suggested[k] = v
-        diagnosis["suggested_args"] = TaskGoal.sanitize_args(
+        diagnosis["suggested_args"] = TaskContract.sanitize_args(
             suggested, request
         )
         return diagnosis

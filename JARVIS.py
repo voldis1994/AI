@@ -135,9 +135,14 @@ def run_check(root: Path) -> int:
         "jarvis.knowledge_artifact",
         "jarvis.memory",
         "jarvis.ledger",
-        "jarvis.capability_registry",
+        "jarvis.implementation_registry",
         "jarvis.capability_match",
-        "jarvis.task_goal",
+        "jarvis.task_contract",
+        "jarvis.ontology",
+        "jarvis.invariants",
+        "jarvis.runtime_fingerprint",
+        "jarvis.competence",
+        "jarvis.competence_registry",
         "jarvis.research",
         "jarvis.source_pipeline",
         "jarvis.dependency_manager",
@@ -163,7 +168,7 @@ def run_check(root: Path) -> int:
     print("  — subprocess test + verifier separation + ACTIVE protect —")
     try:
         from jarvis.skill_builder import SkillBuilder
-        from jarvis.capability_registry import CapabilityRegistry
+        from jarvis.implementation_registry import ImplementationRegistry
         from jarvis.skill_tester import SkillTester
         from jarvis.verifier import Verifier
         from jarvis.dependency_manager import DependencyManager
@@ -202,7 +207,7 @@ def run(context: dict) -> dict:
         skill_path = skills / "write_hello_file.py"
         skill_path.write_text(skill_code, encoding="utf-8")
 
-        reg = CapabilityRegistry(db)
+        reg = ImplementationRegistry(db)
         reg.register_candidate(
             "write_hello_file", "Write hello.txt", str(skill_path),
             ["write hello file"], [], 1,
@@ -520,23 +525,23 @@ def run(context: dict) -> dict:
     print("  — e2e context_mapping fault_layer repair (no skill rewrite) —")
     try:
         from jarvis.context_builder import ContextBuilder
-        from jarvis.task_goal import TaskGoal
+        from jarvis.task_contract import TaskContract
         from jarvis.verifier import Verifier
 
-        # Unit: immutable TaskGoal + grounding (no invented defaults / no token→file noise)
-        tg = TaskGoal.from_request("Izveido failu test.txt ar tekstu DARBOJAS")
-        assert tg.user_request == "Izveido failu test.txt ar tekstu DARBOJAS"
+        # Unit: immutable TaskContract + grounding (no invented defaults / no token→file noise)
+        tg = TaskContract.from_request("Izveido failu test.txt ar tekstu DARBOJAS")
+        assert tg.original_request == "Izveido failu test.txt ar tekstu DARBOJAS"
         paths = [f.get("path") for f in tg.constraints.get("files") or []]
         assert paths == ["test.txt"], paths
         assert (tg.constraints.get("files") or [{}])[0].get("contains") == "DARBOJAS"
-        # Structured TaskGoal views (not word-split args)
+        # Structured TaskContract views (not word-split args)
         assert "test.txt" in tg.artifacts
         assert "DARBOJAS" in tg.content_requirements
         assert tg.actions
-        assert tg.success_criteria
-        grounded = TaskGoal.ground_args(
+        assert tg.acceptance_criteria
+        grounded = TaskContract.ground_args(
             {"path": "user_provided_path", "content": "DARBOJAS"},
-            tg.user_request,
+            tg.original_request,
         )
         assert "path" not in grounded and grounded.get("content") == "DARBOJAS", grounded
         # Polluted word-keys from the request sentence must be stripped
@@ -544,7 +549,7 @@ def run(context: dict) -> dict:
             "Paradi ka Python darbojas dekoratori ar piemeri faila "
             "decorators_example.py"
         )
-        polluted = TaskGoal.sanitize_args(
+        polluted = TaskContract.sanitize_args(
             {
                 "Python": "darbojas",
                 "darbojas": "dekoratori",
@@ -557,7 +562,7 @@ def run(context: dict) -> dict:
         assert list(polluted.keys()) == ["path"], polluted
         assert polluted.get("path") == "decorators_example.py"
         # Natural-language request must NOT explode into dozens of must_contain needles
-        tg_long = TaskGoal.from_request(long_req)
+        tg_long = TaskContract.from_request(long_req)
         must = list(tg_long.constraints.get("must_contain") or [])
         assert len(must) <= 3, must
         assert "ti" not in must and "ka" not in must
@@ -577,7 +582,7 @@ def run(context: dict) -> dict:
             {
                 "phase": "VERIFY",
                 "exception": "content_constraint: 'ti' missing from expected files",
-                "context": {"args": {"path": "decorators_example.py"}, "user_request": long_req},
+                "context": {"args": {"path": "decorators_example.py"}, "original_request": long_req},
             },
             long_req,
             user_request=long_req,
@@ -589,7 +594,7 @@ def run(context: dict) -> dict:
         noisy_v = Verifier(root / "data" / "_tg_verify_ws")
         (root / "data" / "_tg_verify_ws").mkdir(parents=True, exist_ok=True)
         built = noisy_v.extract_constraints(
-            tg.user_request,
+            tg.original_request,
             {"path": "user_provided_path", "content": "user_provided_content"},
         )
         file_paths = [f.get("path") for f in built.get("files") or []]
@@ -622,7 +627,7 @@ def run(context: dict) -> dict:
         # Context mapper rejects invented defaults even if diagnosis suggests them
         cb = ContextBuilder()
         mapped = cb.build(
-            tg.user_request,
+            tg.original_request,
             str(root / "data" / "_tg_verify_ws"),
             prior_args={"path": "user_provided_path", "content": "user_provided_content"},
             diagnosis={
@@ -634,24 +639,24 @@ def run(context: dict) -> dict:
                 },
                 "fault_layer": "context_mapping",
             },
-            user_request=tg.user_request,
-            task_goal=tg,
+            user_request=tg.original_request,
+            contract=tg,
         )
         assert mapped["args"].get("path") == "test.txt", mapped["args"]
         assert mapped["args"].get("content") == "DARBOJAS", mapped["args"]
-        assert TaskGoal.normalize_fault_layer("context_args") == "context_mapping"
-        assert TaskGoal.rewrite_skill_for_layer("context_mapping") is False
-        assert TaskGoal.rewrite_skill_for_layer("skill_code") is True
+        assert TaskContract.normalize_fault_layer("context_args") == "context_mapping"
+        assert TaskContract.rewrite_skill_for_layer("context_mapping") is False
+        assert TaskContract.rewrite_skill_for_layer("skill_code") is True
         # UNKNOWN / unrecognized must NOT become skill_code (no auto-rewrite)
-        assert TaskGoal.normalize_fault_layer(None) == "unknown"
-        assert TaskGoal.normalize_fault_layer("") == "unknown"
-        assert TaskGoal.normalize_fault_layer("UNKNOWN") == "unknown"
-        assert TaskGoal.normalize_fault_layer("garbage_layer") == "unknown"
-        assert TaskGoal.rewrite_skill_for_layer("unknown") is False
-        assert TaskGoal.rewrite_skill_for_layer(None) is False
-        gated = TaskGoal.apply_rewrite_gate({"fault_layer": "UNKNOWN", "rewrite_skill": True})
+        assert TaskContract.normalize_fault_layer(None) == "unknown"
+        assert TaskContract.normalize_fault_layer("") == "unknown"
+        assert TaskContract.normalize_fault_layer("UNKNOWN") == "unknown"
+        assert TaskContract.normalize_fault_layer("garbage_layer") == "unknown"
+        assert TaskContract.rewrite_skill_for_layer("unknown") is False
+        assert TaskContract.rewrite_skill_for_layer(None) is False
+        gated = TaskContract.apply_rewrite_gate({"fault_layer": "UNKNOWN", "rewrite_skill": True})
         assert gated["fault_layer"] == "unknown" and gated["rewrite_skill"] is False
-        gated_ok = TaskGoal.apply_rewrite_gate(
+        gated_ok = TaskContract.apply_rewrite_gate(
             {"fault_layer": "skill_code", "rewrite_skill": False}
         )
         assert gated_ok["fault_layer"] == "skill_code" and gated_ok["rewrite_skill"] is True
@@ -673,8 +678,8 @@ def run(context: dict) -> dict:
             "out_tool.py" in segs or any("out_tool" == s for s in segs)
         # Directory + stem from relative path
         assert "workspace" in segs or any("workspace" in s for s in segs)
-        assert TaskGoal.is_polluted_arg_key("out_tool", path_req)
-        assert TaskGoal.is_polluted_arg_key("workspace", path_req)
+        assert TaskContract.is_polluted_arg_key("out_tool", path_req)
+        assert TaskContract.is_polluted_arg_key("workspace", path_req)
         items = classify_request_items(path_req)
         kinds = {i.kind for i in items}
         assert ItemKind.PATH in kinds or ItemKind.FILE in kinds, items
@@ -698,20 +703,20 @@ def run(context: dict) -> dict:
         rs_unit = ResearchSystem(brain=None)
         notes, hits = rs_unit._pypi_lookup(path_req)
         assert notes == "" and hits == [], (notes, hits)
-        tg_path = TaskGoal.from_request(path_req)
+        tg_path = TaskContract.from_request(path_req)
         assert any(
             "out_tool.py" in a for a in tg_path.artifacts
         ), tg_path.artifacts
 
-        # Universal request grounding — polysemous words must not rewrite TaskGoal
-        from jarvis.task_goal import SUBJECT_AMBIGUOUS, SUBJECT_UNKNOWN
+        # Universal request grounding — polysemous words must not rewrite TaskContract
+        from jarvis.task_contract import SUBJECT_AMBIGUOUS, SUBJECT_UNKNOWN
 
         poly_req = (
             'Create habitat_notes.md about python wetland habitat '
             'containing "PYTHON_OK"'
         )
-        tg_poly = TaskGoal.from_request(poly_req)
-        assert tg_poly.user_request == poly_req  # immutable source of truth
+        tg_poly = TaskContract.from_request(poly_req)
+        assert tg_poly.original_request == poly_req  # immutable source of truth
         assert "create" in tg_poly.actions
         assert any("habitat_notes.md" in a for a in tg_poly.artifacts), tg_poly.artifacts
         assert "python" in tg_poly.subject.lower()
@@ -737,7 +742,7 @@ def run(context: dict) -> dict:
             "Write summary.txt about java island geography from "
             "https://example.com/java-isle containing \"JAVA_OK\""
         )
-        tg_java = TaskGoal.from_request(java_req)
+        tg_java = TaskContract.from_request(java_req)
         assert "java" in tg_java.subject.lower() and "island" in tg_java.subject.lower()
         assert any(
             "example.com/java-isle" in s for s in tg_java.content_source
@@ -752,16 +757,16 @@ def run(context: dict) -> dict:
             "Using previously learned knowledge about orange citrus, "
             'create citrus.txt containing "ORANGE_OK"'
         )
-        tg_mem = TaskGoal.from_request(mem_req)
+        tg_mem = TaskContract.from_request(mem_req)
         assert "orange" in tg_mem.subject.lower() and "citrus" in tg_mem.subject.lower()
         assert "memory" in {s.lower() for s in tg_mem.content_source}
         assert tg_mem.prefers_memory_first() is True
         assert "citrus.txt" in tg_mem.artifacts
 
         # Ambiguity: do not invent a sense for a bare leftover token
-        tg_bare = TaskGoal.from_request('Create bank.txt containing "X"')
+        tg_bare = TaskContract.from_request('Create bank.txt containing "X"')
         assert tg_bare.subject in (SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
-        tg_bank = TaskGoal.from_request(
+        tg_bank = TaskContract.from_request(
             'Learn about bank river erosion and write notes.txt containing "BANK_OK"'
         )
         assert "bank" in tg_bank.subject.lower() and "river" in tg_bank.subject.lower()
@@ -772,17 +777,17 @@ def run(context: dict) -> dict:
         life = tg_java.to_dict()
         for key in (
             "actions", "artifacts", "subject", "content_source",
-            "content_requirements", "success_criteria", "user_request",
+            "content_requirements", "acceptance_criteria", "original_request",
         ):
             assert key in life, life.keys()
-        assert life["user_request"] == java_req
+        assert life["original_request"] == java_req
         assert life["subject"] == tg_java.subject
         assert life["content_source"] == list(tg_java.content_source)
         # with_args must not drop subject / content_source
         tg_java2 = tg_java.with_args({"path": "summary.txt", "content": "JAVA_OK"})
         assert tg_java2.subject == tg_java.subject
         assert tg_java2.content_source == tg_java.content_source
-        assert tg_java2.user_request == java_req
+        assert tg_java2.original_request == java_req
 
         # Hierarchical competence classification (no task-specific hardcode)
         from jarvis.competence import (
@@ -797,7 +802,7 @@ def run(context: dict) -> dict:
         assert tool_nm.startswith("io_files"), tool_nm
         assert "habitat_notes" not in tool_nm  # not a per-request slug
         # Multi-competence: fetch + write opens net + io
-        tg_multi = TaskGoal.from_request(
+        tg_multi = TaskContract.from_request(
             'Fetch https://example.com/x and write out.txt containing "OK"'
         )
         clf_multi = classify_task_competences(tg_multi)
@@ -806,38 +811,53 @@ def run(context: dict) -> dict:
         assert any("net.fetch" in c for c in clf_multi["capability_ids"]), clf_multi
         assert any("io.write" in c for c in clf_multi["capability_ids"]), clf_multi
 
-        # Universal success_criteria from full request (what/result/reqs/how)
-        assert tg.has_verifiable_constraints(), tg.to_dict()
-        assert any(s.startswith("artifact_exists:") for s in tg.success_criteria), (
-            tg.success_criteria
+        # Canonical TaskContract fields (single truth source)
+        for key in (
+            "request_id", "original_request", "intent", "desired_outcomes",
+            "artifacts", "behaviors", "constraints", "inputs", "outputs",
+            "side_effects", "acceptance_criteria", "verification_plan",
+            "capability_requirements",
+        ):
+            assert key in tg.to_dict(), key
+        assert tg.validated and tg.is_verifiable(), tg.to_dict()
+        assert tg.desired_outcomes
+        assert tg.verification_plan
+        # Locked fields survive with_inputs
+        tg_locked = tg.with_inputs({"body": "DARBOJAS"})
+        assert tg_locked.original_request == tg.original_request
+        assert tg_locked.desired_outcomes == tg.desired_outcomes
+        assert tg_locked.acceptance_criteria == tg.acceptance_criteria
+        # Universal acceptance_criteria from full request (what/result/reqs/how)
+        assert any(s.startswith("artifact_exists:") for s in tg.acceptance_criteria), (
+            tg.acceptance_criteria
         )
-        assert any("content_present:" in s for s in tg.success_criteria), (
-            tg.success_criteria
+        assert any("content_present:" in s for s in tg.acceptance_criteria), (
+            tg.acceptance_criteria
         )
-        assert any("@workspace_" in s for s in tg.success_criteria), tg.success_criteria
-        assert "skill_ok_and_verified" not in tg.success_criteria
+        assert any("@workspace_" in s for s in tg.acceptance_criteria), tg.acceptance_criteria
+        assert "skill_ok_and_verified" not in tg.acceptance_criteria
         assert isinstance(tg.constraints.get("checks"), list) and tg.constraints["checks"]
         # HTTP-only request → http_ok criterion (not skill stub)
-        tg_http = TaskGoal.from_request("Fetch https://example.com/resource")
-        assert tg_http.has_verifiable_constraints(), tg_http.to_dict()
-        assert any(s.startswith("http_ok:") for s in tg_http.success_criteria), (
-            tg_http.success_criteria
+        tg_http = TaskContract.from_request("Fetch https://example.com/resource")
+        assert tg_http.is_verifiable(), tg_http.to_dict()
+        assert any(s.startswith("http_ok:") for s in tg_http.acceptance_criteria), (
+            tg_http.acceptance_criteria
         )
         # Semantic behavior criteria — communicative request without path/URL/args
-        tg_say = TaskGoal.from_request("Say hello politely to the room")
-        assert tg_say.has_verifiable_constraints(), tg_say.to_dict()
+        tg_say = TaskContract.from_request("Say hello politely to the room")
+        assert tg_say.is_verifiable(), tg_say.to_dict()
         assert any(
-            s.startswith("skill_output_contains:hello") for s in tg_say.success_criteria
-        ), tg_say.success_criteria
-        assert "needs_refine" not in tg_say.success_criteria
-        tg_say_r = TaskGoal.refine(tg_say)
-        assert tg_say_r.has_verifiable_constraints(), tg_say_r.success_criteria
+            s.startswith("skill_output_contains:hello") for s in tg_say.acceptance_criteria
+        ), tg_say.acceptance_criteria
+        assert "needs_refine" not in tg_say.acceptance_criteria
+        tg_say_r = TaskContract.refine(tg_say)
+        assert tg_say_r.is_verifiable(), tg_say_r.acceptance_criteria
         # VERIFY checks real skill stdout/result — not evidence self-proof
         soft_ws = root / "data" / "_tg_soft_ws"
         soft_ws.mkdir(parents=True, exist_ok=True)
         soft_v = Verifier(soft_ws)
         say_pass = soft_v.verify(
-            tg_say_r.user_request,
+            tg_say_r.original_request,
             {
                 "ok": True,
                 "result": {"says": "hello"},
@@ -845,11 +865,11 @@ def run(context: dict) -> dict:
                 "evidence": "ignored",
                 "returncode": 0,
             },
-            task_goal=tg_say_r,
+            contract=tg_say_r,
         )
         assert say_pass.get("verified"), say_pass
         say_fail = soft_v.verify(
-            tg_say_r.user_request,
+            tg_say_r.original_request,
             {
                 "ok": True,
                 "result": {"says": "hi"},
@@ -857,43 +877,43 @@ def run(context: dict) -> dict:
                 "evidence": "I said hello",
                 "returncode": 0,
             },
-            task_goal=tg_say_r,
+            contract=tg_say_r,
         )
         assert not say_fail.get("verified"), say_fail
         # Return/type/arithmetic behavior criteria (still request-grounded)
-        tg_ret = TaskGoal.from_request("Return 42")
+        tg_ret = TaskContract.from_request("Return 42")
         assert any(
-            s.startswith("skill_result_equals:42") for s in tg_ret.success_criteria
-        ), tg_ret.success_criteria
+            s.startswith("skill_result_equals:42") for s in tg_ret.acceptance_criteria
+        ), tg_ret.acceptance_criteria
         assert soft_v.verify(
-            tg_ret.user_request,
+            tg_ret.original_request,
             {"ok": True, "result": 42, "returncode": 0},
-            task_goal=tg_ret,
+            contract=tg_ret,
         ).get("verified")
-        tg_type = TaskGoal.from_request("Return an integer")
+        tg_type = TaskContract.from_request("Return an integer")
         assert any(
-            s.startswith("skill_result_type:int") for s in tg_type.success_criteria
-        ), tg_type.success_criteria
-        tg_arith = TaskGoal.from_request("Compute 2+2")
+            s.startswith("skill_result_type:int") for s in tg_type.acceptance_criteria
+        ), tg_type.acceptance_criteria
+        tg_arith = TaskContract.from_request("Compute 2+2")
         assert any(
-            s.startswith("skill_result_equals:4") for s in tg_arith.success_criteria
-        ), tg_arith.success_criteria
+            s.startswith("skill_result_equals:4") for s in tg_arith.acceptance_criteria
+        ), tg_arith.acceptance_criteria
         # Truly unverifiable request → needs_refine (must not continue empty)
-        tg_soft = TaskGoal.from_request("Be helpful please")
-        assert tg_soft.needs_goal_refine(), tg_soft.success_criteria
-        assert tg_soft.success_criteria == ("needs_refine",)
-        tg_soft_r = TaskGoal.refine(tg_soft)
-        assert tg_soft_r.needs_goal_refine()
-        assert tg_soft_r.success_criteria == ("needs_refine",)
+        tg_soft = TaskContract.from_request("Be helpful please")
+        assert tg_soft.needs_refine(), tg_soft.acceptance_criteria
+        assert tg_soft.acceptance_criteria == ("needs_refine",)
+        tg_soft_r = TaskContract.refine(tg_soft)
+        assert tg_soft_r.needs_refine()
+        assert tg_soft_r.acceptance_criteria == ("needs_refine",)
         soft_res = soft_v.verify(
-            tg_soft_r.user_request,
+            tg_soft_r.original_request,
             {
                 "ok": True,
                 "result": {"says": "sure"},
                 "evidence": "I was helpful",
                 "returncode": 0,
             },
-            task_goal=tg_soft_r,
+            contract=tg_soft_r,
         )
         assert not soft_res.get("verified"), soft_res
         assert "needs_refine" in (soft_res.get("reason") or "") or any(
@@ -1032,7 +1052,7 @@ def run(context: dict) -> dict:
                         "root_cause": "context.args missing required keys",
                         "fault_layer": "context_mapping",
                         "rewrite_skill": False,
-                        "what_to_change": "Map TaskGoal → skill args from USER REQUEST",
+                        "what_to_change": "Map TaskContract → skill args from USER REQUEST",
                         "approach": "context_mapping",
                         "approach_changed": True,
                         "needs_research": False,
@@ -1127,7 +1147,7 @@ def run(context: dict) -> dict:
             for m in logs_a
         ), logs_a[-20:]
         assert any("Skip skill rewrite" in m for m in logs_a), logs_a[-20:]
-        assert any("TaskGoal" in m or "REQUEST:" in m for m in logs_a), logs_a[:10]
+        assert any("TaskContract" in m or "REQUEST:" in m for m in logs_a), logs_a[:10]
         orch_a.close()
         print("  OK args     empty args → context_mapping diagnose → retest (no rewrite)")
     except Exception as exc:
@@ -2019,7 +2039,7 @@ def run(context: dict) -> dict:
                     return _KA(
                         request_id=kw.get("request_id") or "",
                         topic=kw.get("topic") or "",
-                        user_request=kw.get("user_request") or "",
+                        original_request=kw.get("original_request") or "",
                         concepts=[],
                         explanations=[],
                         examples=[],
@@ -2345,7 +2365,7 @@ def run(context: dict) -> dict:
                     return KnowledgeArtifact(
                         request_id=kw.get("request_id") or "",
                         topic=kw.get("topic") or "",
-                        user_request=kw.get("user_request") or "",
+                        original_request=kw.get("original_request") or "",
                         summary="short",
                         concepts=[],
                         explanations=[],
@@ -3320,7 +3340,7 @@ def run(context: dict) -> dict:
     print("  — e2e stabilize / speed / repair context / perf —")
     try:
         from jarvis.perf import PerfTracker, set_active_tracker
-        from jarvis.task_goal import TaskGoal as TGStab
+        from jarvis.task_contract import TaskContract as TGStab
 
         # Perf tracker records stages + model calls
         pt = PerfTracker("perf_test")
@@ -3402,15 +3422,15 @@ def run(context: dict) -> dict:
                 **kwargs,
             ):
                 self.builds += 1
-                # Repair / build must receive original request + TaskGoal + args
-                assert kwargs.get("user_request"), kwargs
-                assert kwargs.get("task_goal"), kwargs
+                # Repair / build must receive original request + TaskContract + args
+                assert kwargs.get("original_request"), kwargs
+                assert kwargs.get("contract"), kwargs
                 assert isinstance(kwargs.get("grounded_args"), dict), kwargs
                 if self.builds >= 2 or diagnosis or error_log:
                     self.saw_repair_context = True
                     assert error_log or diagnosis
                     assert "USER REQUEST" in str(error_log or "") or kwargs.get(
-                        "user_request"
+                        "original_request"
                     )
                 wrong_first = self.builds == 1
                 return (
@@ -3467,14 +3487,14 @@ def run(context: dict) -> dict:
         assert brain_s.saw_repair_context
         assert any("PERF" in m for m in logs_s)
         orch_s.close()
-        print("  OK stabilize — conversation/perf/TaskGoal/repair→PASS")
+        print("  OK stabilize — conversation/perf/TaskContract/repair→PASS")
     except Exception as exc:
         msg = f"E2E_STABILIZE: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)
 
-    # Capability match: unrelated ACTIVE bait must not be REPAIR'd for a new TaskGoal
+    # Capability match: unrelated ACTIVE bait must not be REPAIR'd for a new TaskContract
     print("  — e2e capability match (BUILD_NEW vs unrelated ACTIVE bait) —")
     try:
         from jarvis.capability_match import evaluate_capability as _eval_cap
@@ -3568,7 +3588,7 @@ def run(context):
                 self.builds += 1
                 if skill_name == "python_decorators_basics":
                     self.repaired_bait = True
-                # Universal writer for whatever artifact the TaskGoal asks
+                # Universal writer for whatever artifact the TaskContract asks
                 return f'''
 SKILL_META = {{
     "name": "{skill_name}",
@@ -3612,8 +3632,8 @@ def run(context):
         bait_before = orch_c.registry.get_skill("python_decorators_basics")
         assert bait_before and bait_before["status"] == "ACTIVE"
 
-        # Matcher unit: bait incompatible with new TaskGoal
-        tg_alpha = __import__("jarvis.task_goal", fromlist=["TaskGoal"]).TaskGoal.from_request(
+        # Matcher unit: bait incompatible with new TaskContract
+        tg_alpha = __import__("jarvis.task_contract", fromlist=["TaskContract"]).TaskContract.from_request(
             "Create file alpha_report.txt containing ALPHA_OK"
         )
         bait_match = _eval_cap(bait_before, tg_alpha)
@@ -3641,7 +3661,7 @@ def run(context):
         bait_after = orch_c.registry.get_skill("python_decorators_basics")
         assert bait_after["status"] == "ACTIVE", bait_after
         assert int(bait_after["version"]) == int(bait_before["version"])
-        # New skill/artifact for THIS TaskGoal
+        # New skill/artifact for THIS TaskContract
         alpha = ws_dir / "alpha_report.txt"
         assert alpha.exists() and "ALPHA_OK" in alpha.read_text(encoding="utf-8")
         new_skills = [
@@ -3965,7 +3985,7 @@ def run(context: dict) -> dict:
     # Fault attribution: UNKNOWN must not auto-become skill_code / rewrite
     print("  — e2e fault attribution (unknown ≠ skill_code rewrite) —")
     try:
-        from jarvis.task_goal import TaskGoal as _TGFault
+        from jarvis.task_contract import TaskContract as _TGFault
         from jarvis.orchestrator import Orchestrator as _OrchFault
 
         fa_root = root / "data" / "_e2e_fault_attr"
@@ -4101,7 +4121,7 @@ def run(context):
                 "traceback": "",
                 "context": {
                     "args": {"dest": "fault_attr.txt", "body": "FAULT_OK"},
-                    "user_request": 'Create "fault_attr.txt" containing "FAULT_OK"',
+                    "original_request": 'Create "fault_attr.txt" containing "FAULT_OK"',
                 },
                 "version": 1,
             },
@@ -4115,7 +4135,7 @@ def run(context):
             {
                 "phase": "VERIFY",
                 "exception": "opaque",
-                "context": {"args": {}, "user_request": "x"},
+                "context": {"args": {}, "original_request": "x"},
                 "goal": "x",
             }
         )
@@ -4131,7 +4151,7 @@ def run(context):
                 "traceback": "",
                 "context": {
                     "args": {"dest": "fault_attr.txt", "body": "FAULT_OK"},
-                    "user_request": 'Create "fault_attr.txt" containing "FAULT_OK"',
+                    "original_request": 'Create "fault_attr.txt" containing "FAULT_OK"',
                 },
                 "version": 1,
             },
@@ -4152,7 +4172,7 @@ def run(context):
     print("  — e2e request grounding (subject/source across MEMORY→VERIFY) —")
     try:
         from jarvis.orchestrator import Orchestrator as _OrchGround
-        from jarvis.task_goal import TaskGoal as _TGGround
+        from jarvis.task_contract import TaskContract as _TGGround
 
         gr_root = root / "data" / "_e2e_request_grounding"
         if gr_root.exists():
@@ -4219,10 +4239,10 @@ def run(context):
                 **kwargs,
             ) -> str:
                 self.builds += 1
-                # BUILD context must keep TaskGoal subject (not pip/JDK drift)
-                tg = kwargs.get("task_goal") or {}
+                # BUILD context must keep TaskContract subject (not pip/JDK drift)
+                tg = kwargs.get("contract") or {}
                 blob = str(tg).lower()
-                ur = str(kwargs.get("user_request") or description or "").lower()
+                ur = str(kwargs.get("original_request") or description or "").lower()
                 assert (
                     "wetland" in blob or "habitat" in blob
                     or "wetland" in ur or "habitat" in ur
@@ -4328,7 +4348,7 @@ def run(context: dict) -> dict:
             'Create habitat_notes.md about python wetland habitat '
             'containing "PYTHON_OK"'
         )
-        # Unit: TaskGoal fields survive before cycle
+        # Unit: TaskContract fields survive before cycle
         tg0 = _TGGround.from_request(goal_gr)
         assert "wetland" in tg0.subject.lower()
         snap = {
@@ -4341,7 +4361,7 @@ def run(context: dict) -> dict:
         result_gr = orch_gr.run_cycle(goal_gr)
         assert result_gr.get("success"), result_gr
 
-        # MEMORY retrieved by TaskGoal subject/topic
+        # MEMORY retrieved by TaskContract subject/topic
         assert any("MEMORY" in m for m in logs_gr), logs_gr[:30]
         assert any(
             "subject=" in m.lower() or "wetland" in m.lower() or "habitat" in m.lower()
@@ -4356,7 +4376,7 @@ def run(context: dict) -> dict:
             assert "jdk" not in joined, qs
             assert "programming language" not in joined, qs
 
-        # Artifact created + VERIFY vs original TaskGoal
+        # Artifact created + VERIFY vs original TaskContract
         marker = gr_root / "workspace_runtime" / "habitat_notes.md"
         assert marker.exists(), list(
             (gr_root / "workspace_runtime").rglob("*")
@@ -4378,7 +4398,7 @@ def run(context: dict) -> dict:
             "grounding_poly_skill",
             goal_gr,
             ["pip install python", "java JDK", "random unrelated"],
-            task_goal=tg0,
+            contract=tg0,
         )
         assert research_calls, "expected research invocation"
         last_q = research_calls[-1]
@@ -4403,7 +4423,7 @@ def run(context: dict) -> dict:
         assert dmem["subject"] == tg_mem.subject
         assert "memory" in dmem["content_source"]
         assert any("mem_habitat.txt" in a for a in dmem["artifacts"])
-        assert dmem["user_request"] == mem_goal
+        assert dmem["original_request"] == mem_goal
 
         orch_gr.close()
         print(
@@ -4421,9 +4441,9 @@ def run(context: dict) -> dict:
     try:
         from jarvis.competence import preferred_tool_name as _ptn_c
         from jarvis.competence_registry import CompetenceRegistry as _CompReg
-        from jarvis.capability_registry import CapabilityRegistry as _CapReg2
+        from jarvis.implementation_registry import ImplementationRegistry as _CapReg2
         from jarvis.orchestrator import Orchestrator as _OrchComp
-        from jarvis.task_goal import TaskGoal as _TGComp
+        from jarvis.task_contract import TaskContract as _TGComp
 
         comp_root = root / "data" / "_e2e_competence"
         if comp_root.exists():
@@ -4633,11 +4653,62 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
-    # TaskGoal success_criteria gate — refuse empty constraints before PLAN
-    print("  — e2e TaskGoal success_criteria refine-before-PLAN —")
+    # TaskContract VALIDATE gate — refuse empty constraints before PLAN
+    print("  — e2e TaskContract VALIDATE-before-PLAN + full cycle —")
     try:
         from jarvis.orchestrator import Orchestrator as _OrchSC
-        from jarvis.task_goal import TaskGoal as _TGSC
+        from jarvis.task_contract import TaskContract as _TGSC
+        from jarvis.invariants import (
+            InvariantError as _InvErr,
+            assert_active_requires_independent_verify as _assert_active,
+            assert_build_allowed as _assert_build,
+            assert_done_requires_verify as _assert_done,
+            assert_locked_truth as _assert_locked,
+            rewrite_allowed_for_fault as _rewrite_ok,
+        )
+        from jarvis.ontology import (
+            LAYER_CAPABILITY,
+            LAYER_EXPERIENCE,
+            LAYER_KNOWLEDGE,
+            LAYER_SKILL,
+            LAYER_TOOL,
+            canonicalize_layer,
+        )
+        from jarvis.runtime_fingerprint import fingerprint_line as _fp_line
+        from jarvis.implementation_registry import ImplementationRegistry as _ImplReg
+
+        # Architecture invariant unit checks
+        assert canonicalize_layer("competence") == LAYER_SKILL
+        assert canonicalize_layer("implementation") == LAYER_TOOL
+        assert LAYER_CAPABILITY and LAYER_KNOWLEDGE and LAYER_EXPERIENCE
+        assert "commit=" in _fp_line()
+        soft_c = _TGSC.from_request("Be helpful please")
+        try:
+            _assert_build(soft_c)
+            raise AssertionError("BUILD must refuse unverifiable contract")
+        except _InvErr:
+            pass
+        try:
+            _assert_active(verified=False, skill_ok=True, test_ok=True)
+            raise AssertionError("ACTIVE must refuse without VERIFY")
+        except _InvErr:
+            pass
+        try:
+            _assert_done(verified=False, has_evidence=True)
+            raise AssertionError("DONE must refuse without VERIFY")
+        except _InvErr:
+            pass
+        assert _rewrite_ok("skill_code") is True
+        assert _rewrite_ok("unknown") is False
+        assert _rewrite_ok("context_mapping") is False
+        ok_c = _TGSC.from_request('Create lock.txt containing "L"')
+        assert ok_c.validated
+        locked2 = ok_c.with_inputs({"body": "L"})
+        _assert_locked(ok_c, locked2)
+        # ImplementationRegistry preserves versioning API (skills table lifecycle)
+        impl_db = root / "data" / "_e2e_impl_reg" / "jarvis.db"
+        impl_db.parent.mkdir(parents=True, exist_ok=True)
+        _ = _ImplReg(impl_db)
 
         sc_root = root / "data" / "_e2e_success_criteria"
         if sc_root.exists():
@@ -4660,10 +4731,10 @@ def run(context: dict) -> dict:
                 }
 
             def plan(self, goal: str, known_capabilities: list[str]) -> dict:
-                raise AssertionError("PLAN must not run when TaskGoal needs refine")
+                raise AssertionError("PLAN must not run when TaskContract needs refine")
 
             def write_skill_code(self, *a, **k):
-                raise AssertionError("BUILD must not run when TaskGoal needs refine")
+                raise AssertionError("BUILD must not run when TaskContract needs refine")
 
             def extract_task_args(self, *a, **k):
                 return {}
@@ -4678,17 +4749,19 @@ def run(context: dict) -> dict:
             on_log=lambda m: logs_sc.append(m),
         )
         soft_goal = "Be helpful please"
-        assert _TGSC.from_request(soft_goal).needs_goal_refine()
+        assert _TGSC.from_request(soft_goal).needs_refine()
         result_sc = orch_sc.run_cycle(soft_goal)
         assert result_sc.get("success") is False, result_sc
         assert result_sc.get("fault_layer") == "goal_parsing", result_sc
-        assert any("GOAL_REFINE" in m for m in logs_sc), logs_sc[:30]
+        assert any("VALIDATE" in m for m in logs_sc), logs_sc[:40]
+        assert any("UNDERSTAND" in m for m in logs_sc), logs_sc[:40]
+        assert any("JARVIS RUNTIME" in m for m in logs_sc), logs_sc[:20]
         assert not any("CAPABILITY DECISION:" in m for m in logs_sc), logs_sc
         # Semantic communicative request is verifiable (no path/URL required)
         assert _TGSC.from_request(
             "Say hello politely to the room"
-        ).has_verifiable_constraints()
-        # Verifiable request still proceeds and VERIFY uses success_criteria
+        ).is_verifiable()
+        # Full cycle: REQUEST→UNDERSTAND→VALIDATE→…→VERIFY→REMEMBER→DONE
         class OkBrain(SoftGoalBrain):
             def __init__(self) -> None:
                 super().__init__()
@@ -4747,16 +4820,32 @@ def run(context):
         )
         ok_goal = 'Create sc_ok.txt containing "SC_OK"'
         tg_ok = _TGSC.from_request(ok_goal)
-        assert tg_ok.has_verifiable_constraints()
-        assert any("@workspace_" in s for s in tg_ok.success_criteria)
+        assert tg_ok.is_verifiable()
+        assert any("@workspace_" in s for s in tg_ok.acceptance_criteria)
         res_ok = orch_ok.run_cycle(ok_goal)
         assert res_ok.get("success"), res_ok
+        assert res_ok.get("contract"), res_ok
+        assert any("UNDERSTAND" in m for m in logs_ok), logs_ok[:40]
+        assert any("VALIDATE" in m for m in logs_ok), logs_ok[:40]
         assert any("success_criterion" in str(m) or "VERIFIER RESULT: PASS" in m for m in logs_ok)
+        assert any("DONE" in m for m in logs_ok)
+        # Request isolation — second request must not reuse prior DONE bundle
+        logs_iso: list[str] = []
+        orch_iso = _OrchSC(
+            root=sc_root,
+            brain=OkBrain(),
+            on_log=lambda m: logs_iso.append(m),
+        )
+        iso_goal = 'Create iso_ok.txt containing "ISO_OK"'
+        res_iso = orch_iso.run_cycle(iso_goal)
+        assert res_iso.get("success"), res_iso
+        assert res_iso.get("task_id") != res_ok.get("task_id")
         orch_sc.close()
         orch_ok.close()
-        print("  OK success_criteria — refine gate + VERIFY vs TaskGoal criteria")
+        orch_iso.close()
+        print("  OK TaskContract architecture — VALIDATE gate + full cycle + isolation")
     except Exception as exc:
-        msg = f"E2E_SUCCESS_CRITERIA: {exc}"
+        msg = f"E2E_TASK_CONTRACT_ARCH: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)

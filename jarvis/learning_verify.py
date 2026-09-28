@@ -166,7 +166,7 @@ def diagnose_artifact_gaps(
         art = KnowledgeArtifact.from_dict(art_data)
     else:
         art = KnowledgeArtifact.from_dict({**(entry or {}), **(research or {})})
-    art.user_request = user_request or art.user_request
+    art.original_request = user_request or art.original_request
     gaps = art.missing_fields(user_request)
     # If relatedness is already high, prefer structural gaps over goal_coverage spam
     blob = knowledge_blob(research, entry)
