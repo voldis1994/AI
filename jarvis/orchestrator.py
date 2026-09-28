@@ -1,10 +1,12 @@
 """
 JARVIS orchestrator — the autonomous learning cycle.
 
-REQUEST → PLAN → check capabilities → research → learn → build/reuse skill →
-install deps → TEST skill (process) → EXECUTE original task →
+REQUEST → MEMORY → PLAN → COMPETENCE classify → check capabilities/tools →
+research (gaps) → learn → build/reuse/extend TOOL under competence →
+install deps → TEST tool (process) → EXECUTE original task →
 collect artifacts → VERIFY against original TaskGoal → DONE.
 
+Hierarchy: SKILL (domain) → CAPABILITY → TOOL (executable) + KNOWLEDGE/EXPERIENCE.
 TEST PASS is never task success. DONE requires EXECUTE then VERIFY PASS.
 On VERIFY FAIL: repair with full TaskGoal context (never unchanged approach).
 """
@@ -23,6 +25,8 @@ from jarvis.brain import Brain
 from jarvis.memory import Memory
 from jarvis.ledger import Ledger
 from jarvis.capability_registry import CapabilityRegistry
+from jarvis.competence import format_competence_log, preferred_tool_name
+from jarvis.competence_registry import CompetenceRegistry
 from jarvis.research import ResearchSystem
 from jarvis.dependency_manager import DependencyManager
 from jarvis.skill_builder import SkillBuilder
@@ -111,6 +115,17 @@ class Orchestrator:
         self.memory = Memory(db)
         self.ledger = Ledger(db)
         self.registry = CapabilityRegistry(db)
+        # Hierarchical SKILL / CAPABILITY / TOOL index (tools keep .py lifecycle)
+        self.competences = CompetenceRegistry(db, self.registry)
+        try:
+            mig = self.competences.migrate_legacy_skills()
+            self._log(
+                f"COMPETENCE: migrated legacy skills→tools "
+                f"migrated={mig.get('migrated')} skipped={mig.get('skipped')} "
+                f"nodes={mig.get('nodes')} tools={mig.get('tools')}"
+            )
+        except Exception as exc:
+            self._log(f"COMPETENCE: migration skipped ({exc})")
         # Self-improvement from VERIFY outcomes (survives restart via SQLite facts)
         self.calibration = AutoCalibration(self.memory, on_log=self._log)
         # Apply calibrated timeouts to brain / research (defaults if untouched)
@@ -1704,18 +1719,71 @@ class Orchestrator:
             )
             self.perf.end("CONTEXT", arg_count=len(task_args))
 
-            # CHECK CAPABILITIES — TaskGoal-compatible skills only (not name similarity)
+            # CHECK CAPABILITIES — hierarchical competences + TaskGoal-compatible tools
             self._status("CHECK_CAPABILITIES")
             plan = self._sanitize_action_plan(plan, goal, task_goal=task_goal)
-            matched, match_reports = self._select_compatible_skills(
-                plan, task_goal, task_id=task_id
+            comp_plan = self.competences.plan_for_goal(task_goal)
+            self._request_cache["competence_plan"] = comp_plan.to_dict()
+            self._log(format_competence_log(comp_plan))
+            self.ledger.log(
+                task_id,
+                "COMPETENCE",
+                f"decision={comp_plan.decision}",
+                comp_plan.to_dict(),
             )
-            decision = "REUSE" if (matched and not plan.get("needs_new_skill")) else "BUILD_NEW"
+            # Prefer VERIFIED competence tools over inventing a task-specific skill
+            if comp_plan.decision == "REUSE_COMPOSE" and comp_plan.tools:
+                matched = list(comp_plan.tools)
+                match_reports = [
+                    (t.get("_match") or {"skill": t.get("name"), "compatible": True})
+                    for t in matched
+                ]
+                plan["needs_new_skill"] = False
+                plan["can_reuse"] = [t.get("name") for t in matched if t.get("name")]
+                # Multi-competence: keep preferred tool name for extend path
+                if not plan.get("skill_name"):
+                    plan["skill_name"] = comp_plan.preferred_tool_name
+            else:
+                matched, match_reports = self._select_compatible_skills(
+                    plan, task_goal, task_id=task_id
+                )
+                # Steer BUILD toward competence tool name (not request-slug skill)
+                if comp_plan.needs_new_tool and comp_plan.preferred_tool_name:
+                    planned = str(plan.get("skill_name") or "").strip()
+                    existing_planned = (
+                        self.registry.get_skill(planned) if planned else None
+                    )
+                    # Keep explicit reusable names; replace raw request slugs
+                    if (
+                        not planned
+                        or planned == Brain._slug(goal)[:40]
+                        or planned == Brain._slug(task_goal.user_request)[:40]
+                        or (
+                            existing_planned
+                            and not self._skill_fits_goal(
+                                existing_planned, goal, task_goal=task_goal
+                            )
+                        )
+                    ):
+                        plan["skill_name"] = comp_plan.preferred_tool_name
+            decision = (
+                "REUSE"
+                if (matched and not plan.get("needs_new_skill"))
+                else (
+                    "EXTEND"
+                    if comp_plan.decision in ("EXTEND", "OPEN_BRANCH")
+                    else "BUILD_NEW"
+                )
+            )
             self._log(
                 format_decision_log(
                     decision,
-                    skill=matched[0]["name"] if matched else "",
-                    detail=f"candidates={len(matched)}",
+                    skill=matched[0]["name"] if matched else plan.get("skill_name") or "",
+                    detail=(
+                        f"candidates={len(matched)} "
+                        f"competences={comp_plan.skill_ids[:3]} "
+                        f"caps={comp_plan.capability_ids[:3]}"
+                    ),
                 )
             )
             self.ledger.log(
@@ -1724,9 +1792,13 @@ class Orchestrator:
                 f"decision={decision} matched={len(matched)}",
                 {
                     "decision": decision,
+                    "competence_decision": comp_plan.decision,
                     "names": [m["name"] for m in matched],
                     "plan_skill": plan.get("skill_name"),
                     "matches": match_reports[:8],
+                    "skill_ids": comp_plan.skill_ids,
+                    "capability_ids": comp_plan.capability_ids,
+                    "open_branches": comp_plan.open_branches,
                 },
             )
 
@@ -1778,10 +1850,19 @@ class Orchestrator:
                             task_id, skill_record, goal, task_args, task_goal
                         )
             else:
+                build_label = (
+                    decision
+                    if decision in ("EXTEND", "BUILD_NEW", "OPEN_BRANCH")
+                    else "BUILD_NEW"
+                )
                 self._log(
                     format_decision_log(
-                        "BUILD_NEW",
-                        detail="no TaskGoal-compatible ACTIVE skill",
+                        build_label,
+                        skill=str(plan.get("skill_name") or ""),
+                        detail=(
+                            "extend/build TOOL under competence "
+                            f"{(self._request_cache.get('competence_plan') or {}).get('skill_ids')}"
+                        ),
                     )
                 )
                 skill_record, task_args, task_goal = self._learn_or_repair(
@@ -2047,6 +2128,27 @@ class Orchestrator:
             # SUCCESS path — DONE only after verifier PASS
             if skill_record:
                 self.registry.mark_success(skill_record["name"])
+                try:
+                    self.competences.mark_tool_verified(skill_record["name"], True)
+                    self.competences.bind_built_tool(
+                        skill_record["name"], task_goal, verified=True
+                    )
+                    for sid in (self._request_cache.get("competence_plan") or {}).get(
+                        "skill_ids"
+                    ) or []:
+                        self.competences.attach_experience(
+                            self.memory,
+                            sid,
+                            {
+                                "tool": skill_record["name"],
+                                "success": True,
+                                "goal": goal,
+                                "task_id": task_id,
+                            },
+                        )
+                        break
+                except Exception:
+                    pass
             outcome = (
                 f"DONE. Uzdevums izpildīts un VERIFIER PASS.\n"
                 f"Skill: {(skill_record or {}).get('name')}\n"
@@ -2062,6 +2164,7 @@ class Orchestrator:
                     "evidence": exec_result.get("evidence"),
                     "verification": verification,
                     "task_id": task_id,
+                    "competence": self._request_cache.get("competence_plan"),
                 },
             )
             self.ledger.log(task_id, "SAVE_EXPERIENCE", "Experience saved")
@@ -2148,9 +2251,16 @@ class Orchestrator:
                     )
                 )
                 planned_name = ""
+        # TOOL name from competence+capability — avoid new skill per request slug
+        competence_tool = ""
+        try:
+            competence_tool = preferred_tool_name(task_goal)
+        except Exception:
+            competence_tool = ""
         skill_name = (
             (repair_of or {}).get("name")
             or planned_name
+            or competence_tool
             or self.brain._slug(task_goal.user_request or goal)[:40]
             or "new_skill"
         )
@@ -2720,6 +2830,7 @@ class Orchestrator:
                         approach=current_approach,
                         diagnosis=diagnosis,
                         description=description,
+                        task_goal=task_goal,
                     )
                     # Bundle is from EXECUTE+VERIFY — safe for DONE (not TEST)
                     self._verified_exec_bundle = {
@@ -3555,6 +3666,7 @@ class Orchestrator:
         approach: str,
         diagnosis: Optional[dict],
         description: str,
+        task_goal: Optional[TaskGoal] = None,
     ) -> Optional[dict]:
         self._status("SAVE_SKILL")
         promoted = self.registry.promote_candidate(
@@ -3592,11 +3704,54 @@ class Orchestrator:
             "approach": approach,
             "archived_from": promoted.get("archived_from"),
         })
+        # Bind executable as TOOL under classified competence (not a new skill domain)
+        tool_bind: dict[str, Any] = {}
+        try:
+            tg = task_goal or TaskGoal.from_request(goal, goal=goal)
+            tool_bind = self.competences.bind_built_tool(
+                skill_name, tg, verified=True
+            )
+            self.competences.mark_tool_verified(skill_name, True)
+            primary = str(tool_bind.get("competence_id") or "")
+            if primary:
+                self.competences.attach_knowledge(
+                    self.memory,
+                    primary,
+                    {
+                        "summary": f"Verified tool {skill_name}",
+                        "tool": skill_name,
+                        "goal": goal,
+                        "approach": approach,
+                    },
+                    verified=True,
+                )
+                self.competences.attach_experience(
+                    self.memory,
+                    primary,
+                    {
+                        "tool": skill_name,
+                        "success": True,
+                        "goal": goal,
+                        "approach": approach,
+                        "version": attempt_version,
+                    },
+                )
+            self._log(
+                f"[{task_id}] TOOL bound under competence="
+                f"{tool_bind.get('competence_id')!r} "
+                f"capability={tool_bind.get('capability')!r}"
+            )
+        except Exception as exc:
+            self._log(f"[{task_id}] COMPETENCE bind skipped ({exc})")
         self.ledger.log(
             task_id,
             "SAVE_SKILL",
             f"{skill_name} → ACTIVE v{attempt_version}",
-            {"archived_from": promoted.get("archived_from"), "approach": approach},
+            {
+                "archived_from": promoted.get("archived_from"),
+                "approach": approach,
+                "tool": tool_bind,
+            },
         )
         self._log(
             f"[{task_id}] Skill ACTIVE: {skill_name} v{attempt_version} "
@@ -3954,19 +4109,22 @@ class Orchestrator:
         draft_args = TaskGoal.sanitize_args(
             ContextBuilder._offline_extract(goal), goal
         )
+        tool_name = preferred_tool_name(tg)
         return {
             "steps": [f"Handle: {goal}"],
             "can_reuse": [m["name"] for m in matched[:3]],
             "missing": [] if matched else [goal],
             "needs_research": not bool(matched),
             "needs_new_skill": not bool(matched),
-            "skill_name": Brain._slug(goal)[:40] or "new_skill",
+            # Competence-stable tool name — not a per-request skill slug
+            "skill_name": tool_name or Brain._slug(goal)[:40] or "new_skill",
             "skill_description": goal,
             "research_queries": tg.default_research_queries(),
             "args": draft_args,
             "required_args": list(draft_args.keys()),
             "subject": tg.subject,
             "content_source": list(tg.content_source),
+            "preferred_tool_name": tool_name,
         }
 
     def _list_workspace_artifacts(self, limit: int = 40) -> list[dict[str, Any]]:
@@ -4041,6 +4199,10 @@ class Orchestrator:
                 )
             except Exception:
                 pool_line = ""
+        try:
+            comp = self.competences.stats()
+        except Exception:
+            comp = {}
         return (
             f"Brain (Ollama model pool): {brain}{catalog}{pool_line}\n"
             f"Memory — conv:{mem['conversations']} exp:{mem['experiences']} "
@@ -4048,6 +4210,11 @@ class Orchestrator:
             f"fail:{mem.get('learning_failures', 0)} "
             f"diag:{mem.get('learning_diagnoses', 0)} "
             f"sol:{mem.get('learning_solutions', 0)}\n"
+            f"Competences — nodes:{comp.get('competences', 0)} "
+            f"skills:{comp.get('skills', 0)} "
+            f"capabilities:{comp.get('capabilities', 0)} "
+            f"tools:{comp.get('tools', 0)} "
+            f"verified_tools:{comp.get('verified_tools', 0)}\n"
             f"Skills — total:{reg['total']} ACTIVE:{reg.get('ACTIVE', 0)} "
             f"TESTING:{reg.get('TESTING', 0)} CANDIDATE:{reg.get('CANDIDATE', 0)} "
             f"BROKEN:{reg.get('BROKEN', 0)} REPAIRING:{reg.get('REPAIRING', 0)} "
@@ -4084,9 +4251,20 @@ class Orchestrator:
                 detail = self.brain.router.status_detail()
             except Exception:
                 detail = {}
+        try:
+            competence_stats = self.competences.stats()
+            competence_nodes = [n.to_dict() for n in self.competences.list_nodes()[:40]]
+            competence_tools = self.competences.list_tools()[:40]
+        except Exception:
+            competence_stats = {}
+            competence_nodes = []
+            competence_tools = []
         return {
             "memory": self.memory.stats(),
             "skills": self.registry.stats(),
+            "competences": competence_stats,
+            "competence_nodes": competence_nodes,
+            "competence_tools": competence_tools,
             "ledger": self.ledger.stats(),
             "brain_online": status == "ONLINE",
             "brain_status": status,
@@ -4170,4 +4348,8 @@ class Orchestrator:
             pass
         self.memory.close()
         self.ledger.close()
+        try:
+            self.competences.close()
+        except Exception:
+            pass
         self.registry.close()
