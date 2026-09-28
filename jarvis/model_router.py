@@ -863,7 +863,7 @@ class ModelPool:
                 return 200 <= int(resp.status) < 300
         except Exception as exc:
             logger.info("preload HTTP failed (%s): %s", model, exc)
-            # generate fallback
+            # generate fallback (mark skip only if both paths fail)
             try:
                 import json
                 import urllib.request
@@ -886,7 +886,33 @@ class ModelPool:
                     return 200 <= int(resp.status) < 300
             except Exception as exc2:
                 logger.info("preload generate failed (%s): %s", model, exc2)
+                self._maybe_skip_after_preload_failure(model, exc2)
                 return False
+
+    def _maybe_skip_after_preload_failure(self, model: str, exc: Any) -> None:
+        """On llama-server / HTTP 500 crashes, skip model so pool uses the next fit."""
+        msg = str(exc or "").lower()
+        if not msg:
+            return
+        crash = any(
+            k in msg
+            for k in (
+                "500",
+                "llama-server",
+                "0xe06d7363",
+                "terminated",
+                "forcibly closed",
+                "wsarecv",
+                "connection reset",
+                "broken pipe",
+            )
+        )
+        if not crash:
+            return
+        try:
+            self.mark_model_failed(model, f"preload failed: {exc}"[:160])
+        except Exception:
+            pass
 
     def _http_ps(self) -> Optional[list[dict[str, Any]]]:
         try:
