@@ -373,6 +373,19 @@ class Orchestrator:
         model_status: str,
     ) -> str:
         """Produce a fresh conversational answer for THIS request only."""
+        # Deterministic arithmetic first — never hang on Ollama for "2+5"
+        offline = learn_v.produce_practical_offline(text, {})
+        if offline.get("source") == "offline_expression":
+            ans = offline.get("result", offline.get("answer"))
+            reply = f"{ans}"
+            self._log(
+                f"DIRECT_ANSWER request_id={request_id} "
+                f"source=offline_expression result={ans!r}"
+            )
+            return self._ensure_fresh_reply(
+                reply, text, request_id=request_id, intent_name="conversation"
+            )
+
         # Exclude learning/task DONE turns so prior final_result cannot leak in
         history = self.memory.conversation_history_for_llm(8)
         history = [
@@ -381,6 +394,16 @@ class Orchestrator:
         ]
         if brain_up:
             reply = self.brain.converse(text, history=history)
+            # Model timeout / unreachable → still try offline practical again
+            if str(reply).startswith("[BRAIN ERROR]"):
+                self._log(
+                    f"CONVERSE_FALLBACK request_id={request_id} "
+                    f"brain_error={str(reply)[:120]!r}"
+                )
+                reply = (
+                    f"Nevarēju sasniegt modeli ({model_status}). "
+                    f"Saņēmu: {text}"
+                )
         elif model_status == "MODEL MISSING":
             from jarvis.model_config import TIER_MODELS, TIER_FAST
 
@@ -1663,12 +1686,29 @@ class Orchestrator:
             or entry.get("sources")
             or []
         )
-        # Narrative alone is enough evidence when clean (sources optional)
-        has_sources = bool(sources) or bool(blob)
+        extracted = [
+            s
+            for s in sources
+            if isinstance(s, dict) and (s.get("extracted") or s.get("ok"))
+        ]
+        # Invented request-echo narrative is NOT evidence. Need opened extracts
+        # or a prior verified entry that already had extracted evidence.
+        prior_extracted = bool(
+            isinstance(entry, dict)
+            and entry.get("verified")
+            and any(
+                isinstance(s, dict) and s.get("extracted")
+                for s in (entry.get("sources") or [])
+            )
+        )
+        has_sources = bool(extracted) or prior_extracted
         checks.append({
             "name": "knowledge_sources",
             "ok": has_sources,
-            "detail": f"sources={len(sources)} narrative_len={len(blob)}",
+            "detail": (
+                f"extracted={len(extracted)} sources={len(sources)} "
+                f"narrative_len={len(blob)} prior_extracted={prior_extracted}"
+            ),
         })
         if not has_sources:
             missing.append("knowledge_sources")

@@ -232,6 +232,51 @@ def scrub_text(text: str) -> str:
     return "\n".join(keep).strip()
 
 
+def _research_has_acquired_body(
+    research: dict[str, Any],
+    prior: Optional[KnowledgeArtifact] = None,
+) -> bool:
+    """
+    True only when research actually acquired knowledge (extracts / notes).
+
+    Empty SEARCH + invented keyword fluff must NOT count — that was the
+    false LEARNING VERIFY PASS bug (0 URLs → still concepts=4 PASS).
+    """
+    if prior is not None and prior.has_substance():
+        # Gap-fill from a prior artifact is allowed only if prior had evidence
+        # or a non-echo narrative already verified upstream.
+        if prior.source_evidence or len(prior.narrative()) >= 80:
+            return True
+    if research.get("knowledge_from_extracts"):
+        return True
+    extracts = research.get("extracts") or []
+    if any(isinstance(e, dict) and e.get("ok") for e in extracts):
+        return True
+    sources = list(
+        research.get("source_evidence") or research.get("sources") or []
+    )
+    if any(isinstance(s, dict) and s.get("extracted") for s in sources):
+        return True
+    approach = scrub_text(str(research.get("approach") or ""))
+    if is_polluted(approach):
+        approach = ""
+    concepts = list(research.get("concepts") or research.get("key_apis") or [])
+    concepts = [c for c in concepts if c and not is_polluted(str(c))]
+    raw = scrub_text(str(research.get("raw") or ""))
+    # Strip meta headers used when SEARCH finds nothing / local gap-fill seeds
+    raw_body = re.sub(r"(?im)^###\s+.*$", "", raw)
+    raw_body = re.sub(
+        r"(?im)^(search:|gap-fill focus|search titles).*$", "", raw_body
+    ).strip()
+    if len(approach) >= 40 and (concepts or len(raw_body) >= 40):
+        return True
+    if len(raw_body) >= 120:
+        return True
+    if concepts and len(raw_body) >= 40:
+        return True
+    return False
+
+
 def synthesize_offline(
     *,
     user_request: str,
@@ -245,7 +290,8 @@ def synthesize_offline(
     Deterministic KnowledgeArtifact from research notes — no 30B required.
 
     Filters skill/debug pollution and builds concepts/explanations/examples
-    from clean text only.
+    from clean text only. Refuses to invent knowledge from the USER REQUEST
+    alone when SEARCH/OPEN produced nothing.
     """
     research = dict(research or {})
     missing = [str(m) for m in (missing or []) if m]
@@ -254,6 +300,22 @@ def synthesize_offline(
         topic=topic,
         original_request=user_request,
     )
+
+    if not _research_has_acquired_body(research, prior):
+        # Honest empty artifact — VERIFY must FAIL (no fake PASS)
+        return KnowledgeArtifact(
+            request_id=request_id or base.request_id,
+            topic=topic or base.topic,
+            original_request=user_request or base.original_request,
+            concepts=[],
+            explanations=[],
+            examples=[],
+            source_evidence=[],
+            practical_result=research.get("practical_result") or base.practical_result,
+            practice="",
+            summary="",
+            verified=False,
+        )
 
     raw_clean = scrub_text(str(research.get("raw") or ""))
     approach = scrub_text(str(research.get("approach") or ""))
@@ -493,13 +555,19 @@ def _clean_sources(sources: list[Any]) -> list[dict[str, Any]]:
         if not key or key in seen:
             continue
         seen.add(key)
-        out.append({
+        row = {
             "url": url,
             "title": title,
             "source": s.get("source") or s.get("provider") or "",
             "provider": s.get("provider") or "",
             "query": s.get("query") or "",
-        })
+        }
+        # Preserve OPEN/EXTRACT evidence flags for LEARNING VERIFY
+        if s.get("extracted") or s.get("ok"):
+            row["extracted"] = True
+        if s.get("ok") is not None:
+            row["ok"] = bool(s.get("ok"))
+        out.append(row)
     return out[:20]
 
 

@@ -521,6 +521,7 @@ class TaskContract:
             draft_outcomes=outcomes,
             requirements_hint=req_hint,
             final_output_constraints=foc,
+            request_text=req,
         )
         # Primary advisory label from outcomes (not exclusive lifecycle)
         primary = str(grounded_draft.get("intent") or intent or "").strip()
@@ -555,6 +556,19 @@ class TaskContract:
                 acceptance = ("learning_knowledge:covers_request@knowledge_artifact",)
             elif OUTCOME_CONVERSATION in required:
                 acceptance = ("conversation_reply:nonempty@answer",)
+        # Bare arithmetic Q&A routed to conversation — accept a nonempty answer,
+        # not a skill lifecycle criterion that forces BUILD+model hang.
+        if (
+            OUTCOME_CONVERSATION in required
+            and not (set(required) & actionable)
+            and acceptance
+            and all(
+                str(a).lower().startswith("skill_result_")
+                or str(a).lower().startswith("behavior:")
+                for a in acceptance
+            )
+        ):
+            acceptance = ("conversation_reply:nonempty@answer",)
 
         return cls(
             request_id=rid,
@@ -783,6 +797,7 @@ class TaskContract:
             draft_outcomes=self.desired_outcomes,
             requirements_hint=merged,
             final_output_constraints=self.final_output_constraints,
+            request_text=self.original_request,
         )
         actionable = {
             OUTCOME_ARTIFACT,

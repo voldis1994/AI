@@ -8,8 +8,19 @@ is allowed only when every required outcome is independently VERIFIED.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
+
+
+# Explicit skill/BUILD cues — bare "2+5" / "cik ir 2+5" must NOT match.
+_SKILL_BUILD_CUE_RE = re.compile(
+    r"(?i)\b(?:"
+    r"return|compute|calculate|create|write|make|build|implement|"
+    r"code|function|program|script|skill|module|class|"
+    r"izveido|uzraksti|aprēķini|atgriez|implement[eē]"
+    r")\b"
+)
 
 
 # Canonical outcome kinds (open set — stages may add grounded kinds)
@@ -128,6 +139,7 @@ def derive_required_outcomes(
     draft_outcomes: Iterable[str] = (),
     requirements_hint: Optional[dict[str, Any]] = None,
     final_output_constraints: Optional[dict[str, Any]] = None,
+    request_text: str = "",
 ) -> tuple[str, ...]:
     """
     Derive required outcomes structurally from the semantic contract.
@@ -141,6 +153,7 @@ def derive_required_outcomes(
     arts = [str(a) for a in (artifacts or ()) if str(a).strip()]
     beh = list(behaviors or ())
     http = list(cons.get("http") or [])
+    req_text = (request_text or "").strip()
 
     def _add(kind: str) -> None:
         if kind and kind not in out:
@@ -161,6 +174,24 @@ def derive_required_outcomes(
             for b in beh
         )
     )
+    # Bare Q&A like "2+5" / "cik ir 2+5" — answer directly; do NOT BUILD a skill
+    # and hang on model timeouts. Explicit return/compute/create… stay skill path.
+    practical_qa_beh = bool(
+        not practical_learning_beh
+        and not arts
+        and not http
+        and not cons.get("files")
+        and not hint.get("needs_capability")
+        and not hint.get("needs_learning")
+        and beh
+        and all(
+            isinstance(b, dict)
+            and str(b.get("kind") or "").startswith("skill_result_")
+            for b in beh
+        )
+        and (not req_text or not _SKILL_BUILD_CUE_RE.search(req_text))
+    )
+    skip_skill_lifecycle = practical_learning_beh or practical_qa_beh
 
     # Explicit draft / semantic outcomes (already grounded upstream)
     for raw in draft_outcomes or ():
@@ -173,7 +204,7 @@ def derive_required_outcomes(
         elif s.startswith("artifact"):
             _add(OUTCOME_ARTIFACT)
         elif s.startswith("behavior") or s.startswith("skill_"):
-            if not practical_learning_beh:
+            if not skip_skill_lifecycle:
                 _add(OUTCOME_EXECUTION)
         elif s.startswith("http") or s.startswith("content"):
             _add(OUTCOME_ARTIFACT if arts else OUTCOME_SIDE_EFFECT)
@@ -186,7 +217,7 @@ def derive_required_outcomes(
         _add(OUTCOME_TEST)
         _add(OUTCOME_CAPABILITY)
 
-    if beh and not practical_learning_beh:
+    if beh and not skip_skill_lifecycle:
         _add(OUTCOME_EXECUTION)
         _add(OUTCOME_TEST)
         _add(OUTCOME_CAPABILITY)
@@ -195,7 +226,7 @@ def derive_required_outcomes(
         str(s).startswith("network") for s in (side_effects or ())
     ):
         _add(OUTCOME_SIDE_EFFECT)
-        if not arts and not practical_learning_beh:
+        if not arts and not skip_skill_lifecycle:
             _add(OUTCOME_EXECUTION)
             _add(OUTCOME_CAPABILITY)
 
@@ -232,8 +263,8 @@ def derive_required_outcomes(
             OUTCOME_RESEARCH,
         }
     )
-    if not actionable_present:
-        if hint.get("needs_conversation") or not (
+    if practical_qa_beh or not actionable_present:
+        if practical_qa_beh or hint.get("needs_conversation") or not (
             hint.get("needs_capability")
             or hint.get("needs_learning")
             or hint.get("needs_research")
@@ -241,7 +272,7 @@ def derive_required_outcomes(
             _add(OUTCOME_CONVERSATION)
 
     # Hints cannot strip artifact/execution once derived
-    if hint.get("needs_capability"):
+    if hint.get("needs_capability") and not practical_qa_beh:
         _add(OUTCOME_CAPABILITY)
         # Capability without concrete artifact/behavior → still required
         # (VALIDATE will needs_refine — not conversation fallback)
@@ -258,7 +289,7 @@ def derive_required_outcomes(
         elif low.startswith("http_"):
             _add(OUTCOME_SIDE_EFFECT)
         elif low.startswith("skill_") or low.startswith("behavior"):
-            if not practical_learning_beh:
+            if not skip_skill_lifecycle:
                 _add(OUTCOME_EXECUTION)
         elif "knowledge" in low or low.startswith("learning"):
             _add(OUTCOME_LEARNING)

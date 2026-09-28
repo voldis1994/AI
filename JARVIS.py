@@ -2052,6 +2052,50 @@ def run(context: dict) -> dict:
         orch_l.registry.set_status("create_file", "ACTIVE")
         assert orch_l.registry.get_skill("create_file")["status"] == "ACTIVE"
 
+        def _learn_extracts(queries, goal="", **kwargs):
+            body = (
+                "Computer networks move packets between hosts. "
+                "The OSI model has layers including transport and network. "
+                "TCP provides reliable streams; UDP is datagram-oriented. "
+                "For example, a client opens a TCP socket to a server port."
+            )
+            return {
+                "approach": body[:200],
+                "libraries": [],
+                "key_apis": [
+                    "OSI layers",
+                    "TCP reliable stream",
+                    "UDP datagrams",
+                    "routing",
+                ],
+                "pitfalls": [],
+                "test_idea": "Explain TCP vs UDP and name two OSI layers.",
+                "raw": body,
+                "sources": [{
+                    "url": "https://example.test/networks",
+                    "title": "Network basics",
+                    "extracted": True,
+                    "source": "extracted",
+                }],
+                "results": [],
+                "extracts": [{
+                    "url": "https://example.test/networks",
+                    "title": "Network basics",
+                    "ok": True,
+                    "char_count": len(body),
+                    "relatedness": 0.6,
+                    "text": body,
+                }],
+                "comparison": {"consensus": ["packets", "TCP"], "source_count": 1},
+                "mode": "learning",
+                "network": True,
+                "brain_used": False,
+                "opened_sources": True,
+                "knowledge_from_extracts": True,
+            }
+
+        orch_l.research.research = _learn_extracts  # type: ignore[method-assign]
+
         req_l = "Learn network basics and create practical tests to verify knowledge"
         result_l = orch_l.handle_user_message(req_l)
         assert result_l.get("type") == "learning", result_l
@@ -2101,11 +2145,52 @@ def run(context: dict) -> dict:
         assert "optik" in mt_o or "refrak" in mt_o, mt_o
         assert _ICTopic.topic_slug("vīns") == "vīns"
 
+        def _iso_research(topic_label: str, body: str):
+            def _fn(queries, goal="", **kwargs):
+                return {
+                    "approach": body[:220],
+                    "libraries": [],
+                    "key_apis": body.split(". ")[:4],
+                    "pitfalls": [],
+                    "test_idea": f"Self-check {topic_label} with one worked example.",
+                    "raw": body,
+                    "sources": [{
+                        "url": f"https://example.test/{topic_label}",
+                        "title": f"{topic_label} primer",
+                        "extracted": True,
+                        "source": "extracted",
+                    }],
+                    "results": [],
+                    "extracts": [{
+                        "url": f"https://example.test/{topic_label}",
+                        "title": f"{topic_label} primer",
+                        "ok": True,
+                        "char_count": len(body),
+                        "relatedness": 0.6,
+                        "text": body,
+                    }],
+                    "comparison": {"consensus": [topic_label], "source_count": 1},
+                    "mode": "learning",
+                    "network": True,
+                    "brain_used": False,
+                    "opened_sources": True,
+                    "knowledge_from_extracts": True,
+                }
+
+            return _fn
+
         logs_a: list[str] = []
         orch_a = Orchestrator(
             root=iso_root,
             brain=_IsoBrain(),
             on_log=lambda m: logs_a.append(m),
+        )
+        orch_a.research.research = _iso_research(  # type: ignore[method-assign]
+            "thermo",
+            "Thermodynamics studies energy, heat, and work. "
+            "The first law states energy is conserved. "
+            "Entropy measures disorder in a system. "
+            "For example, a heat engine converts heat into work.",
         )
         req_a = "Learn thermodynamics basics and create practical tests to verify knowledge"
         res_a = orch_a.handle_user_message(req_a)
@@ -2122,6 +2207,13 @@ def run(context: dict) -> dict:
             root=iso_root,  # same MEMORY DB as A
             brain=_IsoBrain(),
             on_log=lambda m: logs_b.append(m),
+        )
+        orch_b.research.research = _iso_research(  # type: ignore[method-assign]
+            "optics",
+            "Optics studies light: reflection, refraction, and lenses. "
+            "Snell's law relates angles at an interface. "
+            "A convex lens focuses parallel rays to a focal point. "
+            "For example, refraction bends light in water.",
         )
         req_b = "Learn optics refraction basics and create practical tests to verify knowledge"
         res_b = orch_b.handle_user_message(req_b)
@@ -2167,6 +2259,87 @@ def run(context: dict) -> dict:
         traceback.print_exc()
         errors.append(msg)
 
+    # 4g0b) Empty SEARCH must NOT fake LEARNING VERIFY PASS; bare 2+5 answers directly
+    print("  — e2e empty-learn FAIL + direct arithmetic answer —")
+    try:
+        empty_root = root / "data" / "_e2e_empty_learn_arith"
+        if empty_root.exists():
+            shutil.rmtree(empty_root)
+        empty_root.mkdir(parents=True)
+
+        class _EmptyBrain(Brain):
+            def model_status(self) -> str:
+                return "OFFLINE"
+
+            def is_available(self) -> bool:
+                return False
+
+            def converse(self, *a, **k):
+                raise AssertionError("brain must not be required for 2+5")
+
+        logs_e: list[str] = []
+        orch_e = Orchestrator(
+            root=empty_root,
+            brain=_EmptyBrain(),
+            on_log=lambda m: logs_e.append(m),
+        )
+
+        def _empty_search(queries, goal="", **kwargs):
+            return {
+                "approach": "",
+                "libraries": [],
+                "key_apis": [],
+                "pitfalls": [],
+                "test_idea": "",
+                "raw": "",
+                "sources": [],
+                "results": [],
+                "extracts": [],
+                "comparison": {},
+                "mode": "learning",
+                "network": True,
+                "brain_used": False,
+                "opened_sources": False,
+                "knowledge_from_extracts": False,
+            }
+
+        orch_e.research.research = _empty_search  # type: ignore[method-assign]
+        res_empty = orch_e.handle_user_message(
+            "iemācies matemātikas pamatus"
+        )
+        assert not res_empty.get("success"), res_empty
+        assert any(
+            "LEARNING VERIFY: FAIL" in m or "knowledge_sources" in m
+            for m in logs_e
+        ), logs_e[-40:]
+        assert not any(
+            "LEARNING VERIFY: PASS" in m for m in logs_e
+        ), [m for m in logs_e if "VERIFY" in m]
+
+        logs_a2: list[str] = []
+        orch_a2 = Orchestrator(
+            root=empty_root,
+            brain=_EmptyBrain(),
+            on_log=lambda m: logs_a2.append(m),
+        )
+        res_sum = orch_a2.handle_user_message("2+5")
+        assert res_sum.get("success"), res_sum
+        assert res_sum.get("type") == "conversation", res_sum
+        assert "7" in str(res_sum.get("reply") or ""), res_sum
+        assert any("DIRECT_ANSWER" in m for m in logs_a2), logs_a2
+        assert not any("BUILD_SKILL" in m for m in logs_a2), logs_a2
+        assert "capability" not in str(
+            (res_sum.get("contract") or {}).get("required_outcomes") or []
+        )
+        orch_e.close()
+        orch_a2.close()
+        print("  OK empty-learn FAIL + 2+5 → 7 (no skill BUILD)")
+    except Exception as exc:
+        msg = f"E2E_EMPTY_LEARN_ARITH: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
     # 4g) E2E: learning self-correct — VERIFY fail → gap-fill → PASS (not full restart)
     print("  — e2e learning self-correct (gap-fill KnowledgeArtifact) —")
     try:
@@ -2206,7 +2379,28 @@ def run(context: dict) -> dict:
                         practice="",
                         summary="x",
                     )
-                return super()._synthesize_learning_artifact(**kw)
+                # Gap-fill recovery with real extracted evidence (not request echo)
+                body = (
+                    "A graph is a set of nodes connected by edges. "
+                    "Paths traverse edges between nodes. "
+                    "Cycles return to a starting node. "
+                    "For example, a triangle graph has three nodes and three edges."
+                )
+                return _KA(
+                    request_id=kw.get("request_id") or "",
+                    topic=kw.get("topic") or "",
+                    original_request=kw.get("original_request") or "",
+                    concepts=["nodes", "edges", "paths", "cycles"],
+                    explanations=[body],
+                    examples=["Triangle graph: A-B-C-A"],
+                    practice="Draw a path of length 2 and name the nodes.",
+                    summary=body[:200],
+                    source_evidence=[{
+                        "url": "https://example.test/graphs",
+                        "title": "Graph basics",
+                        "extracted": True,
+                    }],
+                )
 
         # Track research queries via wrapping ResearchSystem.research
         logs_sc: list[str] = []
@@ -2364,6 +2558,45 @@ def run(context: dict) -> dict:
             brain=OfflineBrainSem(),
             on_log=lambda m: logs_sem.append(m),
         )
+
+        def _sem_research(queries, goal="", **kwargs):
+            body = (
+                "Arithmetic combines numbers with operations. "
+                "Addition sums two operands into a total. "
+                "Subtraction, multiplication, and division are related. "
+                "For example, evaluating 12+5 yields 17."
+            )
+            return {
+                "approach": body[:200],
+                "libraries": [],
+                "key_apis": ["addition", "operands", "sum"],
+                "pitfalls": [],
+                "test_idea": "Compute a grounded sum from the request.",
+                "raw": body,
+                "sources": [{
+                    "url": "https://example.test/arithmetic",
+                    "title": "Arithmetic basics",
+                    "extracted": True,
+                    "source": "extracted",
+                }],
+                "results": [],
+                "extracts": [{
+                    "url": "https://example.test/arithmetic",
+                    "title": "Arithmetic basics",
+                    "ok": True,
+                    "char_count": len(body),
+                    "relatedness": 0.7,
+                    "text": body,
+                }],
+                "comparison": {"consensus": ["addition"], "source_count": 1},
+                "mode": "learning",
+                "network": True,
+                "brain_used": False,
+                "opened_sources": True,
+                "knowledge_from_extracts": True,
+            }
+
+        orch_sem.research.research = _sem_research  # type: ignore[method-assign]
         # Universal practical learning request — expression not hardcoded in product code
         req_sem = "Learn arithmetic basics and compute 12+5"
         result_sem = orch_sem.handle_user_message(req_sem)
@@ -2402,14 +2635,28 @@ def run(context: dict) -> dict:
                 "### Local hints\n"
                 "- Skill must define SKILL_META and run(context)\n"
                 "- Return concrete result.path\n"
-                "Optics studies light: reflection, refraction, and lenses.\n"
+                "Optics studies light: reflection, refraction, and lenses. "
+                "Snell's law relates incidence and refraction angles at an interface. "
                 "For example, a lens focuses parallel rays to a point.\n"
             ),
-            "key_apis": ["Hint: pathlib / os"],
+            "key_apis": ["Hint: pathlib / os", "reflection", "refraction", "lenses"],
             "sources": [
                 {"title": "Local capability hints", "url": "", "source": "local"},
-                {"title": "Optics overview", "url": "http://ex.test/optics", "source": "web"},
+                {
+                    "title": "Optics overview",
+                    "url": "http://ex.test/optics",
+                    "source": "web",
+                    "extracted": True,
+                },
             ],
+            "extracts": [{
+                "url": "http://ex.test/optics",
+                "title": "Optics overview",
+                "ok": True,
+                "char_count": 180,
+                "relatedness": 0.5,
+            }],
+            "knowledge_from_extracts": True,
         }
         req_u = "Learn optics basics and create practical tests to verify knowledge"
         art_u = synthesize_offline(
@@ -2460,17 +2707,41 @@ def run(context: dict) -> dict:
         _real = orch_ka.research.research
 
         def _rich_research(queries, goal="", **kwargs):
-            base = _real(queries, goal=goal, **kwargs)
-            base["raw"] = (
-                str(base.get("raw") or "")
-                + "\nSignal processing transforms measurements into useful information. "
+            body = (
+                "Signal processing transforms measurements into useful information. "
                 "Filtering removes noise; sampling captures discrete values. "
                 "For example, a low-pass filter attenuates high frequencies. "
                 "Practice: explain sampling and give one filtering example."
             )
-            base["approach"] = ""
-            base["test_idea"] = "Execute skill.run and independently verify artifacts"
-            return base
+            return {
+                "approach": "",
+                "libraries": [],
+                "key_apis": ["filtering", "sampling", "low-pass filter"],
+                "pitfalls": [],
+                "test_idea": "Execute skill.run and independently verify artifacts",
+                "raw": body,
+                "sources": [{
+                    "url": "https://example.test/signal",
+                    "title": "Signal processing",
+                    "extracted": True,
+                    "source": "extracted",
+                }],
+                "results": [],
+                "extracts": [{
+                    "url": "https://example.test/signal",
+                    "title": "Signal processing",
+                    "ok": True,
+                    "char_count": len(body),
+                    "relatedness": 0.6,
+                    "text": body,
+                }],
+                "comparison": {"consensus": ["filtering"], "source_count": 1},
+                "mode": "learning",
+                "network": True,
+                "brain_used": False,
+                "opened_sources": True,
+                "knowledge_from_extracts": True,
+            }
 
         orch_ka.research.research = _rich_research  # type: ignore[method-assign]
         req_ka = (
@@ -2531,7 +2802,7 @@ def run(context: dict) -> dict:
                         explanations=[],
                         examples=[],
                     )
-                # Gap-fill merge path
+                # Gap-fill merge path — real extracted evidence required for VERIFY
                 return super()._synthesize_learning_artifact(**kw)
 
         gf_root = root / "data" / "_e2e_knowledge_gapfill"
@@ -2543,18 +2814,44 @@ def run(context: dict) -> dict:
             brain=OfflineBrainKA(),
             on_log=lambda m: None,
         )
-        _real2 = orch_gf.research.research
 
         def _spy2(queries, goal="", **kwargs):
             orch_gf.gap_queries.append(list(queries or []))
-            base = _real2(queries, goal=goal, **kwargs)
-            base["raw"] = (
+            body = (
                 "Control systems regulate behavior using feedback loops. "
                 "A setpoint is compared to measured output. "
                 "For example, a thermostat turns heating on and off. "
                 "Practice questions check understanding of feedback."
             )
-            return base
+            return {
+                "approach": body[:200],
+                "libraries": [],
+                "key_apis": ["feedback", "setpoint", "thermostat"],
+                "pitfalls": [],
+                "test_idea": "Explain feedback with one example.",
+                "raw": body,
+                "sources": [{
+                    "url": "https://example.test/control",
+                    "title": "Control systems",
+                    "extracted": True,
+                    "source": "extracted",
+                }],
+                "results": [],
+                "extracts": [{
+                    "url": "https://example.test/control",
+                    "title": "Control systems",
+                    "ok": True,
+                    "char_count": len(body),
+                    "relatedness": 0.6,
+                    "text": body,
+                }],
+                "comparison": {"consensus": ["feedback"], "source_count": 1},
+                "mode": "learning",
+                "network": kwargs.get("network", True),
+                "brain_used": False,
+                "opened_sources": True,
+                "knowledge_from_extracts": True,
+            }
 
         orch_gf.research.research = _spy2  # type: ignore[method-assign]
         req_gf = "Learn control systems basics and create practical tests to verify knowledge"
