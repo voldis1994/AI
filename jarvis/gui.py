@@ -843,17 +843,16 @@ class JarvisGUI:
 
     def _boot_banner(self) -> None:
         status = self.orch.brain.model_status()
-        fast = TIER_MODELS[TIER_FAST]["primary"]
-        reason = TIER_MODELS[TIER_REASONING]["primary"]
-        coding = TIER_MODELS[TIER_CODING]["primary"]
-        hint = {
-            "ONLINE": "CONNECTED",
-            "MODEL MISSING": f"MODEL MISSING — ollama pull {fast}",
-            "OFFLINE": "OFFLINE (start ollama serve)",
-        }.get(status, status)
+        # Show RESOLVED (auto-selected installed) models — not catalog primaries
         catalog = ""
         if hasattr(self.orch.brain, "model_catalog_summary"):
             catalog = self.orch.brain.model_catalog_summary()
+        pull_hint = TIER_MODELS[TIER_FAST]["primary"]
+        hint = {
+            "ONLINE": "CONNECTED (auto-select installed)",
+            "MODEL MISSING": f"MODEL MISSING — ollama pull {pull_hint}",
+            "OFFLINE": "OFFLINE (start ollama serve)",
+        }.get(status, status)
         try:
             from jarvis.runtime_fingerprint import fingerprint_line
 
@@ -864,8 +863,15 @@ class JarvisGUI:
             "[SYSTEM] JARVIS cyber-core online — integrated Workspace active.\n"
             f"[SYSTEM] {runtime_line}\n"
             f"[SYSTEM] Ollama multi-model — {hint}\n"
-            f"[SYSTEM] FAST:{fast}  REASONING:{reason}  CODING:{coding}\n"
-            + (f"[SYSTEM] {catalog}\n" if catalog else "")
+            + (
+                f"[SYSTEM] ACTIVE {catalog}\n"
+                if catalog
+                else (
+                    f"[SYSTEM] FAST:{TIER_MODELS[TIER_FAST]['primary']}  "
+                    f"REASONING:{TIER_MODELS[TIER_REASONING]['primary']}  "
+                    f"CODING:{TIER_MODELS[TIER_CODING]['primary']}\n"
+                )
+            )
             + "[SYSTEM] Views: CHAT WORKSPACE CODE TERMINAL RESEARCH FILES\n"
             + "[SYSTEM] Type a goal below · F11 fullscreen · Esc exit FS"
         )

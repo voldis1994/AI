@@ -606,7 +606,7 @@ class ModelPool:
             tier=chosen_tier,
             model=resolved,
             work=work_key,
-            primary=primary,
+            primary=catalog_primary,
             used_fallback=used_fb,
             reason=reason,
             warm=warm,
@@ -754,6 +754,10 @@ class ModelPool:
         """
         Estimate bytes available for warm models (GPU VRAM preferred, else RAM).
         Conservative fraction to avoid thrashing.
+
+        When VRAM cannot be probed (common on Intel/Vulkan Windows), apply a
+        soft selection cap so 30B primaries are not preferred over an installed
+        8B that actually runs.
         """
         vram = self._detect_vram_bytes()
         if vram and vram > 0:
@@ -761,8 +765,9 @@ class ModelPool:
         ram = self._detect_ram_bytes()
         if ram and ram > 0:
             return int(ram * cfg.WARM_BUDGET_FRACTION)
-        # Fallback ~12 GiB soft budget
-        return int(12 * 1024**3 * cfg.WARM_BUDGET_FRACTION)
+        # No VRAM/RAM probe (typical Windows without nvidia-smi): soft ~7.5 GiB
+        # so installed 8B/7B beat crash-prone 30B primaries.
+        return int(10 * 1024**3 * cfg.WARM_BUDGET_FRACTION)
 
     def loaded_models(self) -> Optional[list[dict[str, Any]]]:
         if self._ps_fn is not None:
@@ -905,7 +910,25 @@ class ModelPool:
         """Catalog + auto-discovered installed models, minus runner failures."""
         with self._lock:
             ban = set(self._failed_models.keys())
-        return cfg.discover_models_for_tier(tier, tags, exclude=ban)
+            budget = int(self._budget_bytes or 0)
+        if not budget:
+            try:
+                budget = int(self.detect_memory_budget_bytes() or 0)
+                with self._lock:
+                    self._budget_bytes = budget
+            except Exception:
+                budget = 0
+
+        def _sz(name: str) -> int:
+            return int(self._model_size_bytes(name, tags) or 0)
+
+        return cfg.discover_models_for_tier(
+            tier,
+            tags,
+            exclude=ban,
+            budget_bytes=budget,
+            size_fn=_sz,
+        )
 
     def _resolve_model(
         self, tier: str, tags: Optional[list[str]]

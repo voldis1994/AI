@@ -258,54 +258,78 @@ def discover_models_for_tier(
     installed: Optional[list[str]],
     *,
     exclude: Optional[set[str]] = None,
+    budget_bytes: int = 0,
+    size_fn: Optional[Any] = None,
 ) -> list[str]:
     """
     Ordered candidates for a tier from catalog + installed Ollama tags.
 
-    1) Configured primary/fallbacks that are installed (catalog order)
-    2) Other installed models ranked by tier fitness (auto-select)
-    3) If nothing installed is known, return catalog order (caller may still try)
+    Ranked by tier fitness (size/family). Catalog membership is a boost, not a
+    hard first-pick — so an installed ``qwen3:8b`` beats a crashing/oversized
+    ``qwen3:30b`` when the memory budget cannot fit the larger model.
     """
     t = (tier or "").strip().upper() or TIER_FAST
     catalog = models_for_tier(t)
+    catalog_rank = {
+        str(n).strip().lower(): i for i, n in enumerate(catalog) if str(n).strip()
+    }
     ban = {x.strip().lower() for x in (exclude or set()) if str(x).strip()}
     tags = [str(x).strip() for x in (installed or []) if str(x).strip()]
     tag_l = {n.lower(): n for n in tags}  # preserve original casing
 
-    out: list[str] = []
-    seen: set[str] = set()
-
-    def _add(name: str) -> None:
-        key = name.strip().lower()
-        if not key or key in seen or key in ban:
-            return
-        seen.add(key)
-        # Prefer installed casing when present
-        out.append(tag_l.get(key, name.strip()))
+    def _size(name: str) -> int:
+        if callable(size_fn):
+            try:
+                got = size_fn(name)
+                if got:
+                    return int(got)
+            except Exception:
+                pass
+        return size_hint_bytes(name)
 
     if tags:
-        for name in catalog:
-            if name.strip().lower() in tag_l and name.strip().lower() not in ban:
-                _add(name)
-        # Auto-discover: anything installed that scores reasonably
-        extras = []
+        scored: list[tuple[float, str]] = []
         for raw in tags:
             key = raw.lower()
-            if key in seen or key in ban:
+            if key in ban:
                 continue
             sc = score_model_for_tier(raw, t)
-            if sc < 0:
+            if sc < -20:
                 continue
-            extras.append((sc, raw))
-        extras.sort(key=lambda x: (-x[0], x[1].lower()))
-        for _, raw in extras:
-            _add(raw)
+            # Catalog boost — earlier entries score higher, but not enough to
+            # beat a model that actually fits when the primary is oversized.
+            if key in catalog_rank:
+                sc += 12.0 - min(catalog_rank[key], 8) * 0.8
+            else:
+                sc -= 1.0
+            sz = _size(raw)
+            if budget_bytes and sz > 0:
+                if sz > budget_bytes:
+                    # Strong penalty: prefer a fitting 8b over a 30b that OOMs/crashes
+                    sc -= 40.0 + (sz - budget_bytes) / 1_000_000_000.0
+                elif sz > budget_bytes * 0.85:
+                    sc -= 8.0
+                else:
+                    sc += 3.0
+            # Soft prefer not-huge for FAST even without budget probe
+            params = parse_param_billions(raw)
+            if t == TIER_FAST and params is not None and params >= 14:
+                sc -= 10.0
+            scored.append((sc, raw))
+        scored.sort(key=lambda x: (-x[0], x[1].lower()))
+        out = [tag_l.get(n.lower(), n) for _, n in scored]
         if out:
             return out
 
     # Offline / empty tags — catalog preference order
+    out = []
+    seen: set[str] = set()
     for name in catalog:
-        _add(name)
-    if DEFAULT_MODEL.strip().lower() not in seen:
-        _add(DEFAULT_MODEL)
+        key = name.strip().lower()
+        if not key or key in seen or key in ban:
+            continue
+        seen.add(key)
+        out.append(name.strip())
+    if DEFAULT_MODEL.strip().lower() not in seen and DEFAULT_MODEL.strip().lower() not in ban:
+        out.append(DEFAULT_MODEL)
     return out
