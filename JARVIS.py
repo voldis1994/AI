@@ -642,6 +642,19 @@ def run(context: dict) -> dict:
         assert TaskGoal.normalize_fault_layer("context_args") == "context_mapping"
         assert TaskGoal.rewrite_skill_for_layer("context_mapping") is False
         assert TaskGoal.rewrite_skill_for_layer("skill_code") is True
+        # UNKNOWN / unrecognized must NOT become skill_code (no auto-rewrite)
+        assert TaskGoal.normalize_fault_layer(None) == "unknown"
+        assert TaskGoal.normalize_fault_layer("") == "unknown"
+        assert TaskGoal.normalize_fault_layer("UNKNOWN") == "unknown"
+        assert TaskGoal.normalize_fault_layer("garbage_layer") == "unknown"
+        assert TaskGoal.rewrite_skill_for_layer("unknown") is False
+        assert TaskGoal.rewrite_skill_for_layer(None) is False
+        gated = TaskGoal.apply_rewrite_gate({"fault_layer": "UNKNOWN", "rewrite_skill": True})
+        assert gated["fault_layer"] == "unknown" and gated["rewrite_skill"] is False
+        gated_ok = TaskGoal.apply_rewrite_gate(
+            {"fault_layer": "skill_code", "rewrite_skill": False}
+        )
+        assert gated_ok["fault_layer"] == "skill_code" and gated_ok["rewrite_skill"] is True
 
         # Universal request-item classification: path stems ≠ libraries / deps
         from jarvis.request_items import (
@@ -3739,6 +3752,192 @@ def run(context: dict) -> dict:
         print("  OK path artifact ≠ dependency — BUILD→TEST→EXECUTE→VERIFY")
     except Exception as exc:
         msg = f"E2E_PATH_NOT_DEP: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # Fault attribution: UNKNOWN must not auto-become skill_code / rewrite
+    print("  — e2e fault attribution (unknown ≠ skill_code rewrite) —")
+    try:
+        from jarvis.task_goal import TaskGoal as _TGFault
+        from jarvis.orchestrator import Orchestrator as _OrchFault
+
+        fa_root = root / "data" / "_e2e_fault_attr"
+        if fa_root.exists():
+            shutil.rmtree(fa_root)
+        fa_root.mkdir(parents=True)
+
+        class AmbiguousDiagnoseBrain(Brain):
+            """Returns unrecognized fault_layer — must not trigger skill rewrite."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.builds = 0
+                self.rewrites = 0
+
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": ["create"],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                return {
+                    "steps": ["build"],
+                    "can_reuse": [],
+                    "missing": [goal],
+                    "needs_research": False,
+                    "needs_new_skill": True,
+                    "skill_name": "fault_attr_skill",
+                    "skill_description": goal,
+                    "research_queries": [],
+                    "args": {"dest": "fault_attr.txt", "body": "FAULT_OK"},
+                    "required_args": ["dest", "body"],
+                }
+
+            def extract_task_args(
+                self, goal, skill_meta=None, prior_args=None, diagnosis=None
+            ):
+                return {"dest": "fault_attr.txt", "body": "FAULT_OK"}
+
+            def write_skill_code(
+                self,
+                skill_name,
+                description,
+                research,
+                previous_code=None,
+                error_log=None,
+                diagnosis=None,
+                failed_approaches=None,
+                test_plan=None,
+                **kwargs,
+            ) -> str:
+                self.builds += 1
+                if previous_code or diagnosis:
+                    self.rewrites += 1
+                # First build: process-ok but wrong content → VERIFY will fail.
+                # Ambiguous diagnose returns UNKNOWN — must NOT rewrite via skill_code default.
+                body = "WRONG" if self.builds == 1 else "FAULT_OK"
+                return f'''
+from pathlib import Path
+SKILL_META = {{
+    "name": "{skill_name}",
+    "description": {description!r},
+    "capabilities": ["write"],
+    "dependencies": [],
+    "version": {self.builds},
+    "required_args": ["dest", "body"],
+}}
+def run(context):
+    args = context.get("args") or {{}}
+    p = Path(context.get("workspace") or ".") / str(args.get("dest") or "x.txt")
+    p.write_text({body!r} + "\\n", encoding="utf-8")
+    return {{"ok": True, "result": {{"path": str(p)}}, "error": None, "evidence": "wrote"}}
+'''
+
+            def diagnose(self, observation, failed_approaches=None, prior_solutions=None):
+                # Intentionally unrecognized layer — must normalize to unknown, no rewrite
+                return {
+                    "root_cause": "ambiguous failure",
+                    "fault_layer": "COMPLETELY_UNKNOWN_LAYER",
+                    "rewrite_skill": True,  # must be forced False by gate
+                    "what_to_change": "should not rewrite",
+                    "approach": "mystery",
+                    "approach_changed": True,
+                    "needs_research": False,
+                    "missing_knowledge": [],
+                    "research_queries": [],
+                    "needs_new_deps": [],
+                    "missing_args": [],
+                    "required_args": ["dest", "body"],
+                    "suggested_args": {"dest": "fault_attr.txt", "body": "FAULT_OK"},
+                    "test_plan": "none",
+                    "expected_artifacts": ["fault_attr.txt"],
+                    "is_unfixable": False,
+                    "diagnosis": "unknown",
+                }
+
+            def verify_claim(self, goal, result, evidence) -> dict:
+                return {"achieved": True, "confidence": 0.5, "reason": "advisory"}
+
+            def converse(self, user_text, history=None) -> str:
+                return "ok"
+
+        # Unit: gate itself
+        g = _TGFault.apply_rewrite_gate(
+            {"fault_layer": "COMPLETELY_UNKNOWN_LAYER", "rewrite_skill": True}
+        )
+        assert g["fault_layer"] == "unknown" and g["rewrite_skill"] is False
+
+        brain_fa = AmbiguousDiagnoseBrain()
+        logs_fa: list[str] = []
+        orch_fa = _OrchFault(
+            root=fa_root,
+            brain=brain_fa,
+            on_log=lambda m: logs_fa.append(m),
+        )
+        # Patch deterministic diagnose to also return unknown (no VERIFY content evidence path)
+        # so brain.diagnose's UNKNOWN layer is what recovery sees after VERIFY fail.
+        # Actually VERIFY content fail will deterministic→skill_code. Force unknown via
+        # wrapping _observe_diagnose_enrich post-gate check instead: call diagnose path unit.
+        det = orch_fa._deterministic_diagnose(
+            {
+                "phase": "TEST",
+                "exception": "odd opaque failure without layer signals",
+                "traceback": "",
+                "context": {
+                    "args": {"dest": "fault_attr.txt", "body": "FAULT_OK"},
+                    "user_request": 'Create "fault_attr.txt" containing "FAULT_OK"',
+                },
+                "version": 1,
+            },
+            _TGFault.from_request('Create "fault_attr.txt" containing "FAULT_OK"'),
+        )
+        assert det.get("fault_layer") == "unknown", det
+        assert det.get("rewrite_skill") is False, det
+
+        # Brain diagnose returning garbage layer is gated
+        brain_diag = brain_fa.diagnose(
+            {
+                "phase": "VERIFY",
+                "exception": "opaque",
+                "context": {"args": {}, "user_request": "x"},
+                "goal": "x",
+            }
+        )
+        gated_brain = _TGFault.apply_rewrite_gate(brain_diag)
+        assert gated_brain["fault_layer"] == "unknown"
+        assert gated_brain["rewrite_skill"] is False
+
+        # Evidence path still allows skill_code rewrite
+        det_ev = orch_fa._deterministic_diagnose(
+            {
+                "phase": "VERIFY",
+                "exception": "content_constraint: 'FAULT_OK' missing from expected files",
+                "traceback": "",
+                "context": {
+                    "args": {"dest": "fault_attr.txt", "body": "FAULT_OK"},
+                    "user_request": 'Create "fault_attr.txt" containing "FAULT_OK"',
+                },
+                "version": 1,
+            },
+            _TGFault.from_request('Create "fault_attr.txt" containing "FAULT_OK"'),
+        )
+        assert det_ev.get("fault_layer") == "skill_code", det_ev
+        assert det_ev.get("rewrite_skill") is True, det_ev
+
+        orch_fa.close()
+        print("  OK fault attribution — unknown ≠ skill_code; evidence allows rewrite")
+    except Exception as exc:
+        msg = f"E2E_FAULT_ATTR: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)

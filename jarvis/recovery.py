@@ -256,8 +256,11 @@ class ProgressAwareRecovery:
         Research is allowed ONLY when diagnosis indicates a knowledge gap —
         never as a universal fallback for every VERIFY fail.
         """
-        layer = str(fault_layer or "skill_code")
-        prefer_coding = layer in ("skill_code",)
+        from jarvis.task_goal import TaskGoal
+
+        layer = TaskGoal.normalize_fault_layer(fault_layer)
+        # CODING rewrite only for evidence-backed skill_code — never unknown
+        prefer_coding = layer == "skill_code"
         same = [
             a for a in self.attempts if a.failure_signature == failure_signature
         ]

@@ -630,10 +630,8 @@ class ContextBuilder:
             )
         )
 
-        # Normalize any legacy layer the brain may have returned
-        layer_now = TaskGoal.normalize_fault_layer(
-            diagnosis.get("fault_layer") or "skill_code"
-        )
+        # Normalize any legacy layer — unknown stays unknown (never → skill_code)
+        layer_now = TaskGoal.normalize_fault_layer(diagnosis.get("fault_layer"))
 
         if no_constraints and not ctx_args:
             diagnosis["fault_layer"] = "goal_parsing"
@@ -661,6 +659,7 @@ class ContextBuilder:
                     "(no invented defaults) and retest"
                 )
         elif skill_default_fault:
+            # Evidence: skill used defaults / wrong artifact vs USER REQUEST
             diagnosis["fault_layer"] = "skill_code"
             diagnosis["rewrite_skill"] = True
         else:
@@ -668,21 +667,8 @@ class ContextBuilder:
             diagnosis["fault_layer"] = layer_now
             diagnosis["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(layer_now)
 
-        # Enforce rewrite_skill ONLY for skill_code
-        diagnosis["fault_layer"] = TaskGoal.normalize_fault_layer(
-            diagnosis.get("fault_layer")
-        )
-        diagnosis["rewrite_skill"] = TaskGoal.rewrite_skill_for_layer(
-            diagnosis["fault_layer"]
-        ) and bool(
-            diagnosis.get("rewrite_skill", True)
-            if diagnosis["fault_layer"] == "skill_code"
-            else False
-        )
-        if diagnosis["fault_layer"] == "skill_code":
-            diagnosis["rewrite_skill"] = True
-        else:
-            diagnosis["rewrite_skill"] = False
+        # Enforce rewrite_skill ONLY for evidence-backed skill_code
+        diagnosis = TaskGoal.apply_rewrite_gate(diagnosis)
 
         suggested = dict(diagnosis.get("suggested_args") or {})
         # Strip invented / ungrounded / polluted suggestions
