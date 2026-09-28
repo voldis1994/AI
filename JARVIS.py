@@ -5264,6 +5264,182 @@ def run(context):
         traceback.print_exc()
         errors.append(msg)
 
+    # 4z2) Goal-grounding — TaskContract sole truth across RESEARCH→RECOVERY
+    print("  — e2e goal-grounding (outcome queries / mismatch / wrong-tool ≠ progress) —")
+    try:
+        from jarvis.task_contract import TaskContract as _TGg
+        from jarvis.capability_match import (
+            evaluate_capability as _evc,
+            outcome_capability_mismatch as _ocm,
+        )
+        from jarvis.recovery import ProgressAwareRecovery as _PAR
+        from jarvis.knowledge_artifact import gap_fill_queries as _gfq
+        from jarvis.observer import Observer as _ObsG
+
+        # Unknown multi-step requests (no task-specific hardcode)
+        multi = [
+            'Apgūsti par sūnām un izveido sunas.txt ar "SUNA_OK"',
+            'Erforschen Moose und erstelle moose.md mit "MOOS"',
+            'Studia le api e crea api.txt con "API_OK", reply in English with 2 sentences',
+        ]
+        for req in multi:
+            cg = _TGg.from_request(req)
+            assert cg.original_request == req
+            assert cg.required_outcomes, req
+            # Research queries must be outcome-derived, not whole-request dump
+            qs = cg.default_research_queries()
+            assert qs, (req, qs)
+            assert req not in qs or len(qs) > 1 or cg.topical_anchor(), (req, qs)
+            # Whole free-form request must not be the sole ungrounded query
+            # when topical anchor / artifacts exist
+            if cg.artifacts or cg.topical_anchor():
+                assert not (len(qs) == 1 and qs[0] == req), (req, qs)
+            # Per-outcome queries stay on contract fields
+            for kind in cg.required_outcomes:
+                oq = cg.outcome_research_queries(kind)
+                for q in oq:
+                    assert cg.query_is_grounded(q), (req, kind, q)
+
+        # Capability: extension-only bait cannot REUSE
+        bait = {
+            "name": "generic_txt_writer",
+            "description": "writes txt files",
+            "capabilities": ["write file", "txt"],
+            "status": "ACTIVE",
+            "file_path": "",
+        }
+        tgt = _TGg.from_request(
+            'Create wetland_habitat.md containing "WETLAND_OK"'
+        )
+        assert not _evc(bait, tgt).get("compatible"), _evc(bait, tgt)
+        assert _ocm(bait, tgt) is True
+
+        # DIAGNOSE outcome↔capability mismatch
+        diag = Orchestrator._deterministic_diagnose(
+            {
+                "phase": "VERIFY",
+                "exception": "content_constraint: 'WETLAND_OK' missing from expected files",
+                "context": {
+                    "args": {"dest": "wetland_habitat.md", "body": "WETLAND_OK"},
+                    "skill": bait,
+                    "skill_path": "",
+                    "capabilities": bait["capabilities"],
+                },
+                "skill_name": "generic_txt_writer",
+                "version": 1,
+            },
+            tgt,
+        )
+        assert diag.get("fault_layer") == "capability_mismatch", diag
+        assert diag.get("rewrite_skill") is False, diag
+
+        # Wrong-tool artifacts ≠ recovery progress
+        prev = type("A", (), {})()  # unused — use RecoveryAttempt via record
+        from jarvis.recovery import RecoveryAttempt as _RA
+
+        prev_a = _RA(
+            fault_layer="skill_code",
+            failure_signature="sig1",
+            attempted_solution="rewrite",
+            model_used="offline",
+            result="fail",
+            artifacts=[{"path": "wrong.txt", "exists": True, "size": 3}],
+            verifier_failure={"reason": "missing wetland_habitat.md"},
+        )
+        assert (
+            _PAR.material_progress(
+                prev_a,
+                code_fingerprint="",
+                artifacts=[{"path": "other.txt", "exists": True, "size": 4}],
+                verifier_failure={"reason": "missing wetland_habitat.md"},
+                fault_layer="skill_code",
+                approach_fingerprint="alt",
+                contract=tgt,
+            )
+            is False
+        )
+        assert (
+            _PAR.material_progress(
+                prev_a,
+                code_fingerprint="",
+                artifacts=[
+                    {
+                        "path": "wetland_habitat.md",
+                        "exists": True,
+                        "size": 20,
+                        "preview": "WETLAND_OK",
+                    }
+                ],
+                verifier_failure={"reason": "ok"},
+                fault_layer="skill_code",
+                approach_fingerprint="fixed",
+                contract=tgt,
+            )
+            is True
+        )
+
+        # gap_fill / observer carry frozen contract
+        learn_c = _TGg.from_request("Learn about quantum entanglement basics")
+        gq = _gfq(
+            learn_c.original_request,
+            ["concepts", "examples"],
+            contract=learn_c,
+        )
+        assert gq and all(learn_c.query_is_grounded(q) or "quantum" in q.lower() for q in gq), gq
+        obs_root = root / "data" / "_e2e_goal_ground_obs"
+        obs_root.mkdir(parents=True, exist_ok=True)
+        obs = _ObsG(obs_root).observe_failure(
+            goal="stale goal string",
+            skill_name="x",
+            version=1,
+            phase="VERIFY",
+            skill_code="",
+            contract=tgt,
+            verification={"reason": "fail"},
+        )
+        assert obs.get("original_request") == tgt.original_request
+        assert "artifact" in (obs.get("required_outcomes") or [])
+        assert obs.get("expected_artifacts") == list(tgt.artifacts)
+
+        # Offline plan never remints a second contract
+        gg_root = root / "data" / "_e2e_goal_ground_plan"
+        if gg_root.exists():
+            shutil.rmtree(gg_root)
+        gg_root.mkdir(parents=True)
+
+        class _OffBrain(Brain):
+            def model_status(self) -> str:
+                return "OFFLINE"
+
+            def is_available(self) -> bool:
+                return False
+
+        orch_gg = Orchestrator(root=gg_root, brain=_OffBrain())
+        plan = orch_gg._offline_plan(tgt, [])
+        assert plan.get("research_queries") == tgt.default_research_queries()
+        assert plan.get("required_outcomes") == list(tgt.required_outcomes)
+        assert plan.get("subject") == tgt.subject
+        # Locked contract survives diagnose
+        locked = _TGg.validate(_TGg.understand(tgt.original_request, request_id="gg1"))
+        d2 = Orchestrator._deterministic_diagnose(
+            {
+                "phase": "VERIFY",
+                "exception": "content_constraint missing",
+                "context": {"args": {}, "skill": bait},
+                "skill_name": "generic_txt_writer",
+            },
+            locked,
+        )
+        assert locked.original_request == tgt.original_request
+        assert locked.request_id == "gg1"
+        orch_gg.close()
+        print("  OK goal-grounding — outcome queries / mismatch / wrong-tool ≠ progress")
+    except Exception as exc:
+        msg = f"E2E_GOAL_GROUNDING: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
     # 5) Orchestrator boots + conversation logs must not echo USER/JARVIS replies
     try:
         echoed: list[str] = []

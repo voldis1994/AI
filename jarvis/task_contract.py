@@ -84,6 +84,13 @@ _SUBJECT_STOP = {
     "jo", "ja", "ko", "kas", "kur", "kad", "tik", "tai", "tos", "tas",
     "šo", "so", "ti", "tu", "es", "mēs", "mes", "jūs", "jus",
     "example", "examples", "demo", "show", "how", "works", "working",
+    # Multilingual function words (not topical subjects)
+    "und", "mit", "dem", "der", "die", "das", "ein", "eine", "auch",
+    "con", "per", "una", "del", "della", "che", "les", "des", "une",
+    "pour", "dans", "sur", "aux", "las", "los", "por", "para", "como",
+    "que", "le", "la", "el", "il", "lo", "gli", "als", "vom", "zum",
+    "zur", "bei", "nach", "aus", "auf", "ist", "sind", "wird", "werden",
+    "reply", "response", "english", "sentences", "sentence",
 }
 
 # Canonical DIAGNOSE layers (legacy aliases accepted + normalized).
@@ -91,6 +98,7 @@ _SUBJECT_STOP = {
 FAULT_LAYERS = frozenset({
     "goal_parsing",
     "context_mapping",
+    "capability_mismatch",
     "skill_code",
     "execution",
     "environment",
@@ -101,6 +109,9 @@ _LEGACY_LAYER = {
     "context_args": "context_mapping",
     "test_harness": "execution",
     "dependency": "environment",
+    "capability": "capability_mismatch",
+    "wrong_tool": "capability_mismatch",
+    "wrong_capability": "capability_mismatch",
     "unknown": "unknown",
     "unrecognized": "unknown",
     "none": "unknown",
@@ -111,11 +122,18 @@ _LEGACY_LAYER = {
 # Action verbs used only to label high-level actions (not as args).
 _ACTION_VERBS = re.compile(
     r"(?i)\b(create|write|make|build|run|fetch|download|install|learn|"
-    r"research|execute|test|verify|izveido|uzraksti|palaid|iemācies|"
-    r"iemacies|paradi|parādi|summarize|summary|note|notes|"
+    r"study|research|execute|test|verify|izveido|uzraksti|palaid|"
+    r"iemācies|iemacies|apgūsti|apgūt|erforschen|studia|studiare|"
+    r"lernen|paradi|parādi|summarize|summary|note|notes|"
     r"say|print|tell|speak|announce|echo|return|compute|calculate|"
-    r"reverse|sort|saki|pasaki|izdrukā|atgriez|aprēķin)\b"
+    r"reverse|sort|saki|pasaki|izdrukā|atgriez|aprēķin|"
+    r"erstelle|crea|erzeuge)\b"
 )
+
+# Unicode-aware tokens (letters/digits/underscore) — keeps Latvian/German/… subjects intact.
+_TOKEN_3 = re.compile(r"[\w]{3,}", re.UNICODE)
+_TOKEN_2 = re.compile(r"[\w]{2,}", re.UNICODE)
+_LETTER_3 = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 
 # Communicative / output verbs → skill_output_contains (behavior, not workspace).
 _COMMUNICATIVE_RE = re.compile(
@@ -1577,7 +1595,7 @@ class TaskContract:
                 if art and art in phrase:
                     phrase = phrase.replace(art, " ")
             cleaned: list[str] = []
-            for tok in re.findall(r"[A-Za-z0-9_]{3,}", phrase):
+            for tok in _TOKEN_3.findall(phrase):
                 low = tok.lower()
                 if low in _SUBJECT_STOP:
                     continue
@@ -1595,15 +1613,15 @@ class TaskContract:
         for art in artifacts:
             exclude.add(str(art).lower())
             exclude.add(Path(str(art)).stem.lower())
-            for part in re.findall(r"[A-Za-z0-9_]{2,}", str(art)):
+            for part in _TOKEN_2.findall(str(art)):
                 exclude.add(part.lower())
         for c in content_requirements:
             exclude.add(str(c).lower())
-            for part in re.findall(r"[A-Za-z0-9_]{2,}", str(c)):
+            for part in _TOKEN_2.findall(str(c)):
                 exclude.add(part.lower())
         for src in content_source:
             exclude.add(str(src).lower())
-            for part in re.findall(r"[A-Za-z0-9_]{2,}", str(src)):
+            for part in _TOKEN_2.findall(str(src)):
                 if part.lower() not in ("http", "https", "www"):
                     exclude.add(part.lower())
         exclude.update(path_segment_tokens(req, artifacts))
@@ -1611,7 +1629,7 @@ class TaskContract:
             exclude.add(a.lower())
 
         tokens: list[str] = []
-        for tok in re.findall(r"[A-Za-z0-9_]{3,}", req):
+        for tok in _TOKEN_3.findall(req):
             low = tok.lower()
             if low in _SUBJECT_STOP or low in exclude:
                 continue
@@ -1967,7 +1985,7 @@ class TaskContract:
             return set()
         return {
             t.lower()
-            for t in re.findall(r"[A-Za-z0-9_]{3,}", anchor)
+            for t in _TOKEN_3.findall(anchor)
             if t.lower() not in _SUBJECT_STOP
         }
 
@@ -1978,10 +1996,14 @@ class TaskContract:
         Rejects queries that share only a single short token with a multi-token
         subject (classic polysemy drift) while inventing an unrelated domain.
         Soft relatedness alone is not enough when subject-token overlap is weak.
+
+        Queries that literally reuse locked artifact paths and/or content
+        requirements are grounded — those are outcome-derived, not drift.
         """
         q = (query or "").strip()
         if not q:
             return False
+        q_l = q.lower()
         # Whole query literally present in request/subject
         if q in (self.original_request or "") or (
             self.subject
@@ -1989,6 +2011,37 @@ class TaskContract:
             and q in self.subject
         ):
             return True
+
+        # Outcome-derived: locked artifact path(s) + content needle(s)
+        arts = [str(a) for a in (self.artifacts or ()) if str(a).strip()]
+        reqs = [
+            str(c) for c in (self.content_requirements or ()) if str(c).strip()
+        ]
+        art_hit = any(a.lower() in q_l for a in arts)
+        req_hit = any(c.lower() in q_l for c in reqs)
+        if art_hit and (req_hit or any(
+            k in q_l for k in ("containing", "produce", "create", "write")
+        )):
+            return True
+        if req_hit and art_hit:
+            return True
+
+        # Outcome-derived final_output / topical anchor + locked FOC fields
+        anchor = (self.topical_anchor() or "").strip()
+        foc = self.final_output_constraints or {}
+        foc_hit = False
+        if isinstance(foc, dict) and foc:
+            for k, v in foc.items():
+                if v in (None, "", [], {}):
+                    continue
+                if str(k).lower() in q_l or str(v).lower() in q_l:
+                    foc_hit = True
+                    break
+        if anchor and anchor.lower() in q_l:
+            if " " in anchor.strip() or len(anchor.split()) >= 2:
+                return True
+            if foc_hit or art_hit or req_hit:
+                return True
 
         subj = (
             self.subject
@@ -1999,13 +2052,13 @@ class TaskContract:
             src_l = str(src).lower()
             if src_l == "memory":
                 continue
-            if src and src_l in q.lower():
+            if src and src_l in q_l:
                 return True
 
         subj_tokens = self.subject_tokens()
         q_tokens = {
             t.lower()
-            for t in re.findall(r"[A-Za-z0-9_]{3,}", q)
+            for t in _TOKEN_3.findall(q)
             if t.lower() not in _SUBJECT_STOP
         }
         overlap = subj_tokens & q_tokens
@@ -2028,7 +2081,7 @@ class TaskContract:
         # unknown/ambiguous subject — require request-token overlap (not actions)
         req_tokens = {
             t.lower()
-            for t in re.findall(r"[A-Za-z0-9_]{3,}", self.original_request or "")
+            for t in _TOKEN_3.findall(self.original_request or "")
             if t.lower() not in _SUBJECT_STOP
         }
         actions = {a.lower() for a in self.actions}
@@ -2039,37 +2092,177 @@ class TaskContract:
         }
         if len(useful) >= 2:
             return True
+        # Single distinctive topical token from the request (e.g. multilingual subject)
+        if len(useful) == 1 and (art_hit or req_hit or self.topical_anchor()):
+            return True
         return False
 
-    def default_research_queries(self) -> list[str]:
-        """Regenerate queries strictly from TaskContract fields (no invented sense)."""
-        out: list[str] = []
-        subj = (
-            self.subject
-            if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
-            else ""
+    def topical_anchor(self) -> str:
+        """
+        Grounded topical phrase for RESEARCH — subject first, else distinctive
+        request tokens excluding artifacts/content/actions (no invented sense).
+        """
+        exclude: set[str] = set(_SUBJECT_STOP) | {a.lower() for a in self.actions}
+        # Structural / communicative fillers — not topical research anchors
+        exclude |= {
+            "txt", "md", "py", "json", "csv", "pdf", "html", "xml", "yml",
+            "yaml", "log", "dat", "tmp", "zip", "file", "files", "folder",
+            "directory", "path", "containing", "contain", "create", "write",
+            "learn", "research", "about", "with", "from", "into", "then",
+            "make", "save", "reply", "response", "sentences", "sentence",
+            "english", "latvian", "german", "french", "russian", "format",
+            "please", "using", "based", "also", "just", "only",
+            # Multilingual conjunctions / prepositions (not topical)
+            "und", "mit", "dem", "der", "die", "das", "ein", "eine",
+            "con", "per", "una", "del", "della", "che", "les", "des",
+            "une", "pour", "dans", "sur", "aux", "las", "los", "por",
+            "para", "como", "que",
+        }
+        if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS):
+            # Keep subject only when it still carries topical (non-filler) tokens
+            kept = [
+                t for t in _LETTER_3.findall(self.subject)
+                if t.lower() not in exclude
+            ]
+            if kept:
+                return " ".join(kept)
+        # Content needles are removed via quote masking — do NOT casefold them
+        # into exclude (quoted "MOSS" would erase topical word "moss").
+        req = self.original_request or ""
+        # Mask paths and quotes so extension/content tokens don't dominate
+        masked = re.sub(
+            r"[\w./\\-]+\.[A-Za-z0-9]{1,12}", " ", req, flags=re.UNICODE
         )
-        if subj:
-            out.append(subj)
-            if self.content_requirements:
-                out.append(f"{subj} {' '.join(self.content_requirements[:2])}")
-        for src in self.content_source[:2]:
-            if str(src).lower() == "memory":
+        masked = re.sub(r"[\"'][^\"']+[\"']", " ", masked)
+        toks: list[str] = []
+        for t in _LETTER_3.findall(masked):
+            low = t.lower()
+            if low in exclude or low in toks:
                 continue
+            toks.append(low)
+            if len(toks) >= 6:
+                break
+        if toks:
+            return " ".join(toks)
+        # Fall back: artifact stem if it also appears as a bare word in request
+        for a in self.artifacts or ():
+            stem = Path(str(a)).stem.lower()
+            if (
+                stem
+                and stem not in exclude
+                and re.search(rf"\b{re.escape(stem)}\b", masked, re.I)
+            ):
+                return stem
+        return ""
+
+    def outcome_research_queries(self, outcome: str) -> list[str]:
+        """
+        Research queries for ONE required outcome — not the whole request blob.
+
+        Derived only from locked TaskContract fields for that outcome kind.
+        """
+        kind = str(outcome or "").strip().lower()
+        out: list[str] = []
+        subj = self.topical_anchor()
+        arts = [str(a) for a in (self.artifacts or ()) if str(a).strip()]
+        behs = [
+            b for b in (self.behaviors or ())
+            if isinstance(b, dict) and b.get("kind") and b.get("target")
+        ]
+        reqs = [str(c) for c in (self.content_requirements or ()) if str(c).strip()]
+
+        if kind in ("learning", "research", "knowledge"):
             if subj:
-                out.append(f"{subj} {src}")
-            else:
-                out.append(str(src))
-        if not out:
-            # Fall back to full immutable request — never invent a topic
-            out = [self.original_request]
-        # Dedupe
+                out.append(subj)
+            # Learning queries must NOT collapse to artifact content needles
+        elif kind in ("artifact", "execution", "capability", "test"):
+            # Capability/build research: how to produce the locked artifacts/behaviors
+            if arts and subj:
+                out.append(f"{subj} produce {' '.join(arts[:2])}")
+            elif arts:
+                out.append(f"create {' '.join(arts[:2])}")
+            for b in behs[:2]:
+                tgt = str(b.get("target") or "").strip()
+                if tgt:
+                    out.append(
+                        f"{subj} {b.get('kind')} {tgt}".strip()
+                        if subj
+                        else f"{b.get('kind')} {tgt}"
+                    )
+            if reqs and arts:
+                out.append(f"{' '.join(arts[:1])} containing {' '.join(reqs[:2])}")
+        elif kind in ("side_effect",):
+            for src in self.content_source[:2]:
+                if str(src).lower() != "memory":
+                    out.append(str(src))
+        elif kind in ("final_output", "conversation"):
+            foc = self.final_output_constraints or {}
+            if foc:
+                bits = [f"{k}={v}" for k, v in foc.items() if v not in (None, "", [], {})]
+                if bits:
+                    out.append(
+                        f"{subj} response {' '.join(bits)}".strip()
+                        if subj
+                        else f"response {' '.join(bits)}"
+                    )
+
+        # Never invent — if outcome had no grounded anchors, fall back to subject only
+        if not out and subj:
+            out = [subj]
         seen: list[str] = []
         for q in out:
             q = " ".join(str(q).split())
             if q and q not in seen:
                 seen.append(q)
-        return seen[:6]
+        return seen[:4]
+
+    def default_research_queries(self) -> list[str]:
+        """
+        Research queries strictly from locked TaskContract outcomes/fields.
+
+        Prefer per-outcome queries over dumping the whole original_request.
+        """
+        out: list[str] = []
+        outcomes = list(self.required_outcomes or ())
+        # Prefer research/learning first, then artifact/execution capability work
+        order = (
+            "learning",
+            "research",
+            "artifact",
+            "execution",
+            "capability",
+            "side_effect",
+            "final_output",
+        )
+        ranked = [o for o in order if o in outcomes] + [
+            o for o in outcomes if o not in order
+        ]
+        for kind in ranked:
+            for q in self.outcome_research_queries(kind):
+                if q not in out:
+                    out.append(q)
+            if len(out) >= 6:
+                break
+        if not out:
+            subj = (
+                self.subject
+                if self.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+                else ""
+            )
+            if subj:
+                out = [subj]
+            elif self.content_requirements:
+                out = [" ".join(str(c) for c in self.content_requirements[:3])]
+            else:
+                # Last resort — immutable request (never invent a topic)
+                out = [self.original_request]
+        for src in self.content_source[:2]:
+            if str(src).lower() == "memory":
+                continue
+            s = str(src).strip()
+            if s and s not in out:
+                out.append(s)
+        return out[:6]
 
     def ground_research_queries(
         self,

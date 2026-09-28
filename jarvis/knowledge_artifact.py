@@ -381,31 +381,76 @@ def synthesize_offline(
     return art
 
 
-def gap_fill_queries(user_request: str, gaps: list[str]) -> list[str]:
-    """Targeted queries for missing artifact fields only (not a full restart)."""
+def gap_fill_queries(
+    user_request: str,
+    gaps: list[str],
+    *,
+    contract: Any = None,
+) -> list[str]:
+    """
+    Targeted queries for missing KnowledgeArtifact fields only.
+
+    Prefer locked TaskContract subject / content_requirements / outcome
+    queries over dumping the whole USER REQUEST as a research blob.
+    """
+    anchor = ""
+    outcome_qs: list[str] = []
+    if contract is not None:
+        try:
+            subj = str(getattr(contract, "subject", "") or "")
+            if subj and subj not in ("", "unknown", "ambiguous"):
+                anchor = subj
+            reqs = list(getattr(contract, "content_requirements", ()) or ())
+            if not anchor and reqs:
+                anchor = " ".join(str(r) for r in reqs[:3])
+            # Prefer learning/research outcome queries when present
+            for kind in ("learning", "research"):
+                if hasattr(contract, "requires") and contract.requires(kind):
+                    outcome_qs.extend(
+                        list(contract.outcome_research_queries(kind) or [])
+                    )
+            if not outcome_qs and hasattr(contract, "default_research_queries"):
+                outcome_qs = list(contract.default_research_queries() or [])
+        except Exception:
+            anchor = ""
+    if not anchor:
+        anchor = (user_request or "").strip()
+
     queries: list[str] = []
     for g in gaps:
         g = str(g)
         if g in ("concepts", "knowledge_substance", "summary", "explanations"):
-            queries.append(f"{user_request} — core concepts and clear explanation")
+            queries.append(f"{anchor} — core concepts and clear explanation")
         elif g in ("examples",):
-            queries.append(f"{user_request} — worked examples and illustrations")
+            queries.append(f"{anchor} — worked examples and illustrations")
         elif g in ("practice",):
-            queries.append(f"{user_request} — practice questions for self-check")
+            queries.append(f"{anchor} — practice questions for self-check")
         elif g in ("practical_result",):
-            queries.append(f"{user_request} — concrete answer / worked result")
+            queries.append(f"{anchor} — concrete answer / worked result")
         elif g == "contamination":
-            queries.append(f"{user_request} — clean conceptual overview")
+            queries.append(f"{anchor} — clean conceptual overview")
         elif g not in ("goal_coverage", "knowledge_sources", "no_skill_inherit"):
-            queries.append(f"{user_request} — fill gap: {g}")
-    # Dedupe
+            queries.append(f"{anchor} — fill gap: {g}")
+    # Prepend contract outcome queries (grounded)
+    for q in outcome_qs:
+        q = " ".join(str(q).split())
+        if q and q not in queries:
+            queries.insert(0, q)
     out: list[str] = []
     for q in queries:
         q = " ".join(q.split())
         if q and q not in out:
             out.append(q)
     if not out:
-        out = [f"{user_request} — deepen understanding"]
+        out = [f"{anchor} — deepen understanding"] if anchor else []
+    # Ground against contract when available
+    if contract is not None and hasattr(contract, "ground_research_queries"):
+        try:
+            grounded = contract.ground_research_queries(out)
+            if grounded:
+                return grounded[:5]
+        except Exception:
+            pass
     return out[:5]
 
 
