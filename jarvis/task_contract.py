@@ -30,7 +30,7 @@ _INVENTED_RE = re.compile(
     r"(?i)\b(?:user[_-]?provided(?:[_-]?\w+)?|"
     r"default(?:[_-]?(?:path|file|name|content|value|dir|output))?|"
     r"placeholder|changeme|your[_-]?name|todo|tbd|xxx+|dummy|"
-    r"sample[_-]?(?:path|file)?|example[_-]?(?:path|file)?|"
+    r"sample(?:[_-]?(?:path|file))|example(?:[_-]?(?:path|file))|"
     r"temp[_-]?file|untitled)\b"
 )
 
@@ -283,53 +283,113 @@ class TaskContract:
         args: Optional[dict[str, Any]] = None,
         skill_meta: Optional[dict[str, Any]] = None,
         capability_requirements: Optional[tuple[str, ...] | list[str]] = None,
+        brain: Any = None,
     ) -> "TaskContract":
         """
-        UNDERSTAND — derive structured contract fields from the USER REQUEST.
+        UNDERSTAND — semantic contract fields from the USER REQUEST.
 
-        Does not invent requirements. Optional model-assisted args must be
-        grounded in the request (enforced by sanitize_args).
+        Semantics come from the model (``brain.understand_contract``) or a
+        universal offline literal/structure draft. Deterministic code only
+        grounds and validates the draft — it is not the primary semantics
+        generator and must not invent task-specific requirements.
         """
         import uuid
 
+        from jarvis.contract_semantics import (
+            ground_semantic_draft,
+            offline_semantic_draft,
+        )
+
         req = (original_request or "").strip()
         rid = (request_id or uuid.uuid4().hex[:12]).strip()
-        intent_s = (intent or "task").strip() or "task"
         grounded = cls.sanitize_args(args or {}, req, skill_meta=skill_meta)
-        constraints = cls.derive_constraints(req, grounded)
-        artifacts = cls._derive_artifacts(constraints)
-        content_reqs = cls._derive_content_requirements(constraints)
-        content_source = cls._derive_content_source(req, constraints)
-        subject = cls._derive_subject(req, artifacts, content_reqs, content_source)
-        constraints = cls._attach_checks(constraints, req)
-        actions = cls._derive_actions(req)
-        acceptance = cls._derive_success_criteria(constraints, req)
-        plan = cls._verification_plan_from_constraints(constraints, acceptance)
-        behaviors = cls._behaviors_from_plan(plan)
-        outcomes = cls._desired_outcomes(
-            artifacts, behaviors, content_reqs, acceptance
+
+        draft: dict[str, Any] = {}
+        if brain is not None and hasattr(brain, "understand_contract"):
+            try:
+                draft = brain.understand_contract(req, prior_args=grounded) or {}
+            except Exception:
+                draft = {}
+        if not isinstance(draft, dict) or not draft:
+            draft = offline_semantic_draft(req, grounded)
+
+        grounded_draft = ground_semantic_draft(draft, req)
+        if intent:
+            grounded_draft["intent"] = (intent or "task").strip() or "task"
+
+        cons = dict(grounded_draft.get("constraints") or {})
+        cons.setdefault("check_process", True)
+        cons.setdefault("source", "task_contract_semantic")
+        # Ensure checks exist for VERIFY
+        if not cons.get("checks"):
+            cons["checks"] = list(grounded_draft.get("verification_plan") or [])
+
+        acceptance = tuple(
+            str(x) for x in (grounded_draft.get("acceptance_criteria") or []) if str(x).strip()
+        ) or ("needs_refine",)
+        if acceptance == ("needs_refine",) and not cons.get("checks"):
+            # Explicitly unverifiable semantic result
+            pass
+        elif acceptance == ("needs_refine",):
+            acceptance = cls._derive_success_criteria(cons, req)
+
+        plan = tuple(
+            dict(x)
+            for x in (grounded_draft.get("verification_plan") or cons.get("checks") or [])
+            if isinstance(x, dict) and x.get("kind") and x.get("target")
         )
-        outputs = cls._derive_outputs(artifacts, behaviors)
-        side_effects = cls._derive_side_effects(constraints, actions)
+        behaviors = tuple(
+            dict(b)
+            for b in (grounded_draft.get("behaviors") or [])
+            if isinstance(b, dict) and b.get("kind") and b.get("target")
+        )
+        artifacts = tuple(
+            str(a) for a in (grounded_draft.get("artifacts") or []) if str(a).strip()
+        )
+        outcomes = tuple(
+            str(o) for o in (grounded_draft.get("desired_outcomes") or []) if str(o).strip()
+        )
+        if not outcomes and acceptance and acceptance != ("needs_refine",):
+            outcomes = cls._desired_outcomes(
+                artifacts,
+                behaviors,
+                tuple(grounded_draft.get("content_requirements") or ()),
+                acceptance,
+            )
+
         return cls(
             request_id=rid,
             original_request=req,
-            intent=intent_s,
+            intent=str(grounded_draft.get("intent") or intent or "task").strip() or "task",
             desired_outcomes=outcomes,
             artifacts=artifacts,
             behaviors=behaviors,
-            constraints=constraints,
-            inputs=dict(grounded),
-            outputs=outputs,
-            side_effects=side_effects,
+            constraints=cons,
+            inputs=dict(grounded_draft.get("inputs") or grounded),
+            outputs=tuple(
+                str(o) for o in (grounded_draft.get("outputs") or []) if str(o).strip()
+            ),
+            side_effects=tuple(
+                str(s) for s in (grounded_draft.get("side_effects") or []) if str(s).strip()
+            ),
             acceptance_criteria=acceptance,
             verification_plan=plan,
             capability_requirements=tuple(capability_requirements or ()),
             validated=False,
-            subject=subject,
-            actions=actions,
-            content_source=content_source,
-            content_requirements=content_reqs,
+            subject=str(grounded_draft.get("subject") or SUBJECT_UNKNOWN),
+            actions=tuple(
+                str(a).lower()
+                for a in (grounded_draft.get("actions") or [])
+                if str(a).strip()
+            ),
+            content_source=tuple(
+                str(s) for s in (grounded_draft.get("content_source") or []) if str(s).strip()
+            ),
+            content_requirements=tuple(
+                str(c)
+                for c in (grounded_draft.get("content_requirements") or [])
+                if str(c).strip()
+            ),
         )
 
     @classmethod
@@ -403,9 +463,9 @@ class TaskContract:
         intent: Optional[str] = None,
         capability_requirements: Optional[tuple[str, ...] | list[str]] = None,
         auto_validate: bool = True,
+        brain: Any = None,
     ) -> "TaskContract":
         """UNDERSTAND (+ VALIDATE by default) — single entry for building a contract."""
-        # ``goal`` accepted only as intent hint when intent omitted (not a 2nd truth).
         intent_s = intent or ("task" if not goal else "task")
         contract = cls.understand(
             original_request if original_request is not None else (goal or ""),
@@ -414,10 +474,52 @@ class TaskContract:
             args=args,
             skill_meta=skill_meta,
             capability_requirements=capability_requirements,
+            brain=brain,
         )
         if auto_validate:
             return cls.validate(contract)
         return contract
+
+    def constraints_for_verify(
+        self, args: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        """
+        Frozen verification view of constraints.
+
+        Does NOT re-interpret original_request. Optionally overlays grounded
+        input values onto already-locked file specs (path/contains) when the
+        input is request-grounded and matches a locked artifact/needle.
+        """
+        out = dict(self.constraints or {})
+        out["checks"] = [
+            dict(ch) for ch in (self.verification_plan or out.get("checks") or [])
+            if isinstance(ch, dict)
+        ]
+        if not args:
+            return out
+        grounded = self.sanitize_args(args, self.original_request)
+        files = [dict(f) for f in (out.get("files") or []) if isinstance(f, dict)]
+        art_set = {str(a).lower() for a in self.artifacts}
+        for f in files:
+            p = str(f.get("path") or "")
+            for key in ("path", "dest", "file", "output", "filepath"):
+                cand = grounded.get(key)
+                if cand and self.is_grounded(cand, self.original_request):
+                    if p.lower() == str(cand).lower() or Path(p).name.lower() == Path(
+                        str(cand)
+                    ).name.lower() or str(cand).lower() in art_set:
+                        f["path"] = str(cand)
+            for key in ("content", "body", "text", "contains"):
+                cand = grounded.get(key)
+                if cand is not None and self.is_grounded(cand, self.original_request):
+                    if f.get("contains") is None or str(f.get("contains")) == str(cand):
+                        if any(
+                            str(cand) == str(x)
+                            for x in self.content_requirements
+                        ) or str(cand) in self.original_request:
+                            f["contains"] = str(cand)
+        out["files"] = files
+        return out
 
     def with_inputs(
         self,
@@ -425,74 +527,75 @@ class TaskContract:
         skill_meta: Optional[dict[str, Any]] = None,
     ) -> "TaskContract":
         """
-        Refresh grounded inputs/constraints without rewriting locked fields.
+        Refresh grounded inputs without rewriting locked truth fields.
 
         If ``validated``, original_request / desired_outcomes / acceptance_criteria
-        stay exactly as validated. New acceptance strings are ignored.
+        and verification_plan stay exactly as validated. Constraints used for
+        VERIFY overlay inputs onto the frozen plan — no request re-parse.
         """
         grounded = self.sanitize_args(
             args or {}, self.original_request, skill_meta=skill_meta
         )
-        # Merge prior inputs (request-grounded only)
         merged = dict(self.inputs or {})
         merged.update(grounded)
         merged = self.sanitize_args(merged, self.original_request, skill_meta=skill_meta)
 
-        constraints = self.derive_constraints(self.original_request, merged)
-        artifacts = self._derive_artifacts(constraints)
-        content_reqs = self._derive_content_requirements(constraints)
-        content_source = self._derive_content_source(self.original_request, constraints)
-        if self.subject in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS):
-            subject = self._derive_subject(
-                self.original_request, artifacts, content_reqs, content_source
-            )
-        else:
-            subject = self.subject
-        constraints = self._attach_checks(constraints, self.original_request)
-        new_acceptance = self._derive_success_criteria(
-            constraints, self.original_request
-        )
-        new_plan = self._verification_plan_from_constraints(constraints, new_acceptance)
-        new_behaviors = self._behaviors_from_plan(new_plan)
-
         if self.validated:
-            # Lock: never rewrite original_request / desired_outcomes / acceptance
-            acceptance = self.acceptance_criteria
-            outcomes = self.desired_outcomes
-            behaviors = self.behaviors or new_behaviors
-            # verification_plan may gain how-details for same criteria targets only
-            plan = self._filter_plan_to_acceptance(new_plan, acceptance)
-            if not plan:
-                plan = self.verification_plan
-        else:
-            acceptance = new_acceptance
-            behaviors = new_behaviors
-            outcomes = self._desired_outcomes(
-                artifacts, behaviors, content_reqs, acceptance
+            cons = self.constraints_for_verify(merged)
+            return TaskContract(
+                request_id=self.request_id,
+                original_request=self.original_request,
+                intent=self.intent,
+                desired_outcomes=self.desired_outcomes,
+                artifacts=self.artifacts,
+                behaviors=self.behaviors,
+                constraints=cons,
+                inputs=merged,
+                outputs=self.outputs,
+                side_effects=self.side_effects,
+                acceptance_criteria=self.acceptance_criteria,
+                verification_plan=self.verification_plan,
+                capability_requirements=self.capability_requirements,
+                validated=True,
+                subject=self.subject,
+                actions=self.actions,
+                content_source=self.content_source,
+                content_requirements=self.content_requirements,
             )
-            plan = new_plan
 
+        # Not yet validated — allow semantic refresh from grounded inputs
+        refreshed = self.understand(
+            self.original_request,
+            request_id=self.request_id,
+            intent=self.intent,
+            args=merged,
+            skill_meta=skill_meta,
+            capability_requirements=self.capability_requirements,
+        )
         return TaskContract(
             request_id=self.request_id,
             original_request=self.original_request,
-            intent=self.intent,
-            desired_outcomes=outcomes,
-            artifacts=artifacts or self.artifacts,
-            behaviors=behaviors,
-            constraints=constraints,
+            intent=refreshed.intent,
+            desired_outcomes=refreshed.desired_outcomes,
+            artifacts=refreshed.artifacts or self.artifacts,
+            behaviors=refreshed.behaviors,
+            constraints=refreshed.constraints,
             inputs=merged,
-            outputs=self._derive_outputs(artifacts or self.artifacts, behaviors),
-            side_effects=self._derive_side_effects(
-                constraints, self.actions or self._derive_actions(self.original_request)
-            ),
-            acceptance_criteria=acceptance,
-            verification_plan=plan,
+            outputs=refreshed.outputs,
+            side_effects=refreshed.side_effects,
+            acceptance_criteria=refreshed.acceptance_criteria,
+            verification_plan=refreshed.verification_plan,
             capability_requirements=self.capability_requirements,
-            validated=self.validated,
-            subject=subject,
-            actions=self.actions or self._derive_actions(self.original_request),
-            content_source=content_source or self.content_source,
-            content_requirements=content_reqs or self.content_requirements,
+            validated=False,
+            subject=(
+                refreshed.subject
+                if refreshed.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+                else self.subject
+            ),
+            actions=refreshed.actions or self.actions,
+            content_source=refreshed.content_source or self.content_source,
+            content_requirements=refreshed.content_requirements
+            or self.content_requirements,
         )
 
     # Prefer with_inputs; keep name used by context/orchestrator call sites.
@@ -617,6 +720,7 @@ class TaskContract:
             intent=contract.intent,
             args=grounded,
             capability_requirements=contract.capability_requirements,
+            brain=brain,
         )
         if (
             refined.subject in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)

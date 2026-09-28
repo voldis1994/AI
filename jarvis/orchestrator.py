@@ -52,6 +52,8 @@ from jarvis.invariants import (
     assert_build_allowed,
     assert_done_requires_verify,
     assert_locked_truth,
+    assert_requests_isolated,
+    prior_request_isolation,
 )
 from jarvis.runtime_fingerprint import fingerprint_line
 from jarvis.capability_match import (
@@ -114,6 +116,7 @@ class Orchestrator:
         self.on_event = on_event or (lambda _k, _p: None)
         # Isolates the in-flight USER REQUEST (never share final_result across turns)
         self._active_request_id: Optional[str] = None
+        self._prev_request_id: Optional[str] = None
 
         db = self.data_dir / "jarvis.db"
         self.brain = brain or Brain(on_log=self._log)
@@ -221,8 +224,21 @@ class Orchestrator:
                 "request_id": request_id,
             }
 
+        # Hard isolation — never reuse a prior request_id / result bundle
+        try:
+            assert_requests_isolated(self._prev_request_id, request_id)
+        except InvariantError as inv:
+            self._log(f"INVARIANT: {inv}")
+            request_id = uuid.uuid4().hex[:12]
+            assert_requests_isolated(self._prev_request_id, request_id)
+        if not prior_request_isolation(self._prev_request_id, request_id):
+            raise InvariantError(
+                f"request isolation failed prev={self._prev_request_id} new={request_id}"
+            )
+
         # Per-request state — do not read/write cross-request result caches
         self._active_request_id = request_id
+        self._verified_exec_bundle = None
         self._request_cache = {}
         self.perf = PerfTracker(request_id)
         set_active_tracker(self.perf)
@@ -500,11 +516,14 @@ class Orchestrator:
             out["success"] = success
         if extra:
             out.update(extra)
+        # Record prior id for isolation checks on the next request
+        self._prev_request_id = request_id
         # Clear active id only if we still own the turn
         if getattr(self, "_active_request_id", None) == request_id:
             self._active_request_id = None
             set_active_tracker(None)
             self._request_cache = {}
+            self._verified_exec_bundle = None
             if hasattr(self.brain, "end_request_pool"):
                 try:
                     pool_ctx = self.brain.end_request_pool()
@@ -1580,6 +1599,7 @@ class Orchestrator:
                 user_request,
                 request_id=task_id,
                 intent="task",
+                brain=self.brain,
             )
             goal = contract.original_request
             self._log(

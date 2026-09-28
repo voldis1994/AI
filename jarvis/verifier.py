@@ -104,11 +104,12 @@ class Verifier:
         result = sr.get("result")
         evidence = str(sr.get("evidence") or "")
 
-        # Constraints from TaskContract / USER REQUEST only. Skill result is not a source.
+        # Constraints from immutable TaskContract only — never re-parse USER REQUEST
+        # when a contract is provided. Skill result is not a source of expectations.
         if constraints:
             built = constraints
         elif contract is not None:
-            built = contract.with_args(task_args).constraints
+            built = contract.constraints_for_verify(task_args)
         else:
             built = self.extract_constraints(request, task_args)
         if expect and constraints is None and contract is None and args is None:
@@ -221,11 +222,20 @@ class Verifier:
             ok, detail = self._check_http(spec)
             checks.append({"name": "http", "ok": ok, "detail": detail})
 
-        # ── TaskContract success_criteria (independent of skill self-claims) ──
+        # ── Immutable acceptance_criteria / verification_plan vs observations ──
+        # When TaskContract is present, do not rebuild criteria from the request.
         criteria = []
         if contract is not None:
             criteria = list(contract.acceptance_criteria or ())
-        if not criteria and isinstance(built.get("checks"), list):
+            if not criteria:
+                for ch in contract.verification_plan or ():
+                    if isinstance(ch, dict) and ch.get("kind") and ch.get("target"):
+                        how = ch.get("how") or ""
+                        criteria.append(
+                            f"{ch['kind']}:{ch['target']}"
+                            + (f"@{how}" if how else "")
+                        )
+        elif isinstance(built.get("checks"), list):
             for ch in built["checks"]:
                 if isinstance(ch, dict) and ch.get("kind") and ch.get("target"):
                     how = ch.get("how") or ""
@@ -380,14 +390,21 @@ class Verifier:
         args: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
-        Build verification constraints from the USER REQUEST + grounded args.
+        Legacy constraint extract when no TaskContract is supplied.
 
-        Delegates to TaskContract.derive_constraints so VERIFY never invents file
-        checks from random sentence tokens. Does not read skill results.
+        Prefer ``contract=`` so VERIFY uses immutable acceptance_criteria.
+        Uses grounded offline semantic draft — does not invent requirements.
         """
+        from jarvis.contract_semantics import (
+            ground_semantic_draft,
+            offline_semantic_draft,
+        )
+
         grounded = TaskContract.ground_args(dict(args or {}), request or "")
-        cons = TaskContract.derive_constraints(request or "", grounded)
-        return TaskContract._attach_checks(cons, request or "")
+        draft = ground_semantic_draft(
+            offline_semantic_draft(request or "", grounded), request or ""
+        )
+        return dict(draft.get("constraints") or {})
 
     def _check_success_criterion(
         self,

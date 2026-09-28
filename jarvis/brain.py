@@ -629,6 +629,73 @@ class Brain:
             "required_args": [],
         })
 
+    def understand_contract(
+        self,
+        original_request: str,
+        *,
+        prior_args: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """
+        Semantic UNDERSTAND — model proposes TaskContract fields from USER REQUEST.
+
+        Deterministic code must ground this draft afterward. Never invent values
+        absent from the request. Works for previously unseen tasks / languages.
+        """
+        system = (
+            "You are JARVIS UNDERSTAND. Parse the USER REQUEST into a structured "
+            "TaskContract draft. Reply ONLY with JSON:\n"
+            "{\n"
+            '  "intent": "task|learning|conversation",\n'
+            '  "desired_outcomes": ["artifact:path|content:X|behavior:kind:target|http:url"],\n'
+            '  "artifacts": ["filename_or_path"],\n'
+            '  "behaviors": [{"kind":"skill_output_contains|skill_result_equals|skill_result_type",'
+            '"target":"...","how":"skill_stdout_or_result|skill_result"}],\n'
+            '  "constraints": {"files":[{"path":"...","contains":"...","min_bytes":1}],'
+            '"directories":[],"http":[{"url":"..."}],"must_contain":[],"imports":[]},\n'
+            '  "inputs": {},\n'
+            '  "outputs": ["..."],\n'
+            '  "side_effects": ["filesystem_write|network_http|..."],\n'
+            '  "acceptance_criteria": ["kind:target@how"],\n'
+            '  "verification_plan": [{"kind":"...","target":"...","how":"..."}],\n'
+            '  "subject": "topic words from request or unknown",\n'
+            '  "actions": ["surface verbs from request"],\n'
+            '  "content_source": ["urls or memory if named"],\n'
+            '  "content_requirements": ["payloads that must appear"]\n'
+            "}\n"
+            "Rules:\n"
+            "- ONLY use values that literally appear in USER REQUEST "
+            "(or are strict arithmetic/reverse/sort results of literals in it).\n"
+            "- Never invent filenames, URLs, or content the user did not ask for.\n"
+            "- Prefer checkable acceptance_criteria (artifact_exists, content_present, "
+            "http_ok, skill_output_contains, skill_result_equals, skill_result_type).\n"
+            "- If the request is too vague to verify, return empty "
+            "acceptance_criteria and desired_outcomes.\n"
+            "- Language-agnostic: handle any natural language.\n"
+            "- No task-specific hardcoding."
+        )
+        payload = {
+            "original_request": original_request,
+            "prior_args": prior_args or {},
+        }
+        if not self.is_available():
+            from jarvis.contract_semantics import offline_semantic_draft
+
+            return offline_semantic_draft(original_request, prior_args)
+        raw = self.generate(
+            json.dumps(payload, ensure_ascii=False, default=str)[:8000],
+            system=system,
+            temperature=0.1,
+            work="plan",
+            allow_escalate=True,
+            expect_json=True,
+        )
+        parsed = self._parse_json(raw, {})
+        if not isinstance(parsed, dict) or not parsed:
+            from jarvis.contract_semantics import offline_semantic_draft
+
+            return offline_semantic_draft(original_request, prior_args)
+        return parsed
+
     def extract_task_args(
         self,
         goal: str,

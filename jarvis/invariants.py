@@ -117,10 +117,32 @@ def assert_dependency_structured(
     )
 
 
-def prior_request_isolation(prev_request_id: Optional[str], new_request_id: str) -> bool:
-    """Previous request results must not bleed into a new request_id."""
-    if not new_request_id:
+def prior_request_isolation(
+    prev_request_id: Optional[str], new_request_id: str
+) -> bool:
+    """
+    True when the new request is isolated from any prior request.
+
+    Rules:
+    - ``new_request_id`` must be non-empty
+    - if a prior id exists, it must differ (same id ⇒ NOT isolated)
+    - if there is no prior id, the first request is isolated by definition
+    """
+    new_id = str(new_request_id or "").strip()
+    if not new_id:
         return False
-    if prev_request_id and prev_request_id == new_request_id:
+    prev_id = str(prev_request_id or "").strip()
+    if not prev_id:
         return True
-    return prev_request_id != new_request_id
+    return prev_id != new_id
+
+
+def assert_requests_isolated(
+    prev_request_id: Optional[str], new_request_id: str
+) -> None:
+    """Raise if a new request would reuse a prior request_id."""
+    if not prior_request_isolation(prev_request_id, new_request_id):
+        raise InvariantError(
+            "request isolation violated — "
+            f"prev={prev_request_id!r} new={new_request_id!r}"
+        )

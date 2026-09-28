@@ -843,13 +843,16 @@ def run(context: dict) -> dict:
         assert any(s.startswith("http_ok:") for s in tg_http.acceptance_criteria), (
             tg_http.acceptance_criteria
         )
-        # Semantic behavior criteria — communicative request without path/URL/args
-        tg_say = TaskContract.from_request("Say hello politely to the room")
+        # Semantic UNDERSTAND — quoted payload (model/offline draft, not verb tables)
+        tg_say = TaskContract.from_request('Say "hello" politely to the room')
         assert tg_say.is_verifiable(), tg_say.to_dict()
         assert any(
             s.startswith("skill_output_contains:hello") for s in tg_say.acceptance_criteria
         ), tg_say.acceptance_criteria
         assert "needs_refine" not in tg_say.acceptance_criteria
+        # Unquoted communicative text without grounded literals → needs_refine offline;
+        # model UNDERSTAND fills it when available (see FakeSemanticBrain below).
+        assert TaskContract.from_request("Say hello politely to the room").needs_refine()
         tg_say_r = TaskContract.refine(tg_say)
         assert tg_say_r.is_verifiable(), tg_say_r.acceptance_criteria
         # VERIFY checks real skill stdout/result — not evidence self-proof
@@ -880,6 +883,35 @@ def run(context: dict) -> dict:
             contract=tg_say_r,
         )
         assert not say_fail.get("verified"), say_fail
+        # VERIFY must use frozen contract — not re-interpret a mutated request string
+        frozen = TaskContract.validate(
+            TaskContract.understand('Create freeze.txt containing "Z"')
+        )
+        assert frozen.validated
+        wrong_goal = "Create other.txt containing NEVER"
+        freeze_ok = soft_v.verify(
+            wrong_goal,  # deliberately wrong goal string
+            {
+                "ok": True,
+                "result": {"path": str(soft_ws / "freeze.txt")},
+                "returncode": 0,
+            },
+            user_request=wrong_goal,
+            contract=frozen,
+        )
+        # Still checks freeze.txt / Z from contract, not wrong_goal
+        (soft_ws / "freeze.txt").write_text("Z\n", encoding="utf-8")
+        freeze_ok = soft_v.verify(
+            wrong_goal,
+            {
+                "ok": True,
+                "result": {"path": str(soft_ws / "freeze.txt")},
+                "returncode": 0,
+            },
+            user_request=wrong_goal,
+            contract=frozen,
+        )
+        assert freeze_ok.get("verified"), freeze_ok
         # Return/type/arithmetic behavior criteria (still request-grounded)
         tg_ret = TaskContract.from_request("Return 42")
         assert any(
@@ -4730,6 +4762,22 @@ def run(context: dict) -> dict:
                     "keywords": ["say"],
                 }
 
+            def understand_contract(self, original_request: str, *, prior_args=None):
+                # Soft goals stay empty; otherwise use universal offline draft
+                from jarvis.contract_semantics import offline_semantic_draft
+
+                if "helpful" in (original_request or "").lower():
+                    return {
+                        "intent": "task",
+                        "desired_outcomes": [],
+                        "artifacts": [],
+                        "behaviors": [],
+                        "constraints": {},
+                        "acceptance_criteria": [],
+                        "verification_plan": [],
+                    }
+                return offline_semantic_draft(original_request, prior_args)
+
             def plan(self, goal: str, known_capabilities: list[str]) -> dict:
                 raise AssertionError("PLAN must not run when TaskContract needs refine")
 
@@ -4757,10 +4805,69 @@ def run(context: dict) -> dict:
         assert any("UNDERSTAND" in m for m in logs_sc), logs_sc[:40]
         assert any("JARVIS RUNTIME" in m for m in logs_sc), logs_sc[:20]
         assert not any("CAPABILITY DECISION:" in m for m in logs_sc), logs_sc
-        # Semantic communicative request is verifiable (no path/URL required)
+        # Quoted communicative payload is verifiable without path/URL
         assert _TGSC.from_request(
-            "Say hello politely to the room"
+            'Say "hello" politely to the room'
         ).is_verifiable()
+        # prior_request_isolation — same id is NOT isolated; distinct ids are
+        from jarvis.invariants import (
+            prior_request_isolation as _pri,
+            assert_requests_isolated as _ari,
+            InvariantError as _IE2,
+        )
+        assert _pri(None, "a1") is True
+        assert _pri("a1", "a2") is True
+        assert _pri("a1", "a1") is False
+        assert _pri("a1", "") is False
+        try:
+            _ari("same", "same")
+            raise AssertionError("same request_id must violate isolation")
+        except _IE2:
+            pass
+        # Unknown languages / tasks not covered by old verb regexes
+        for unk in (
+            'Erstelle datei neu.txt mit "HALLO"',
+            'Создай файл data.txt с текстом "PING"',
+            'Créer fichier out.txt avec "BONJOUR"',
+        ):
+            uc = _TGSC.from_request(unk)
+            assert uc.is_verifiable(), (unk, uc.acceptance_criteria)
+            assert any(s.startswith("artifact_exists:") for s in uc.acceptance_criteria)
+            assert any("content_present:" in s for s in uc.acceptance_criteria)
+        # Model-assisted UNDERSTAND for free-form (unquoted) semantics
+        class SemanticBrain(SoftGoalBrain):
+            def understand_contract(self, original_request: str, *, prior_args=None):
+                req = original_request or ""
+                if "bonjour" in req.lower() and "fichier" not in req.lower():
+                    return {
+                        "intent": "task",
+                        "desired_outcomes": ["behavior:skill_output_contains:bonjour"],
+                        "artifacts": [],
+                        "behaviors": [{
+                            "kind": "skill_output_contains",
+                            "target": "bonjour",
+                            "how": "skill_stdout_or_result",
+                        }],
+                        "constraints": {"files": [], "http": [], "must_contain": []},
+                        "acceptance_criteria": [
+                            "skill_output_contains:bonjour@skill_stdout_or_result"
+                        ],
+                        "verification_plan": [{
+                            "kind": "skill_output_contains",
+                            "target": "bonjour",
+                            "how": "skill_stdout_or_result",
+                        }],
+                        "subject": "bonjour",
+                        "actions": [],
+                    }
+                return super().understand_contract(req, prior_args=prior_args)
+
+        fr = _TGSC.understand("Dis bonjour poliment", brain=SemanticBrain())
+        fr = _TGSC.validate(fr)
+        assert fr.is_verifiable(), fr.acceptance_criteria
+        assert any(
+            "skill_output_contains:bonjour" in s for s in fr.acceptance_criteria
+        ), fr.acceptance_criteria
         # Full cycle: REQUEST→UNDERSTAND→VALIDATE→…→VERIFY→REMEMBER→DONE
         class OkBrain(SoftGoalBrain):
             def __init__(self) -> None:
