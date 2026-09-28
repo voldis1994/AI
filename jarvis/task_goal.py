@@ -183,6 +183,7 @@ class TaskGoal:
         content_reqs = cls._derive_content_requirements(constraints)
         content_source = cls._derive_content_source(req, constraints)
         subject = cls._derive_subject(req, artifacts, content_reqs, content_source)
+        constraints = cls._attach_checks(constraints, req)
         return cls(
             user_request=req,
             goal=g,
@@ -192,7 +193,7 @@ class TaskGoal:
             subject=subject,
             content_requirements=content_reqs,
             content_source=content_source,
-            success_criteria=cls._derive_success_criteria(constraints),
+            success_criteria=cls._derive_success_criteria(constraints, req),
         )
 
     def with_args(
@@ -216,6 +217,7 @@ class TaskGoal:
             )
         else:
             subject = self.subject
+        constraints = self._attach_checks(constraints, self.user_request)
         return TaskGoal(
             user_request=self.user_request,
             goal=self.goal,
@@ -225,7 +227,9 @@ class TaskGoal:
             subject=subject,
             content_requirements=content_reqs,
             content_source=content_source or self.content_source,
-            success_criteria=self._derive_success_criteria(constraints),
+            success_criteria=self._derive_success_criteria(
+                constraints, self.user_request
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -242,7 +246,126 @@ class TaskGoal:
             "content_requirements": list(self.content_requirements),
             "content_source": list(self.content_source),
             "success_criteria": list(self.success_criteria),
+            "verifiable": self.has_verifiable_constraints(),
+            "needs_goal_refine": self.needs_goal_refine(),
         }
+
+    # ── Verifiability / refine ──────────────────────────────────────────
+
+    def has_verifiable_constraints(self) -> bool:
+        """
+        True when TaskGoal yields independent checks against the real world.
+
+        Weak stubs like ``skill_ok_and_verified`` / ``needs_refine`` do NOT count.
+        """
+        c = self.constraints or {}
+        if any(c.get(k) for k in ("files", "directories", "http", "imports", "must_contain")):
+            return True
+        checks = c.get("checks") or []
+        if isinstance(checks, list) and any(
+            isinstance(x, dict) and x.get("kind") and x.get("target") for x in checks
+        ):
+            return True
+        weak = {"skill_ok_and_verified", "needs_refine", ""}
+        for s in self.success_criteria or ():
+            if str(s).strip() and str(s).strip() not in weak:
+                return True
+        return False
+
+    def needs_goal_refine(self) -> bool:
+        """True when PLAN/BUILD must not proceed with empty/unverifiable criteria."""
+        return not self.has_verifiable_constraints()
+
+    @classmethod
+    def refine(
+        cls,
+        task_goal: "TaskGoal",
+        *,
+        brain: Any = None,
+        args: Optional[dict[str, Any]] = None,
+    ) -> "TaskGoal":
+        """
+        Strengthen TaskGoal expectations from the immutable USER REQUEST.
+
+        Never invents paths/content absent from the request. Uses offline
+        re-derivation first; optionally asks the brain for grounded structured
+        expectations only. If still unverifiable, returns a TaskGoal marked
+        ``needs_refine`` (caller must stop — not continue with empty constraints).
+        """
+        req = task_goal.user_request
+        grounded = cls.sanitize_args(args or {}, req)
+        # Merge any prior grounded args already implied by constraints
+        for f in (task_goal.constraints or {}).get("files") or []:
+            p = str((f or {}).get("path") or "").strip()
+            if p and "path" not in grounded and cls.is_grounded(p, req):
+                grounded.setdefault("path", p)
+            c = (f or {}).get("contains")
+            if c is not None and "content" not in grounded and cls.is_grounded(c, req):
+                grounded.setdefault("content", c)
+        for h in (task_goal.constraints or {}).get("http") or []:
+            u = str((h or {}).get("url") or "").strip()
+            if u and cls.is_grounded(u, req):
+                grounded.setdefault("url", u)
+
+        # Offline: pull URLs from content_source into args for constraint rebuild
+        for src in task_goal.content_source or ():
+            if cls.looks_like_url(str(src)) and cls.is_grounded(src, req):
+                grounded.setdefault("url", str(src))
+
+        # Optional brain assist — values must be grounded in the request
+        if brain is not None and hasattr(brain, "extract_task_args"):
+            try:
+                hinted = brain.extract_task_args(req, prior_args=grounded) or {}
+                if isinstance(hinted, dict):
+                    for k, v in hinted.items():
+                        if v in (None, ""):
+                            continue
+                        if cls.is_invented_default(v, req):
+                            continue
+                        if not cls.is_grounded(v, req) and not isinstance(
+                            v, (int, float, bool)
+                        ):
+                            continue
+                        grounded.setdefault(str(k), v)
+            except Exception:
+                pass
+
+        refined = cls.from_request(req, goal=task_goal.goal, args=grounded)
+        # Preserve subject/source when refine would regress to unknown
+        if (
+            refined.subject in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+            and task_goal.subject not in ("", SUBJECT_UNKNOWN, SUBJECT_AMBIGUOUS)
+        ):
+            refined = TaskGoal(
+                user_request=refined.user_request,
+                goal=refined.goal,
+                constraints=refined.constraints,
+                actions=refined.actions or task_goal.actions,
+                artifacts=refined.artifacts or task_goal.artifacts,
+                subject=task_goal.subject,
+                content_requirements=(
+                    refined.content_requirements or task_goal.content_requirements
+                ),
+                content_source=refined.content_source or task_goal.content_source,
+                success_criteria=refined.success_criteria,
+            )
+        if refined.needs_goal_refine():
+            # Explicit marker — never pretend skill self-proof is a criterion
+            cons = dict(refined.constraints or {})
+            cons["needs_refine"] = True
+            cons["source"] = "task_goal_refine"
+            return TaskGoal(
+                user_request=refined.user_request,
+                goal=refined.goal,
+                constraints=cons,
+                actions=refined.actions,
+                artifacts=refined.artifacts,
+                subject=refined.subject,
+                content_requirements=refined.content_requirements,
+                content_source=refined.content_source,
+                success_criteria=("needs_refine",),
+            )
+        return refined
 
     # ── Fault-layer helpers (universal) ─────────────────────────────────
 
@@ -795,14 +918,111 @@ class TaskGoal:
         return " ".join(tokens[:10])
 
     @classmethod
-    def _derive_success_criteria(cls, constraints: dict[str, Any]) -> tuple[str, ...]:
+    def _attach_checks(
+        cls, constraints: dict[str, Any], request: str
+    ) -> dict[str, Any]:
+        """
+        Attach structured, independently checkable ``checks`` to constraints.
+
+        Each check: kind + target + how (workspace_stat / workspace_read /
+        http_get / importlib / directory_stat). Derived only from request-
+        grounded constraints — never from skill self-proof.
+        """
+        out = dict(constraints or {})
+        checks: list[dict[str, Any]] = []
+
+        def _add(kind: str, target: str, how: str) -> None:
+            t = str(target or "").strip()
+            if not t:
+                return
+            entry = {"kind": kind, "target": t, "how": how}
+            if entry not in checks:
+                checks.append(entry)
+
+        for f in out.get("files") or []:
+            p = str((f or {}).get("path") or "").strip()
+            if p:
+                _add("artifact_exists", p, "workspace_stat")
+            c = (f or {}).get("contains")
+            if c is not None and str(c).strip():
+                _add("content_present", str(c), "workspace_read")
+        for m in out.get("must_contain") or []:
+            if m is not None and str(m).strip():
+                _add("content_present", str(m), "workspace_read")
+        for d in out.get("directories") or []:
+            p = str((d or {}).get("path") or "").strip()
+            if p:
+                _add("directory_exists", p, "directory_stat")
+        for h in out.get("http") or []:
+            u = str((h or {}).get("url") or "").strip()
+            if u:
+                _add("http_ok", u, "http_get")
+        for mod in out.get("imports") or []:
+            if mod is not None and str(mod).strip():
+                _add("import_ok", str(mod), "importlib")
+
+        # content_source URLs not already in http → checkable origins
+        if not out.get("http"):
+            for m in re.finditer(r"https?://\S+", request or ""):
+                u = m.group(0).rstrip(".,);]\"'")
+                if u and not cls.is_invented_default(u, request):
+                    _add("http_ok", u, "http_get")
+                    out.setdefault("http", []).append({"url": u})
+
+        out["checks"] = checks[:24]
+        out["source"] = out.get("source") or "task_goal"
+        return out
+
+    @classmethod
+    def _derive_success_criteria(
+        cls,
+        constraints: dict[str, Any],
+        request: str = "",
+    ) -> tuple[str, ...]:
+        """
+        Verifiable success criteria from the full request-derived constraints.
+
+        Encodes: what must exist / what content / what network/import checks,
+        and (via constraint checks[].how) how to verify. Never falls back to
+        skill self-proof stubs.
+        """
         crit: list[str] = []
-        for p in cls._derive_artifacts(constraints):
-            crit.append(f"artifact_exists:{p}")
-        for c in cls._derive_content_requirements(constraints):
-            crit.append(f"content_present:{c}")
+        checks = list((constraints or {}).get("checks") or [])
+        if checks:
+            for ch in checks:
+                if not isinstance(ch, dict):
+                    continue
+                kind = str(ch.get("kind") or "").strip()
+                target = str(ch.get("target") or "").strip()
+                how = str(ch.get("how") or "").strip()
+                if not kind or not target:
+                    continue
+                # kind:target@how — machine-checkable; VERIFY parses this
+                label = f"{kind}:{target}"
+                if how:
+                    label = f"{label}@{how}"
+                if label not in crit:
+                    crit.append(label)
+        else:
+            for p in cls._derive_artifacts(constraints):
+                crit.append(f"artifact_exists:{p}@workspace_stat")
+            for c in cls._derive_content_requirements(constraints):
+                crit.append(f"content_present:{c}@workspace_read")
+            for d in (constraints or {}).get("directories") or []:
+                p = str((d or {}).get("path") or "").strip()
+                if p:
+                    crit.append(f"directory_exists:{p}@directory_stat")
+            for h in (constraints or {}).get("http") or []:
+                u = str((h or {}).get("url") or "").strip()
+                if u:
+                    crit.append(f"http_ok:{u}@http_get")
+            for mod in (constraints or {}).get("imports") or []:
+                if mod is not None and str(mod).strip():
+                    crit.append(f"import_ok:{mod}@importlib")
+
         if not crit:
-            crit.append("skill_ok_and_verified")
+            # Explicitly unverifiable — caller must refine, not invent PASS
+            return ("needs_refine",)
         return tuple(crit[:16])
 
     # ── Query / MEMORY grounding ────────────────────────────────────────

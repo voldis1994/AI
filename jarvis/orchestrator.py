@@ -1571,6 +1571,76 @@ class Orchestrator:
         self._log_request_items(task_id, task_goal)
 
         try:
+            # GOAL_REFINE — never PLAN/BUILD with empty/unverifiable success_criteria
+            if task_goal.needs_goal_refine():
+                self.perf.begin("GOAL_REFINE")
+                self._status("GOAL_REFINE")
+                self._log(
+                    f"[{task_id}] GOAL_REFINE: success_criteria unverifiable — "
+                    f"refining TaskGoal from USER REQUEST before PLAN"
+                )
+                brain_for_refine = (
+                    self.brain if self.brain.is_available() else None
+                )
+                task_goal = TaskGoal.refine(
+                    task_goal, brain=brain_for_refine
+                )
+                goal = task_goal.goal
+                self.ledger.log(
+                    task_id,
+                    "GOAL_REFINE",
+                    (
+                        "refined"
+                        if task_goal.has_verifiable_constraints()
+                        else "still_unverifiable"
+                    ),
+                    task_goal.to_dict(),
+                )
+                self.perf.end(
+                    "GOAL_REFINE",
+                    verifiable=task_goal.has_verifiable_constraints(),
+                )
+                if task_goal.needs_goal_refine():
+                    outcome = (
+                        "GOAL_REFINE FAIL: cannot derive verifiable "
+                        "success_criteria from USER REQUEST — refusing to "
+                        "continue with empty constraints "
+                        "(fault_layer=goal_parsing)."
+                    )
+                    self._log(f"[{task_id}] {outcome}")
+                    self.memory.save_experience(
+                        goal,
+                        outcome,
+                        False,
+                        details={
+                            "task_id": task_id,
+                            "fault_layer": "goal_parsing",
+                            "task_goal": task_goal.to_dict(),
+                        },
+                    )
+                    self.ledger.log(
+                        task_id,
+                        "FAIL",
+                        outcome,
+                        {
+                            "fault_layer": "goal_parsing",
+                            "rewrite_skill": False,
+                            "task_goal": task_goal.to_dict(),
+                        },
+                    )
+                    self.ledger.finish(
+                        task_id, False, {"outcome": outcome, "fault_layer": "goal_parsing"}
+                    )
+                    return {
+                        "type": "task",
+                        "success": False,
+                        "task_id": task_id,
+                        "reply": outcome,
+                        "outcome": outcome,
+                        "fault_layer": "goal_parsing",
+                        "task_goal": task_goal.to_dict(),
+                    }
+
             # MEMORY first — retrieve by TaskGoal.subject/topic before PLAN/RESEARCH
             self.perf.begin("MEMORY")
             self._status("MEMORY")

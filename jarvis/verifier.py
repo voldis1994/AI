@@ -111,6 +111,22 @@ class Verifier:
             # Legacy callers may pass expect — still run default/alignment guards
             built = self._normalize_expect(expect, request, task_args)
 
+        # Refuse empty/unverifiable TaskGoal — never fall through to skill self-proof
+        if task_goal is not None and task_goal.needs_goal_refine():
+            return self._fail(
+                "TaskGoal has no verifiable success_criteria — refine before VERIFY",
+                checks,
+                sr,
+                [{
+                    "name": "user_constraints",
+                    "ok": False,
+                    "detail": (
+                        "needs_refine: empty/unverifiable constraints from "
+                        "USER REQUEST; refusing PASS on skill self-proof"
+                    ),
+                }],
+            )
+
         # ── Process signal (not proof of goal) ──────────────────────────
         rc = sr.get("returncode")
         proc_ok = (not sr.get("timed_out")) and (rc is not None) and bool(sr.get("ok"))
@@ -197,8 +213,29 @@ class Verifier:
             ok, detail = self._check_http(spec)
             checks.append({"name": "http", "ok": ok, "detail": detail})
 
+        # ── TaskGoal success_criteria (independent of skill self-claims) ──
+        criteria = []
+        if task_goal is not None:
+            criteria = list(task_goal.success_criteria or ())
+        if not criteria and isinstance(built.get("checks"), list):
+            for ch in built["checks"]:
+                if isinstance(ch, dict) and ch.get("kind") and ch.get("target"):
+                    how = ch.get("how") or ""
+                    criteria.append(
+                        f"{ch['kind']}:{ch['target']}"
+                        + (f"@{how}" if how else "")
+                    )
+        for crit in criteria:
+            ok, detail = self._check_success_criterion(str(crit), file_specs)
+            checks.append({
+                "name": "success_criterion",
+                "ok": ok,
+                "detail": detail,
+            })
+
         # ── Alignment: skill-claimed artifacts must match user constraints ──
-        # We inspect claimed paths only to REJECT mismatches — never to invent PASS.
+        # Inspect claimed paths only to REJECT mismatches — never invent PASS.
+        # claim_aligns_with_request is NEVER a substitute for user-derived checks.
         claimed = self._collect_claimed_paths(result, evidence)
         user_paths = {
             self._resolve(s.get("path")).resolve()
@@ -211,7 +248,6 @@ class Verifier:
                 if p.resolve() not in user_paths
                 and p.name.lower() not in {u.name.lower() for u in user_paths}
             ]
-            # Also treat claimed path as mismatch if it's a default not in request
             for p in claimed:
                 if self._is_untrusted_default(p.name, request, task_args):
                     if str(p) not in mismatched:
@@ -226,30 +262,31 @@ class Verifier:
                 ),
             })
         elif claimed and not user_paths:
-            # Skill claims files but user request had no file constraint — still
-            # reject defaults; otherwise require at least one claimed path exists
-            # AND every claimed value token appears in the request.
+            # No user file constraints — skill claims cannot earn PASS
             bad = [
                 str(p) for p in claimed
                 if self._is_untrusted_default(p.name, request, task_args)
                 or not self._token_supported_by_request(p.name, request, task_args)
             ]
+            claim_list = [str(p) for p in claimed][:4]
             checks.append({
                 "name": "claim_aligns_with_request",
-                "ok": not bad and all(p.exists() for p in claimed),
+                "ok": False,
                 "detail": (
-                    "claimed artifacts supported by user request"
-                    if not bad
-                    else f"unsupported/default claims: {bad[:4]}"
+                    "skill-claimed artifacts without user file constraints — "
+                    f"not accepted as proof (claims={claim_list}"
+                    + (f"; bad={bad[:4]}" if bad else "")
+                    + ")"
                 ),
             })
 
         # ── Must have at least one user-derived constraint check ────────
+        # claim_aligns_with_request does NOT count — only TaskGoal-derived checks.
         constraint_checks = [
             c for c in checks
             if c["name"] in (
                 "file", "directory", "content_constraint", "http",
-                "dependency_import", "claim_aligns_with_request",
+                "dependency_import", "success_criterion",
             )
         ]
         if not constraint_checks:
@@ -260,6 +297,16 @@ class Verifier:
                     "No user-derived constraints extracted from REQUEST/args — "
                     "refusing PASS based on skill self-proof alone"
                 ),
+            })
+        elif all(
+            c.get("name") == "success_criterion"
+            and str(c.get("detail") or "").startswith("needs_refine")
+            for c in constraint_checks
+        ):
+            checks.append({
+                "name": "user_constraints",
+                "ok": False,
+                "detail": "success_criteria=needs_refine — TaskGoal not verifiable",
             })
 
         # Skill evidence is recorded but never counts toward PASS
@@ -331,7 +378,53 @@ class Verifier:
         checks from random sentence tokens. Does not read skill results.
         """
         grounded = TaskGoal.ground_args(dict(args or {}), request or "")
-        return TaskGoal.derive_constraints(request or "", grounded)
+        cons = TaskGoal.derive_constraints(request or "", grounded)
+        return TaskGoal._attach_checks(cons, request or "")
+
+    def _check_success_criterion(
+        self,
+        criterion: str,
+        file_specs: list[dict[str, Any]],
+    ) -> tuple[bool, str]:
+        """
+        Evaluate one TaskGoal success_criterion against the real world.
+
+        Format: ``kind:target`` or ``kind:target@how``.
+        Never treats skill self-proof as satisfaction.
+        """
+        raw = (criterion or "").strip()
+        if not raw or raw in ("skill_ok_and_verified", "needs_refine"):
+            return False, f"needs_refine:{raw or 'empty'}"
+        how = ""
+        body = raw
+        if "@" in raw:
+            body, how = raw.rsplit("@", 1)
+        if ":" not in body:
+            return False, f"unparseable_criterion:{raw}"
+        kind, target = body.split(":", 1)
+        kind = kind.strip()
+        target = target.strip()
+        if not kind or not target:
+            return False, f"unparseable_criterion:{raw}"
+
+        if kind == "artifact_exists":
+            path = self._resolve(target)
+            ok = path.exists() and path.is_file()
+            return ok, f"artifact_exists:{path} exists={ok} how={how or 'workspace_stat'}"
+        if kind == "directory_exists":
+            path = self._resolve(target)
+            ok = path.exists() and path.is_dir()
+            return ok, f"directory_exists:{path} is_dir={ok} how={how or 'directory_stat'}"
+        if kind == "content_present":
+            ok, detail = self._content_present(target, file_specs)
+            return ok, f"content_present:{detail} how={how or 'workspace_read'}"
+        if kind == "http_ok":
+            ok, detail = self._check_http({"url": target})
+            return ok, f"http_ok:{detail} how={how or 'http_get'}"
+        if kind == "import_ok":
+            ok, detail = self._check_import(target)
+            return ok, f"import_ok:{detail} how={how or 'importlib'}"
+        return False, f"unknown_criterion_kind:{kind}"
 
     def _normalize_expect(
         self,

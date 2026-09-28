@@ -806,6 +806,50 @@ def run(context: dict) -> dict:
         assert any("net.fetch" in c for c in clf_multi["capability_ids"]), clf_multi
         assert any("io.write" in c for c in clf_multi["capability_ids"]), clf_multi
 
+        # Universal success_criteria from full request (what/result/reqs/how)
+        assert tg.has_verifiable_constraints(), tg.to_dict()
+        assert any(s.startswith("artifact_exists:") for s in tg.success_criteria), (
+            tg.success_criteria
+        )
+        assert any("content_present:" in s for s in tg.success_criteria), (
+            tg.success_criteria
+        )
+        assert any("@workspace_" in s for s in tg.success_criteria), tg.success_criteria
+        assert "skill_ok_and_verified" not in tg.success_criteria
+        assert isinstance(tg.constraints.get("checks"), list) and tg.constraints["checks"]
+        # HTTP-only request → http_ok criterion (not skill stub)
+        tg_http = TaskGoal.from_request("Fetch https://example.com/resource")
+        assert tg_http.has_verifiable_constraints(), tg_http.to_dict()
+        assert any(s.startswith("http_ok:") for s in tg_http.success_criteria), (
+            tg_http.success_criteria
+        )
+        # Unverifiable request → needs_refine (must not continue with empty criteria)
+        tg_soft = TaskGoal.from_request("Say hello politely to the room")
+        assert tg_soft.needs_goal_refine(), tg_soft.success_criteria
+        assert tg_soft.success_criteria == ("needs_refine",)
+        tg_soft_r = TaskGoal.refine(tg_soft)
+        assert tg_soft_r.needs_goal_refine()
+        assert tg_soft_r.success_criteria == ("needs_refine",)
+        # VERIFY refuses skill self-proof when TaskGoal unverifiable
+        soft_ws = root / "data" / "_tg_soft_ws"
+        soft_ws.mkdir(parents=True, exist_ok=True)
+        (soft_ws / "fake.txt").write_text("hi\n", encoding="utf-8")
+        soft_v = Verifier(soft_ws)
+        soft_sr = {
+            "ok": True,
+            "result": {"path": str(soft_ws / "fake.txt"), "says": "hello"},
+            "evidence": "I said hello",
+            "returncode": 0,
+        }
+        soft_res = soft_v.verify(
+            tg_soft_r.user_request, soft_sr, task_goal=tg_soft_r
+        )
+        assert not soft_res.get("verified"), soft_res
+        assert "needs_refine" in (soft_res.get("reason") or "") or any(
+            c.get("name") == "user_constraints" and not c.get("ok")
+            for c in soft_res.get("checks") or []
+        ), soft_res
+
         args_root = root / "data" / "_e2e_args"
         if args_root.exists():
             shutil.rmtree(args_root)
@@ -4534,6 +4578,130 @@ def run(context: dict) -> dict:
         )
     except Exception as exc:
         msg = f"E2E_COMPETENCE: {exc}"
+        print(f"  FAIL {msg}")
+        traceback.print_exc()
+        errors.append(msg)
+
+    # TaskGoal success_criteria gate — refuse empty constraints before PLAN
+    print("  — e2e TaskGoal success_criteria refine-before-PLAN —")
+    try:
+        from jarvis.orchestrator import Orchestrator as _OrchSC
+        from jarvis.task_goal import TaskGoal as _TGSC
+
+        sc_root = root / "data" / "_e2e_success_criteria"
+        if sc_root.exists():
+            shutil.rmtree(sc_root)
+        sc_root.mkdir(parents=True)
+
+        class SoftGoalBrain(Brain):
+            def model_status(self) -> str:
+                return "ONLINE"
+
+            def is_available(self) -> bool:
+                return True
+
+            def classify_intent(self, user_text: str) -> dict:
+                return {
+                    "intent": "task",
+                    "goal": user_text,
+                    "needs_capability": True,
+                    "keywords": ["say"],
+                }
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                raise AssertionError("PLAN must not run when TaskGoal needs refine")
+
+            def write_skill_code(self, *a, **k):
+                raise AssertionError("BUILD must not run when TaskGoal needs refine")
+
+            def extract_task_args(self, *a, **k):
+                return {}
+
+            def converse(self, user_text, history=None) -> str:
+                return "ok"
+
+        logs_sc: list[str] = []
+        orch_sc = _OrchSC(
+            root=sc_root,
+            brain=SoftGoalBrain(),
+            on_log=lambda m: logs_sc.append(m),
+        )
+        soft_goal = "Say hello politely to the room"
+        assert _TGSC.from_request(soft_goal).needs_goal_refine()
+        result_sc = orch_sc.run_cycle(soft_goal)
+        assert result_sc.get("success") is False, result_sc
+        assert result_sc.get("fault_layer") == "goal_parsing", result_sc
+        assert any("GOAL_REFINE" in m for m in logs_sc), logs_sc[:30]
+        assert not any("CAPABILITY DECISION:" in m for m in logs_sc), logs_sc
+        # Verifiable request still proceeds and VERIFY uses success_criteria
+        class OkBrain(SoftGoalBrain):
+            def __init__(self) -> None:
+                super().__init__()
+                self.builds = 0
+
+            def plan(self, goal: str, known_capabilities: list[str]) -> dict:
+                return {
+                    "steps": ["build"],
+                    "can_reuse": [],
+                    "missing": [goal],
+                    "needs_research": False,
+                    "needs_new_skill": True,
+                    "skill_name": "io_files_io_create_txt",
+                    "skill_description": goal,
+                    "research_queries": [],
+                    "args": {"dest": "sc_ok.txt", "body": "SC_OK"},
+                    "required_args": ["dest", "body"],
+                }
+
+            def extract_task_args(self, *a, **k):
+                return {"dest": "sc_ok.txt", "body": "SC_OK"}
+
+            def write_skill_code(self, skill_name, description, research, **kwargs):
+                self.builds += 1
+                return f'''
+from pathlib import Path
+SKILL_META = {{"name": "{skill_name}", "capabilities": ["write_file"],
+ "required_args": ["dest", "body"], "version": {self.builds}}}
+def run(context):
+    args = context.get("args") or {{}}
+    p = Path(context.get("workspace") or ".") / str(args.get("dest") or "x.txt")
+    p.write_text(str(args.get("body") or "") + "\\n", encoding="utf-8")
+    return {{"ok": True, "result": {{"path": str(p)}}, "error": None, "evidence": "ok"}}
+'''
+
+            def diagnose(self, *a, **k):
+                return {
+                    "fault_layer": "unknown",
+                    "rewrite_skill": False,
+                    "approach": "write",
+                    "needs_research": False,
+                    "research_queries": [],
+                    "missing_args": [],
+                    "required_args": ["dest", "body"],
+                    "suggested_args": {"dest": "sc_ok.txt", "body": "SC_OK"},
+                }
+
+            def verify_claim(self, *a, **k):
+                return {"achieved": True, "confidence": 0.9, "reason": "ok"}
+
+        logs_ok: list[str] = []
+        orch_ok = _OrchSC(
+            root=sc_root,
+            brain=OkBrain(),
+            on_log=lambda m: logs_ok.append(m),
+        )
+        ok_goal = 'Create sc_ok.txt containing "SC_OK"'
+        tg_ok = _TGSC.from_request(ok_goal)
+        assert tg_ok.has_verifiable_constraints()
+        assert any("@workspace_" in s for s in tg_ok.success_criteria)
+        res_ok = orch_ok.run_cycle(ok_goal)
+        assert res_ok.get("success"), res_ok
+        assert any("success_criterion" in str(m) or "VERIFIER RESULT: PASS" in m for m in logs_ok)
+        orch_sc.close()
+        orch_ok.close()
+        print("  OK success_criteria — refine gate + VERIFY vs TaskGoal criteria")
+    except Exception as exc:
+        msg = f"E2E_SUCCESS_CRITERIA: {exc}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)
