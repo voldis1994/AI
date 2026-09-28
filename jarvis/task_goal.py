@@ -98,8 +98,72 @@ _LEGACY_LAYER = {
 _ACTION_VERBS = re.compile(
     r"(?i)\b(create|write|make|build|run|fetch|download|install|learn|"
     r"research|execute|test|verify|izveido|uzraksti|palaid|iemācies|"
-    r"iemacies|paradi|parādi|summarize|summary|note|notes)\b"
+    r"iemacies|paradi|parādi|summarize|summary|note|notes|"
+    r"say|print|tell|speak|announce|echo|return|compute|calculate|"
+    r"reverse|sort|saki|pasaki|izdrukā|atgriez|aprēķin)\b"
 )
+
+# Communicative / output verbs → skill_output_contains (behavior, not workspace).
+_COMMUNICATIVE_RE = re.compile(
+    r"(?i)\b(?:say|print|tell|speak|announce|echo|output|display|"
+    r"saki|pasaki|izdrukā|izdruka|parādi\s+tekstu)\s+"
+    r"(?:(?:me|us|them|him|her|to\s+(?:me|us|them))\s+)?"
+    r"(?:\"([^\"]+)\"|'([^']+)'|([A-Za-z0-9][\w.-]{0,47}))"
+)
+
+# Return / equals cues with a grounded literal value.
+_RETURN_EQUALS_RE = re.compile(
+    r"(?i)\b(?:return|returns|atgriez|equal(?:s)?|result\s*(?:is|=)|"
+    r"should\s+(?:be|return)|must\s+(?:be|return)|"
+    r"rezultāts\s*(?:ir|=))\s+"
+    r"[\"']?([^\"'\n]+?)[\"']?\s*$"
+)
+
+# Return-type cues (an int / a list / …).
+_RETURN_TYPE_RE = re.compile(
+    r"(?i)\b(?:return|returns|produce|yield|atgriez)\s+"
+    r"(?:an?\s+)?(integers?|ints?|strings?|strs?|lists?|"
+    r"dicts?|dictionaries|bool(?:ean)?s?|floats?|tuples?|none)\b"
+)
+
+# Arithmetic expression grounded in the request (operands literal).
+_ARITH_EXPR_RE = re.compile(
+    r"(?<![\w.])(\d+(?:\.\d+)?)\s*([\+\-\*/×÷])\s*(\d+(?:\.\d+)?)(?![\w.])"
+)
+
+# Reverse / sort with a grounded sequence literal in the request.
+_REVERSE_LIT_RE = re.compile(
+    r"(?i)\breverse\s+(\[[^\]]+\]|\([^\)]+\)|[\"'][^\"']+[\"'])"
+)
+_SORT_LIT_RE = re.compile(
+    r"(?i)\bsort\s+(\[[^\]]+\])"
+)
+
+# Tokens that are manner/filler — never treated as communicative payload.
+# Do NOT include ordinary words that can themselves be the message (e.g. world).
+_BEHAVIOR_PAYLOAD_STOP = frozenset({
+    "a", "an", "the", "to", "for", "with", "from", "into", "in", "on",
+    "at", "of", "by", "is", "are", "be", "as", "it", "this", "that",
+    "me", "us", "them", "him", "her", "please", "politely", "nicely",
+    "kindly", "quietly", "loudly", "softly", "something", "anything",
+    "somehow", "someone", "somebody", "everything", "nothing", "stuff",
+    "things", "thing", "now", "here", "there", "user",
+    "out", "back", "again", "just", "only", "also", "very", "really",
+    "true", "false", "none", "null", "result", "value", "answer",
+    "integer", "int", "string", "str", "list", "dict", "bool", "float",
+    "tuple", "boolean", "dictionary", "man", "lai", "un", "vai",
+})
+
+_TYPE_ALIASES = {
+    "integer": "int", "integers": "int", "int": "int", "ints": "int",
+    "string": "str", "strings": "str", "str": "str", "strs": "str",
+    "list": "list", "lists": "list",
+    "dict": "dict", "dicts": "dict", "dictionaries": "dict", "dictionary": "dict",
+    "bool": "bool", "boolean": "bool", "booleans": "bool", "bools": "bool",
+    "float": "float", "floats": "float",
+    "tuple": "tuple", "tuples": "tuple",
+    "none": "none",
+}
 
 # Topic cues — capture the surface subject without inventing a sense.
 _ABOUT_CUE = re.compile(
@@ -753,6 +817,14 @@ class TaskGoal:
                 # Only multi-word / substantial extras become must_contain
                 if cls.looks_like_content(str(extra)) or len(str(extra)) >= 4:
                     expect["must_contain"].append(str(extra))
+            # Pathless payload: primary never attached to a file contains —
+            # keep it as a content/behavior needle (VERIFY uses skill output
+            # when no file targets exist).
+            if not path_vals and (
+                cls.looks_like_content(str(primary)) or len(str(primary)) >= 4
+            ):
+                if str(primary) not in expect["must_contain"]:
+                    expect["must_contain"].insert(0, str(primary))
         elif text_vals and not path_vals:
             expect["must_contain"].extend(
                 str(t) for t in text_vals
@@ -918,6 +990,170 @@ class TaskGoal:
         return " ".join(tokens[:10])
 
     @classmethod
+    def _derive_behavior_checks(cls, request: str) -> list[dict[str, Any]]:
+        """
+        Structured behavior/functionality checks from USER REQUEST semantics.
+
+        Converts requested functionality into verifiable criteria even when no
+        path/URL/args were given. Only uses literals grounded in the request —
+        never invents payloads, expected values, or types the user did not ask for.
+        """
+        req = request or ""
+        checks: list[dict[str, Any]] = []
+
+        def _add(kind: str, target: str, how: str) -> None:
+            t = str(target or "").strip()
+            if not t:
+                return
+            entry = {"kind": kind, "target": t, "how": how}
+            if entry not in checks:
+                checks.append(entry)
+
+        # 1) Communicative output — say/print/… + grounded payload token
+        for m in _COMMUNICATIVE_RE.finditer(req):
+            tok = ((m.group(1) or m.group(2) or m.group(3) or "")).strip()
+            if not tok:
+                continue
+            low = tok.lower()
+            # Multi-word quoted payloads: reject if every token is filler
+            words = [w.lower() for w in re.findall(r"[A-Za-z0-9][\w.-]*", tok)]
+            if words and all(
+                w in _BEHAVIOR_PAYLOAD_STOP or w in _STOP for w in words
+            ):
+                continue
+            if low in _BEHAVIOR_PAYLOAD_STOP or low in _STOP:
+                continue
+            if cls.is_invented_default(tok, req) or cls.looks_like_path(tok):
+                continue
+            if not cls.is_grounded(tok, req):
+                continue
+            _add("skill_output_contains", tok, "skill_stdout_or_result")
+
+        # 2) Explicit return type (before equals — "return an int" is type, not equals)
+        for m in _RETURN_TYPE_RE.finditer(req):
+            raw_t = (m.group(1) or "").strip().lower()
+            canon = _TYPE_ALIASES.get(raw_t)
+            if canon:
+                _add("skill_result_type", canon, "skill_result")
+
+        # 3) Return / equals literal — only when no type criterion already covers it
+        if not any(c.get("kind") == "skill_result_type" for c in checks):
+            m = _RETURN_EQUALS_RE.search(req.strip())
+            if m:
+                raw = (m.group(1) or "").strip().rstrip(".,;:")
+                # Drop leading articles
+                raw = re.sub(r"(?i)^(an?|the)\s+", "", raw).strip()
+                if raw and raw.lower() not in _BEHAVIOR_PAYLOAD_STOP:
+                    if raw.lower() not in _TYPE_ALIASES and not cls.is_invented_default(
+                        raw, req
+                    ):
+                        # Prefer short grounded literals / numbers / sequences
+                        if (
+                            cls.is_grounded(raw, req)
+                            or re.fullmatch(r"-?\d+(?:\.\d+)?", raw)
+                            or (
+                                raw[:1] in "([\"'"
+                                and raw[-1:] in ")]\"'"
+                                and raw in req
+                            )
+                        ):
+                            _add("skill_result_equals", raw, "skill_result")
+
+        # 4) Arithmetic with grounded operands → expected numeric result
+        am = _ARITH_EXPR_RE.search(req)
+        if am:
+            a_s, op, b_s = am.group(1), am.group(2), am.group(3)
+            if a_s in req and b_s in req and op in req:
+                try:
+                    a = float(a_s) if "." in a_s else int(a_s)
+                    b = float(b_s) if "." in b_s else int(b_s)
+                    if op in ("+",):
+                        val: Any = a + b
+                    elif op in ("-",):
+                        val = a - b
+                    elif op in ("*", "×"):
+                        val = a * b
+                    elif op in ("/", "÷"):
+                        if b == 0:
+                            val = None
+                        else:
+                            val = a / b
+                    else:
+                        val = None
+                    if val is not None:
+                        if isinstance(val, float) and val.is_integer():
+                            val = int(val)
+                        _add("skill_result_equals", str(val), "skill_result")
+                except Exception:
+                    pass
+
+        # 5) Reverse / sort only with grounded example literals
+        rm = _REVERSE_LIT_RE.search(req)
+        if rm:
+            lit = (rm.group(1) or "").strip()
+            if lit and lit in req and not cls.is_invented_default(lit, req):
+                expected = cls._eval_reverse_literal(lit)
+                if expected is not None:
+                    _add("skill_result_equals", expected, "skill_result")
+        sm = _SORT_LIT_RE.search(req)
+        if sm:
+            lit = (sm.group(1) or "").strip()
+            if lit and lit in req and not cls.is_invented_default(lit, req):
+                expected = cls._eval_sort_literal(lit)
+                if expected is not None:
+                    _add("skill_result_equals", expected, "skill_result")
+
+        return checks
+
+    @staticmethod
+    def _eval_reverse_literal(lit: str) -> Optional[str]:
+        """Compute reverse of a grounded list/tuple/string literal; else None."""
+        s = (lit or "").strip()
+        if not s:
+            return None
+        try:
+            if (s.startswith('"') and s.endswith('"')) or (
+                s.startswith("'") and s.endswith("'")
+            ):
+                return s[1:-1][::-1]
+            if s.startswith("(") and s.endswith(")"):
+                # Normalize to list-like for eval safety
+                inner = s[1:-1].strip()
+                if not inner:
+                    return "()"
+                # Use literal_eval via ast for safety
+                import ast
+
+                val = ast.literal_eval(s if s.endswith(",)") or "," in s else f"({inner},)")
+                if isinstance(val, tuple):
+                    return repr(tuple(reversed(val)))
+            if s.startswith("[") and s.endswith("]"):
+                import ast
+
+                val = ast.literal_eval(s)
+                if isinstance(val, list):
+                    return repr(list(reversed(val)))
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _eval_sort_literal(lit: str) -> Optional[str]:
+        """Compute sorted form of a grounded list literal; else None."""
+        s = (lit or "").strip()
+        if not (s.startswith("[") and s.endswith("]")):
+            return None
+        try:
+            import ast
+
+            val = ast.literal_eval(s)
+            if isinstance(val, list):
+                return repr(sorted(val))
+        except Exception:
+            return None
+        return None
+
+    @classmethod
     def _attach_checks(
         cls, constraints: dict[str, Any], request: str
     ) -> dict[str, Any]:
@@ -925,8 +1161,9 @@ class TaskGoal:
         Attach structured, independently checkable ``checks`` to constraints.
 
         Each check: kind + target + how (workspace_stat / workspace_read /
-        http_get / importlib / directory_stat). Derived only from request-
-        grounded constraints — never from skill self-proof.
+        http_get / importlib / directory_stat / skill_stdout_or_result /
+        skill_result). Derived only from request-grounded constraints and
+        semantic behavior cues — never from skill self-proof.
         """
         out = dict(constraints or {})
         checks: list[dict[str, Any]] = []
@@ -939,6 +1176,8 @@ class TaskGoal:
             if entry not in checks:
                 checks.append(entry)
 
+        has_files = bool(out.get("files"))
+
         for f in out.get("files") or []:
             p = str((f or {}).get("path") or "").strip()
             if p:
@@ -948,7 +1187,16 @@ class TaskGoal:
                 _add("content_present", str(c), "workspace_read")
         for m in out.get("must_contain") or []:
             if m is not None and str(m).strip():
-                _add("content_present", str(m), "workspace_read")
+                if has_files:
+                    # Path/artifact goal — content must appear in workspace files
+                    _add("content_present", str(m), "workspace_read")
+                else:
+                    # Pathless content → verify real skill/tool output behavior
+                    _add(
+                        "skill_output_contains",
+                        str(m),
+                        "skill_stdout_or_result",
+                    )
         for d in out.get("directories") or []:
             p = str((d or {}).get("path") or "").strip()
             if p:
@@ -969,6 +1217,14 @@ class TaskGoal:
                     _add("http_ok", u, "http_get")
                     out.setdefault("http", []).append({"url": u})
 
+        # Semantic behavior/functionality criteria from USER REQUEST
+        for beh in cls._derive_behavior_checks(request or ""):
+            _add(
+                str(beh.get("kind") or ""),
+                str(beh.get("target") or ""),
+                str(beh.get("how") or ""),
+            )
+
         out["checks"] = checks[:24]
         out["source"] = out.get("source") or "task_goal"
         return out
@@ -982,8 +1238,8 @@ class TaskGoal:
         """
         Verifiable success criteria from the full request-derived constraints.
 
-        Encodes: what must exist / what content / what network/import checks,
-        and (via constraint checks[].how) how to verify. Never falls back to
+        Encodes artifact/content/network checks and semantic behavior criteria
+        (skill output / result equality / result type). Never falls back to
         skill self-proof stubs.
         """
         crit: list[str] = []
@@ -1019,6 +1275,15 @@ class TaskGoal:
             for mod in (constraints or {}).get("imports") or []:
                 if mod is not None and str(mod).strip():
                     crit.append(f"import_ok:{mod}@importlib")
+            # Behavior fallback when checks were not attached yet
+            for beh in cls._derive_behavior_checks(request or ""):
+                kind = str(beh.get("kind") or "")
+                target = str(beh.get("target") or "")
+                how = str(beh.get("how") or "")
+                if kind and target:
+                    label = f"{kind}:{target}" + (f"@{how}" if how else "")
+                    if label not in crit:
+                        crit.append(label)
 
         if not crit:
             # Explicitly unverifiable — caller must refine, not invent PASS

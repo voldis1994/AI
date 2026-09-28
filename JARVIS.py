@@ -823,26 +823,77 @@ def run(context: dict) -> dict:
         assert any(s.startswith("http_ok:") for s in tg_http.success_criteria), (
             tg_http.success_criteria
         )
-        # Unverifiable request → needs_refine (must not continue with empty criteria)
-        tg_soft = TaskGoal.from_request("Say hello politely to the room")
+        # Semantic behavior criteria — communicative request without path/URL/args
+        tg_say = TaskGoal.from_request("Say hello politely to the room")
+        assert tg_say.has_verifiable_constraints(), tg_say.to_dict()
+        assert any(
+            s.startswith("skill_output_contains:hello") for s in tg_say.success_criteria
+        ), tg_say.success_criteria
+        assert "needs_refine" not in tg_say.success_criteria
+        tg_say_r = TaskGoal.refine(tg_say)
+        assert tg_say_r.has_verifiable_constraints(), tg_say_r.success_criteria
+        # VERIFY checks real skill stdout/result — not evidence self-proof
+        soft_ws = root / "data" / "_tg_soft_ws"
+        soft_ws.mkdir(parents=True, exist_ok=True)
+        soft_v = Verifier(soft_ws)
+        say_pass = soft_v.verify(
+            tg_say_r.user_request,
+            {
+                "ok": True,
+                "result": {"says": "hello"},
+                "stdout": "hello\n",
+                "evidence": "ignored",
+                "returncode": 0,
+            },
+            task_goal=tg_say_r,
+        )
+        assert say_pass.get("verified"), say_pass
+        say_fail = soft_v.verify(
+            tg_say_r.user_request,
+            {
+                "ok": True,
+                "result": {"says": "hi"},
+                "stdout": "hi\n",
+                "evidence": "I said hello",
+                "returncode": 0,
+            },
+            task_goal=tg_say_r,
+        )
+        assert not say_fail.get("verified"), say_fail
+        # Return/type/arithmetic behavior criteria (still request-grounded)
+        tg_ret = TaskGoal.from_request("Return 42")
+        assert any(
+            s.startswith("skill_result_equals:42") for s in tg_ret.success_criteria
+        ), tg_ret.success_criteria
+        assert soft_v.verify(
+            tg_ret.user_request,
+            {"ok": True, "result": 42, "returncode": 0},
+            task_goal=tg_ret,
+        ).get("verified")
+        tg_type = TaskGoal.from_request("Return an integer")
+        assert any(
+            s.startswith("skill_result_type:int") for s in tg_type.success_criteria
+        ), tg_type.success_criteria
+        tg_arith = TaskGoal.from_request("Compute 2+2")
+        assert any(
+            s.startswith("skill_result_equals:4") for s in tg_arith.success_criteria
+        ), tg_arith.success_criteria
+        # Truly unverifiable request → needs_refine (must not continue empty)
+        tg_soft = TaskGoal.from_request("Be helpful please")
         assert tg_soft.needs_goal_refine(), tg_soft.success_criteria
         assert tg_soft.success_criteria == ("needs_refine",)
         tg_soft_r = TaskGoal.refine(tg_soft)
         assert tg_soft_r.needs_goal_refine()
         assert tg_soft_r.success_criteria == ("needs_refine",)
-        # VERIFY refuses skill self-proof when TaskGoal unverifiable
-        soft_ws = root / "data" / "_tg_soft_ws"
-        soft_ws.mkdir(parents=True, exist_ok=True)
-        (soft_ws / "fake.txt").write_text("hi\n", encoding="utf-8")
-        soft_v = Verifier(soft_ws)
-        soft_sr = {
-            "ok": True,
-            "result": {"path": str(soft_ws / "fake.txt"), "says": "hello"},
-            "evidence": "I said hello",
-            "returncode": 0,
-        }
         soft_res = soft_v.verify(
-            tg_soft_r.user_request, soft_sr, task_goal=tg_soft_r
+            tg_soft_r.user_request,
+            {
+                "ok": True,
+                "result": {"says": "sure"},
+                "evidence": "I was helpful",
+                "returncode": 0,
+            },
+            task_goal=tg_soft_r,
         )
         assert not soft_res.get("verified"), soft_res
         assert "needs_refine" in (soft_res.get("reason") or "") or any(
@@ -4626,13 +4677,17 @@ def run(context: dict) -> dict:
             brain=SoftGoalBrain(),
             on_log=lambda m: logs_sc.append(m),
         )
-        soft_goal = "Say hello politely to the room"
+        soft_goal = "Be helpful please"
         assert _TGSC.from_request(soft_goal).needs_goal_refine()
         result_sc = orch_sc.run_cycle(soft_goal)
         assert result_sc.get("success") is False, result_sc
         assert result_sc.get("fault_layer") == "goal_parsing", result_sc
         assert any("GOAL_REFINE" in m for m in logs_sc), logs_sc[:30]
         assert not any("CAPABILITY DECISION:" in m for m in logs_sc), logs_sc
+        # Semantic communicative request is verifiable (no path/URL required)
+        assert _TGSC.from_request(
+            "Say hello politely to the room"
+        ).has_verifiable_constraints()
         # Verifiable request still proceeds and VERIFY uses success_criteria
         class OkBrain(SoftGoalBrain):
             def __init__(self) -> None:

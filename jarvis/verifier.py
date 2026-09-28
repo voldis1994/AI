@@ -1,11 +1,15 @@
 """
 JARVIS verifier — independent factual checks against the USER REQUEST.
 
-PASS is allowed only when the real world satisfies the user's goal/constraints.
-Never trusts:
+PASS is allowed only when the real world / real tool behavior satisfies the
+user's goal and TaskGoal success_criteria. Never trusts:
   - skill self-proof / evidence text
-  - skill result fields as proof of success
+  - skill.ok alone as proof of success
   - default / placeholder values invented by a skill
+
+Behavior criteria (skill_output_contains / skill_result_equals /
+skill_result_type) inspect real stdout and the returned result payload —
+not narrated evidence.
 """
 
 from __future__ import annotations
@@ -187,9 +191,13 @@ class Verifier:
                 "detail": detail,
             })
 
-        # ── Standalone content constraints (must appear in expected files) ──
+        # ── Standalone content constraints ──────────────────────────────
+        # With file targets → workspace content. Pathless → real skill output.
         for needle in built.get("must_contain") or []:
-            ok, detail = self._content_present(str(needle), file_specs)
+            if file_specs:
+                ok, detail = self._content_present(str(needle), file_specs)
+            else:
+                ok, detail = self._skill_output_contains(str(needle), sr)
             checks.append({"name": "content_constraint", "ok": ok, "detail": detail})
 
         # ── Directory constraints ───────────────────────────────────────
@@ -226,7 +234,7 @@ class Verifier:
                         + (f"@{how}" if how else "")
                     )
         for crit in criteria:
-            ok, detail = self._check_success_criterion(str(crit), file_specs)
+            ok, detail = self._check_success_criterion(str(crit), file_specs, sr)
             checks.append({
                 "name": "success_criterion",
                 "ok": ok,
@@ -385,12 +393,16 @@ class Verifier:
         self,
         criterion: str,
         file_specs: list[dict[str, Any]],
+        skill_result: Optional[dict[str, Any]] = None,
     ) -> tuple[bool, str]:
         """
         Evaluate one TaskGoal success_criterion against the real world.
 
         Format: ``kind:target`` or ``kind:target@how``.
-        Never treats skill self-proof as satisfaction.
+        Artifact/network kinds check the workspace/network. Behavior kinds
+        (skill_output_contains / skill_result_equals / skill_result_type)
+        check the real tool return value and stdout — never skill.evidence
+        or skill.ok self-proof.
         """
         raw = (criterion or "").strip()
         if not raw or raw in ("skill_ok_and_verified", "needs_refine"):
@@ -406,6 +418,8 @@ class Verifier:
         target = target.strip()
         if not kind or not target:
             return False, f"unparseable_criterion:{raw}"
+
+        sr = skill_result if isinstance(skill_result, dict) else {}
 
         if kind == "artifact_exists":
             path = self._resolve(target)
@@ -424,7 +438,169 @@ class Verifier:
         if kind == "import_ok":
             ok, detail = self._check_import(target)
             return ok, f"import_ok:{detail} how={how or 'importlib'}"
+        if kind == "skill_output_contains":
+            ok, detail = self._skill_output_contains(target, sr)
+            return ok, (
+                f"skill_output_contains:{detail} "
+                f"how={how or 'skill_stdout_or_result'}"
+            )
+        if kind == "skill_result_equals":
+            ok, detail = self._skill_result_equals(target, sr)
+            return ok, f"skill_result_equals:{detail} how={how or 'skill_result'}"
+        if kind == "skill_result_type":
+            ok, detail = self._skill_result_type(target, sr)
+            return ok, f"skill_result_type:{detail} how={how or 'skill_result'}"
         return False, f"unknown_criterion_kind:{kind}"
+
+    def _skill_observable_text(self, sr: dict[str, Any]) -> str:
+        """
+        Real tool observables used for behavior checks.
+
+        Includes stdout and the returned result payload. Excludes evidence
+        (self-narration) and error strings used as proof.
+        """
+        parts: list[str] = []
+        stdout = sr.get("stdout")
+        if stdout:
+            parts.append(str(stdout))
+        result = sr.get("result")
+        if result is not None:
+            parts.append(self._result_surface(result))
+        return "\n".join(parts)
+
+    @staticmethod
+    def _result_surface(result: Any) -> str:
+        """Flatten a skill result into searchable / comparable text."""
+        if result is None:
+            return ""
+        if isinstance(result, (str, int, float, bool)):
+            return str(result)
+        if isinstance(result, (list, tuple)):
+            return repr(list(result) if isinstance(result, tuple) else result)
+        if isinstance(result, dict):
+            # Prefer common value-bearing keys, then full dict repr
+            preferred = []
+            for key in (
+                "value", "result", "answer", "output", "text", "message",
+                "says", "content", "data", "return", "returned",
+            ):
+                if key in result and result[key] is not None:
+                    preferred.append(str(result[key]))
+            if preferred:
+                return "\n".join(preferred) + "\n" + repr(result)
+            return repr(result)
+        return repr(result)
+
+    def _skill_output_contains(
+        self, needle: str, sr: dict[str, Any]
+    ) -> tuple[bool, str]:
+        if not needle:
+            return True, "empty needle"
+        blob = self._skill_observable_text(sr)
+        if not blob:
+            return False, f"{needle!r} missing — no skill stdout/result"
+        # Case-sensitive first (grounded literal), then case-insensitive fallback
+        if needle in blob:
+            return True, f"{needle!r} found in skill stdout/result"
+        if needle.lower() in blob.lower():
+            return True, f"{needle!r} found in skill stdout/result (case-insensitive)"
+        return False, f"{needle!r} not in skill stdout/result"
+
+    def _skill_result_equals(
+        self, expected: str, sr: dict[str, Any]
+    ) -> tuple[bool, str]:
+        exp_raw = (expected or "").strip()
+        if not exp_raw:
+            return True, "empty expected"
+        result = sr.get("result")
+        # Unwrap common envelopes
+        candidate = result
+        if isinstance(result, dict):
+            for key in (
+                "value", "result", "answer", "output", "text", "data", "return",
+            ):
+                if key in result and result[key] is not None:
+                    candidate = result[key]
+                    break
+        if self._values_equal(candidate, exp_raw):
+            return True, f"result={candidate!r} equals {exp_raw!r}"
+        # Also accept exact match against stdout (trimmed)
+        stdout = str(sr.get("stdout") or "").strip()
+        if stdout and self._values_equal(stdout, exp_raw):
+            return True, f"stdout={stdout!r} equals {exp_raw!r}"
+        return False, f"result={candidate!r} != expected {exp_raw!r}"
+
+    def _skill_result_type(
+        self, expected_type: str, sr: dict[str, Any]
+    ) -> tuple[bool, str]:
+        want = (expected_type or "").strip().lower()
+        result = sr.get("result")
+        candidate = result
+        if isinstance(result, dict):
+            # If envelope only, peek at value-bearing keys; else type is dict
+            for key in ("value", "result", "answer", "output", "data", "return"):
+                if key in result and result[key] is not None:
+                    candidate = result[key]
+                    break
+        actual = type(candidate).__name__.lower()
+        if candidate is None:
+            actual = "none"
+        aliases = {
+            "int": {"int"},
+            "str": {"str"},
+            "list": {"list"},
+            "dict": {"dict"},
+            "bool": {"bool"},
+            "float": {"float"},
+            "tuple": {"tuple"},
+            "none": {"none", "nonetype"},
+        }
+        ok = actual in aliases.get(want, {want})
+        # int satisfies float ask? No. float with .0 satisfying int? allow int==int only.
+        if not ok and want == "float" and actual == "int":
+            ok = True
+        return ok, f"type(result)={actual} expect={want} ok={ok}"
+
+    @staticmethod
+    def _values_equal(produced: Any, expected: str) -> bool:
+        """Compare produced skill value to a request-grounded expected literal."""
+        exp = (expected or "").strip()
+        if produced is None:
+            return exp.lower() in ("none", "null")
+        # Numeric
+        try:
+            if re.fullmatch(r"-?\d+", exp):
+                return int(produced) == int(exp)
+            if re.fullmatch(r"-?\d+\.\d+", exp):
+                return abs(float(produced) - float(exp)) < 1e-9
+        except (TypeError, ValueError):
+            pass
+        # Sequence / literal via repr or ast
+        if exp[:1] in "[(" and exp[-1:] in "])":
+            try:
+                import ast
+
+                exp_val = ast.literal_eval(exp)
+                if isinstance(produced, tuple) and isinstance(exp_val, list):
+                    return list(produced) == exp_val
+                if isinstance(produced, list) and isinstance(exp_val, tuple):
+                    return produced == list(exp_val)
+                if produced == exp_val:
+                    return True
+                if isinstance(produced, (list, tuple)) and isinstance(
+                    exp_val, (list, tuple)
+                ):
+                    return list(produced) == list(exp_val)
+            except Exception:
+                pass
+            return repr(produced).replace(" ", "") == exp.replace(" ", "")
+        # Bool
+        if exp.lower() in ("true", "false"):
+            return str(produced).lower() == exp.lower()
+        # String / generic
+        if isinstance(produced, str):
+            return produced.strip() == exp or produced == exp
+        return str(produced).strip() == exp
 
     def _normalize_expect(
         self,
