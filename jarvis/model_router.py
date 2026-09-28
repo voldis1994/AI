@@ -138,6 +138,8 @@ class ModelPool:
         self._cached_tags: Optional[list[str]] = None
         self._cache_ok = False
         self._cache_ts: float = 0.0
+        # Models that crashed the Ollama runner (llama-server) — skip until reset
+        self._failed_models: dict[str, str] = {}
         self._cache_ttl = TAGS_CACHE_TTL_SEC
         self._last_route: Optional[RouteDecision] = None
 
@@ -181,6 +183,50 @@ class ModelPool:
         target = (model or "").strip().lower()
         normalized = {n.strip().lower() for n in tags}
         return target in normalized
+
+    def mark_model_failed(self, model: str, reason: str = "") -> None:
+        """
+        Blacklist a model after runner crash / hard failure so the pool
+        auto-selects the next installed candidate for that tier.
+        """
+        name = (model or "").strip()
+        if not name:
+            return
+        key = name.lower()
+        with self._lock:
+            self._failed_models[key] = (reason or "runner_failed")[:200]
+            # Drop warm flag so we don't keep trying the broken worker
+            for w in self.workers.values():
+                if (w.model or "").strip().lower() == key:
+                    w.warm = False
+                    w.ready = False
+                    w.last_error = reason or "runner_failed"
+        msg = f"MODEL SKIP: {name} marked failed — will auto-select next installed"
+        self.on_log(msg)
+        logger.warning("%s (%s)", msg, reason)
+        # Re-bind workers that pointed at the failed model
+        try:
+            tags = self.available_models(refresh=True)
+        except Exception:
+            tags = None
+        with self._lock:
+            for tier, w in list(self.workers.items()):
+                if (w.model or "").strip().lower() != key:
+                    continue
+                nxt, _, _ = self._resolve_model(tier, tags)
+                if nxt and nxt.strip().lower() != key:
+                    w.model = nxt
+                    w.ready = True
+                    w.warm = False
+                    self.on_log(f"MODEL AUTO-SELECT: {tier} → {nxt} (after skip {name})")
+
+    def clear_model_failures(self) -> None:
+        with self._lock:
+            self._failed_models.clear()
+
+    def failed_models(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._failed_models)
 
     # ── request context (dedupe + collect) ──────────────────────────────
 
@@ -231,7 +277,7 @@ class ModelPool:
 
         workers: dict[str, ModelWorker] = {}
         for tier in (cfg.TIER_FAST, cfg.TIER_REASONING, cfg.TIER_CODING):
-            resolved, used_fb = self._resolve_model(tier, tags)
+            resolved, used_fb, resolve_reason = self._resolve_model(tier, tags)
             primary = cfg.models_for_tier(tier)[0]
             model = resolved or primary
             size = self._model_size_bytes(model, tags)
@@ -253,7 +299,13 @@ class ModelPool:
                 "ready": w.ready,
                 "size_bytes": size,
                 "fallback": used_fb,
+                "reason": resolve_reason,
             }
+            if resolved and used_fb:
+                self.on_log(
+                    f"MODEL AUTO-SELECT: {tier} → {resolved} "
+                    f"(preferred {primary} not used; {resolve_reason})"
+                )
 
         with self._lock:
             self.workers = workers
@@ -410,6 +462,11 @@ class ModelPool:
             return "OFFLINE"
         if any(self.model_in_tags(m, tags) for m in cfg.all_configured_models()):
             return "ONLINE"
+        # Auto-discovered installed models also count as ONLINE
+        for tier in (cfg.TIER_FAST, cfg.TIER_REASONING, cfg.TIER_CODING):
+            resolved, _, _ = self._resolve_model(tier, tags)
+            if resolved:
+                return "ONLINE"
         return "MODEL MISSING"
 
     def status_detail(self) -> dict[str, Any]:
@@ -423,7 +480,7 @@ class ModelPool:
             workers = dict(self.workers)
         for tier in (cfg.TIER_FAST, cfg.TIER_REASONING, cfg.TIER_CODING):
             primary = cfg.models_for_tier(tier)[0]
-            resolved, fb = self._resolve_model(tier, tags)
+            resolved, fb, reason = self._resolve_model(tier, tags)
             w = workers.get(tier)
             model = (w.model if w else resolved) or primary
             warm = bool(w.warm) if w else (model.lower() in resident)
@@ -432,6 +489,7 @@ class ModelPool:
                 "primary": primary,
                 "resolved": model,
                 "fallback": fb,
+                "reason": reason,
                 "online": bool(ready and tags is not None),
                 "ready": ready,
                 "warm": warm,
@@ -505,16 +563,16 @@ class ModelPool:
             chosen_tier = cfg.TIER_FAST
 
         tags = self.available_models()
-        candidates = cfg.models_for_tier(chosen_tier)
-        primary = candidates[0]
+        catalog_primary = cfg.models_for_tier(chosen_tier)[0]
 
         if force_model:
             decision = RouteDecision(
                 tier=chosen_tier,
                 model=force_model,
                 work=work_key,
-                primary=primary,
-                used_fallback=force_model.strip() != primary,
+                primary=catalog_primary,
+                used_fallback=force_model.strip().lower()
+                != catalog_primary.strip().lower(),
                 reason="forced",
                 warm=False,
                 ready=True,
@@ -522,15 +580,18 @@ class ModelPool:
             self._commit(decision, log=log)
             return decision
 
-        resolved, used_fb = self._resolve_model(chosen_tier, tags)
+        resolved, used_fb, resolve_reason = self._resolve_model(chosen_tier, tags)
         if not resolved:
-            resolved = primary
+            resolved = catalog_primary
             used_fb = False
             reason = "no_installed_candidate"
             ready = False
         else:
-            reason = "fallback" if used_fb else "primary"
+            reason = resolve_reason or ("fallback" if used_fb else "primary")
             ready = True
+            used_fb = (
+                resolved.strip().lower() != catalog_primary.strip().lower()
+            )
 
         warm = False
         if ensure_warm and ready:
@@ -838,16 +899,46 @@ class ModelPool:
 
     # ── internals ───────────────────────────────────────────────────────
 
+    def candidates_for_tier(
+        self, tier: str, tags: Optional[list[str]] = None
+    ) -> list[str]:
+        """Catalog + auto-discovered installed models, minus runner failures."""
+        with self._lock:
+            ban = set(self._failed_models.keys())
+        return cfg.discover_models_for_tier(tier, tags, exclude=ban)
+
     def _resolve_model(
         self, tier: str, tags: Optional[list[str]]
-    ) -> tuple[Optional[str], bool]:
-        candidates = cfg.models_for_tier(tier)
+    ) -> tuple[Optional[str], bool, str]:
+        """
+        Pick best model for tier.
+
+        Returns (model|None, used_fallback, reason).
+        Prefers installed catalog entries, then auto-discovered tags.
+        """
+        catalog = cfg.models_for_tier(tier)
+        primary = catalog[0] if catalog else cfg.DEFAULT_MODEL
+        candidates = self.candidates_for_tier(tier, tags)
+        if not candidates:
+            return None, False, "empty_candidates"
         if not self.prefer_installed or tags is None:
-            return candidates[0], False
+            return candidates[0], candidates[0] != primary, (
+                "catalog" if candidates[0] == primary else "auto"
+            )
+        tag_set = {n.strip().lower() for n in tags}
         for i, name in enumerate(candidates):
-            if self.model_in_tags(name, tags):
-                return name, i > 0
-        return None, False
+            if name.strip().lower() in tag_set:
+                in_catalog = name.strip().lower() in {
+                    c.strip().lower() for c in catalog
+                }
+                if i == 0 and name.strip().lower() == primary.strip().lower():
+                    reason = "primary"
+                elif in_catalog:
+                    reason = "fallback"
+                else:
+                    reason = "auto_installed"
+                return name, name.strip().lower() != primary.strip().lower(), reason
+        return None, False, "no_installed_candidate"
 
     def _commit(self, decision: RouteDecision, *, log: bool) -> None:
         with self._lock:

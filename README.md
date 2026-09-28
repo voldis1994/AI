@@ -3,13 +3,15 @@
 Autonomous self-learning AI agent. Brain: **Ollama multi-model router**
 (`FAST` / `REASONING` / `CODING` — configured in `jarvis/model_config.py`).
 
-| Tier | Primary | Use |
-|------|---------|-----|
-| FAST | `qwen3:4b` | intent, parsing, args, query gen, simple Q&A |
-| REASONING | `qwen3:30b` | planning, learning, research, diagnosis, semantics |
-| CODING | `qwen3-coder:30b` | skill generation, repair, code analysis |
+| Tier | Preferred | Use |
+|------|-----------|-----|
+| FAST | `qwen3:4b` → `qwen3:8b` → … | intent, parsing, args, query gen, simple Q&A |
+| REASONING | `qwen3:30b` → `qwen3:8b` → … | planning, learning, research, diagnosis, semantics |
+| CODING | `qwen3-coder:30b` → `qwen2.5-coder:7b` → … | skill generation, repair, code analysis |
 
-Existing `qwen2.5*` models are automatic fallbacks when a primary is missing.
+JARVIS auto-selects the best **installed** model per tier (Ollama `/api/tags`).
+Missing primaries fall through; unknown local tags can still be picked by size/family.
+Runner crashes (`llama-server` / `0xe06d7363`) mark that model skipped and retry the next.
 Failed FAST results may escalate to REASONING. Failed CODING retries CODING with failure context.
 
 ## Run
