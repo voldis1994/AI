@@ -3243,6 +3243,7 @@ def run(context: dict) -> dict:
 
         # Primaries available — direct tier select (not a chain)
         installed = ["qwen3:4b", "qwen3:30b", "qwen3-coder:30b", "qwen2.5-coder:7b"]
+        pool.detect_memory_budget_bytes = lambda: int(64 * 1024**3)
         pool.invalidate_cache()
         pool.initialize(warm=False)
         route_logs.clear()
@@ -3273,8 +3274,25 @@ def run(context: dict) -> dict:
         assert any("MODEL SKIP:" in m for m in route_logs), route_logs
         pool.clear_model_failures()
 
+        # Budget-aware: with 30b+8b installed but small budget → prefer 8b
+        installed = [
+            "qwen3:4b",
+            "qwen3:8b",
+            "qwen3:30b",
+            "qwen3-coder:30b",
+            "qwen2.5-coder:7b",
+        ]
+        pool.detect_memory_budget_bytes = lambda: int(7.5 * 1024**3)
+        pool.invalidate_cache()
+        pool.initialize(warm=False)
+        d_fit = pool.acquire(work="diagnose", ensure_warm=False)
+        assert d_fit.model == "qwen3:8b", d_fit
+        d_fit_code = pool.acquire(work="skill_code", ensure_warm=False)
+        assert d_fit_code.model == "qwen2.5-coder:7b", d_fit_code
+
         # Escalation only when prior insufficient
         installed = ["qwen3:4b", "qwen3:30b", "qwen3-coder:30b", "qwen2.5-coder:7b"]
+        pool.detect_memory_budget_bytes = lambda: int(64 * 1024**3)
         pool.invalidate_cache()
         pool.initialize(warm=False)
         route_logs.clear()
@@ -3356,7 +3374,22 @@ def run(context: dict) -> dict:
         probe.pool._preload_fn = lambda model, ka: True
         probe.pool._unload_fn = lambda model: True
         probe.pool._ps_fn = lambda: []
+        # Large budget so REASONING can select qwen3:30b (not demoted by size fit)
+        probe.pool.detect_memory_budget_bytes = lambda: int(64 * 1024**3)
+        probe.pool._budget_bytes = int(64 * 1024**3)
         probe.pool.initialize(warm=False)
+        probe.pool._budget_bytes = int(64 * 1024**3)
+        # Pin resolved workers — this probe only asserts escalate FAST→REASONING
+        for tier, model in (
+            (TIER_FAST, "qwen3:4b"),
+            (TIER_REASONING, "qwen3:30b"),
+            (TIER_CODING, "qwen2.5-coder:7b"),
+        ):
+            w = probe.pool.workers.get(tier)
+            if w:
+                w.model = model
+                w.ready = True
+                w.size_bytes = 2_500_000_000 if "4b" in model else 4_500_000_000
         probe.begin_request_pool("probe1")
         out = probe.generate(
             "hi",
