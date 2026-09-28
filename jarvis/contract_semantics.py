@@ -74,13 +74,24 @@ def extract_grounded_literals(request: str) -> dict[str, list[str]]:
             urls.append(u)
 
     quotes: list[str] = []
+    path_like_quotes: list[str] = []
     for a, b in re.findall(r"\"([^\"]+)\"|'([^']+)'", req):
         tok = (a or b).strip()
-        if tok and tok not in quotes and not _INVENTED_RE.search(tok):
+        if not tok or _INVENTED_RE.search(tok):
+            continue
+        # Quoted path/filename is an artifact, not a content payload
+        if re.search(r"\.[A-Za-z0-9]{1,12}$", tok) and "://" not in tok and " " not in tok:
+            if tok not in path_like_quotes:
+                path_like_quotes.append(tok)
+            continue
+        if tok not in quotes:
             quotes.append(tok)
 
     paths: list[str] = []
     url_blob = " ".join(urls).lower()
+    for tok in path_like_quotes:
+        if tok not in paths:
+            paths.append(tok)
     for m in _PATH_RE.finditer(req):
         tok = m.group(1)
         if _INVENTED_RE.search(tok):
@@ -89,7 +100,7 @@ def extract_grounded_literals(request: str) -> dict[str, list[str]]:
             continue
         if any(tok.lower() in u.lower() for u in urls):
             continue
-        if tok not in paths and tok not in quotes:
+        if tok not in paths:
             paths.append(tok)
 
     numbers: list[str] = []
@@ -190,6 +201,8 @@ def offline_semantic_draft(
     tables. Unknown tasks without grounded literals yield empty criteria
     (VALIDATE → needs_refine).
     """
+    from jarvis.request_items import ItemKind, classify_request_items
+
     req = (request or "").strip()
     lit = extract_grounded_literals(req)
     args = dict(args or {})
@@ -210,6 +223,63 @@ def offline_semantic_draft(
             if sv not in lit["quotes"]:
                 lit["quotes"].append(sv)
 
+    # Universal request-item classification (FILE / CONTENT / …) — not verbs
+    items = classify_request_items(req)
+    url_blob = " ".join(lit["urls"]).lower()
+    for it in items:
+        if it.kind in (ItemKind.FILE, ItemKind.PATH):
+            tok = it.text.strip()
+            if not tok or _INVENTED_RE.search(tok):
+                continue
+            # Never promote URL host/path fragments to workspace artifacts
+            if tok.startswith("//") or "://" in tok:
+                continue
+            if tok.lower() in url_blob or any(
+                tok.lower() in u.lower() for u in lit["urls"]
+            ):
+                continue
+            if tok not in lit["paths"]:
+                lit["paths"].append(tok)
+        elif it.kind == ItemKind.CONTENT and it.reason == "quoted content":
+            if it.text not in lit["quotes"]:
+                lit["quotes"].append(it.text)
+
+    # Unquoted CONTENT payloads associated with files (e.g. …containing E2E_OK).
+    # Only payload-like tokens — never every prose word in the sentence.
+    unquoted_content: list[str] = []
+    path_blob = " ".join(lit["paths"]).lower()
+    for p in lit["paths"]:
+        path_blob += " " + Path_stem(p)
+    prose_candidates: list[str] = []
+    for it in items:
+        if it.kind != ItemKind.CONTENT:
+            continue
+        if it.reason == "quoted content":
+            continue
+        tok = it.text.strip()
+        if not tok or _INVENTED_RE.search(tok):
+            continue
+        if tok.lower() in path_blob or tok.lower() in _FILLER:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_]{2,64}", tok):
+            continue
+        if tok in lit["quotes"]:
+            continue
+        # ALL_CAPS / snake_payload markers are clear file contents
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", tok) or "_" in tok:
+            if tok not in unquoted_content:
+                unquoted_content.append(tok)
+        else:
+            prose_candidates.append(tok)
+    # Single remaining unquoted identifier after a path → content (e.g. containing ok)
+    if (
+        not unquoted_content
+        and lit["paths"]
+        and not lit["quotes"]
+        and len(prose_candidates) == 1
+    ):
+        unquoted_content.append(prose_candidates[0])
+
     files: list[dict[str, Any]] = []
     http: list[dict[str, Any]] = []
     must_contain: list[str] = []
@@ -221,7 +291,13 @@ def offline_semantic_draft(
     side_effects: list[str] = []
     artifacts: list[str] = []
 
-    primary_content = lit["quotes"][0] if lit["quotes"] else None
+    primary_content = lit["quotes"][0] if lit["quotes"] else (
+        unquoted_content[0] if unquoted_content else None
+    )
+    # Only use unquoted CONTENT as file payload when a path exists —
+    # pathless prose tokens stay empty offline (model UNDERSTAND covers them).
+    if primary_content in unquoted_content and not lit["paths"]:
+        primary_content = None
 
     for i, p in enumerate(lit["paths"]):
         entry: dict[str, Any] = {"path": p, "min_bytes": 1}
@@ -245,9 +321,11 @@ def offline_semantic_draft(
             outcomes.append(f"content:{primary_content}")
         side_effects.append("filesystem_write")
 
-    for extra in lit["quotes"][1 if files and primary_content else 0 :]:
+    used_primary = bool(files and primary_content is not None)
+    quote_start = 1 if used_primary and lit["quotes"] and primary_content == lit["quotes"][0] else 0
+    for extra in lit["quotes"][quote_start:]:
         if files:
-            if extra not in must_contain:
+            if extra not in must_contain and extra != primary_content:
                 must_contain.append(extra)
                 acceptance.append(f"content_present:{extra}@workspace_read")
                 plan.append(
@@ -278,8 +356,25 @@ def offline_semantic_draft(
             outcomes.append(f"behavior:skill_output_contains:{extra}")
             outputs.append(f"result:skill_output_contains:{extra}")
 
+    # Extra unquoted payloads on multi-content file requests
+    if files and primary_content is not None:
+        for extra in unquoted_content:
+            if extra == primary_content:
+                continue
+            if extra not in must_contain:
+                must_contain.append(extra)
+                acceptance.append(f"content_present:{extra}@workspace_read")
+                plan.append(
+                    {
+                        "kind": "content_present",
+                        "target": extra,
+                        "how": "workspace_read",
+                    }
+                )
+
     # Pathless primary quote → behavior (output), not workspace scan
-    if primary_content and not files:
+    if lit["quotes"] and not files:
+        primary_content = lit["quotes"][0]
         if not any(b.get("target") == primary_content for b in behaviors):
             behaviors.append(
                 {

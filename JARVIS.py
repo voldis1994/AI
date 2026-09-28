@@ -1183,7 +1183,7 @@ def run(context: dict) -> dict:
         orch_a.close()
         print("  OK args     empty args → context_mapping diagnose → retest (no rewrite)")
     except Exception as exc:
-        msg = f"E2E_ARGS: {exc}"
+        msg = f"E2E_ARGS: {exc!r}"
         print(f"  FAIL {msg}")
         traceback.print_exc()
         errors.append(msg)

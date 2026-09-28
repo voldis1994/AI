@@ -357,6 +357,31 @@ class TaskContract:
                 acceptance,
             )
 
+        content_reqs = tuple(
+            str(c)
+            for c in (grounded_draft.get("content_requirements") or [])
+            if str(c).strip()
+        )
+        if not content_reqs:
+            content_reqs = cls._derive_content_requirements(cons)
+        content_source = tuple(
+            str(s) for s in (grounded_draft.get("content_source") or []) if str(s).strip()
+        )
+        if not content_source:
+            content_source = cls._derive_content_source(req, cons)
+        # Structural subject from request (authoritative) — draft prose is advisory only
+        derived_subject = cls._derive_subject(
+            req, artifacts, content_reqs, content_source
+        )
+        subject = derived_subject or str(
+            grounded_draft.get("subject") or SUBJECT_UNKNOWN
+        ).strip() or SUBJECT_UNKNOWN
+        actions = tuple(
+            str(a).lower()
+            for a in (grounded_draft.get("actions") or [])
+            if str(a).strip()
+        ) or cls._derive_actions(req)
+
         return cls(
             request_id=rid,
             original_request=req,
@@ -376,20 +401,10 @@ class TaskContract:
             verification_plan=plan,
             capability_requirements=tuple(capability_requirements or ()),
             validated=False,
-            subject=str(grounded_draft.get("subject") or SUBJECT_UNKNOWN),
-            actions=tuple(
-                str(a).lower()
-                for a in (grounded_draft.get("actions") or [])
-                if str(a).strip()
-            ),
-            content_source=tuple(
-                str(s) for s in (grounded_draft.get("content_source") or []) if str(s).strip()
-            ),
-            content_requirements=tuple(
-                str(c)
-                for c in (grounded_draft.get("content_requirements") or [])
-                if str(c).strip()
-            ),
+            subject=subject,
+            actions=actions,
+            content_source=content_source,
+            content_requirements=content_reqs,
         )
 
     @classmethod
